@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { validateProductionConfig } from "../../packages/config/src/index";
+import { validateProductionConfig, config } from "../../packages/config/src/index";
 import {
   createAdminSessionToken,
   verifyAdminSessionToken,
@@ -81,7 +81,7 @@ describe("Production Security Baseline & Configuration Guardrails", () => {
     // Attempting to send raw password in Authorization: Bearer header
     const reqWithRawPassword = {
       headers: new Headers({
-        authorization: "Bearer admin123",
+        authorization: `Bearer ${config.adminPassword}`,
       }),
       cookies: { get: () => undefined },
     } as any;
@@ -111,8 +111,8 @@ describe("Production Security Baseline & Configuration Guardrails", () => {
   });
 
   it("performs timing-safe admin password verification", () => {
-    expect(verifyAdminPassword("admin123")).toBe(true);
-    expect(verifyAdminPassword("wrong-password")).toBe(false);
+    expect(verifyAdminPassword(config.adminPassword)).toBe(true);
+    expect(verifyAdminPassword("wrong-password-never-matches-123")).toBe(false);
     expect(verifyAdminPassword("")).toBe(false);
   });
 });
