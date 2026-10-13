@@ -179,6 +179,7 @@ export const automationJobs = pgTable(
     retryCount: integer("retry_count").default(0),
     maxRetries: integer("max_retries").default(3),
     lastError: text("last_error"),
+    idempotencyKey: text("idempotency_key"),
     scheduledFor: timestamp("scheduled_for").defaultNow(),
     lockedAt: timestamp("locked_at"),
     completedAt: timestamp("completed_at"),
@@ -186,6 +187,7 @@ export const automationJobs = pgTable(
   },
   (table) => [
     index("jobs_status_scheduled_idx").on(table.status, table.scheduledFor),
+    uniqueIndex("jobs_idempotency_idx").on(table.idempotencyKey),
   ]
 );
 

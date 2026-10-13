@@ -1,9 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db, campaigns } from "@ai-signal/db";
 import { enqueueJob } from "@ai-signal/queue";
+import { isAuthorizedAdmin } from "@/lib/auth";
 
 export async function POST(req: NextRequest) {
   try {
+    if (!isAuthorizedAdmin(req)) {
+      return NextResponse.json(
+        { error: "Unauthorized: Admin authorization required" },
+        { status: 401 }
+      );
+    }
+
     const body = await req.json();
     const { title, subject, previewText, contentHtml, contentPlain } = body;
 

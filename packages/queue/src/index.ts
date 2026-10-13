@@ -3,10 +3,11 @@ import { db, automationJobs, eq, sql } from "@ai-signal/db";
 export interface EnqueueOptions {
   scheduledFor?: Date;
   maxRetries?: number;
+  idempotencyKey?: string;
 }
 
 /**
- * Durable job enqueueing backed by PostgreSQL
+ * Durable job enqueueing backed by PostgreSQL with idempotency
  */
 export async function enqueueJob(
   jobName: string,
@@ -22,10 +23,12 @@ export async function enqueueJob(
         status: "pending",
         scheduledFor: options.scheduledFor || new Date(),
         maxRetries: options.maxRetries ?? 3,
+        idempotencyKey: options.idempotencyKey,
       })
+      .onConflictDoNothing({ target: automationJobs.idempotencyKey })
       .returning({ id: automationJobs.id });
 
-    return inserted.id;
+    return inserted?.id || `idempotent_${options.idempotencyKey}`;
   } catch (err: any) {
     console.error(`[Queue] Failed to enqueue job '${jobName}':`, err.message);
     throw err;

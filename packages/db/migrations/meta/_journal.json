@@ -8,6 +8,13 @@
       "when": 1791916119659,
       "tag": "0000_freezing_microchip",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1791916647161,
+      "tag": "0001_tricky_rumiko_fujikawa",
+      "breakpoints": true
     }
   ]
 }
