@@ -1,0 +1,22 @@
+{
+  "name": "ai-signal-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-grade newsletter platform and automation engine for AI Signal",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=apps/web",
+    "worker": "npm run worker --workspace=apps/worker",
+    "build": "npm run build --workspaces --if-present",
+    "db:generate": "npm run db:generate --workspace=packages/db",
+    "db:push": "npm run db:push --workspace=packages/db",
+    "db:studio": "npm run db:studio --workspace=packages/db",
+    "typecheck": "tsc --build"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
