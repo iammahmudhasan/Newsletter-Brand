@@ -49,6 +49,9 @@ jobs:
       - name: Run Database Migrations
         run: bun run db:push
 
+      - name: Run Lint Verification
+        run: bun run lint
+
       - name: Typecheck TypeScript Workspaces
         run: bun run typecheck
 

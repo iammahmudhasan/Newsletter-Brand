@@ -86,7 +86,6 @@ export async function POST(req: NextRequest) {
     const res = NextResponse.json({
       success: true,
       message: "Admin authenticated successfully",
-      token, // Also returned for API clients
     });
 
     res.cookies.set({

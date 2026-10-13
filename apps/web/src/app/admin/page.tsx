@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import {
   Users,
   Send,
@@ -13,10 +14,32 @@ import {
   AlertCircle,
   PlusCircle,
   RefreshCw,
+  LogOut,
 } from "lucide-react";
 
 export default function AdminPage() {
+  const router = useRouter();
   const [activeTab, setActiveTab] = useState<"overview" | "compose" | "subscribers">("overview");
+
+  // Check authentication on mount
+  useEffect(() => {
+    fetch("/api/health")
+      .then((res) => res.json())
+      .then((data) => {
+        // Detailed metrics are only returned to authenticated sessions
+        if (!data.subscribers) {
+          router.push("/admin/login");
+        }
+      })
+      .catch(() => {
+        router.push("/admin/login");
+      });
+  }, [router]);
+
+  async function handleLogout() {
+    await fetch("/api/admin/auth", { method: "DELETE" });
+    router.push("/admin/login");
+  }
 
   // Compose State
   const [title, setTitle] = useState("AI Signal #01: Frontier Reasoning & Inference Scaling");
@@ -59,6 +82,10 @@ export default function AdminPage() {
 
       const data = await res.json();
       if (!res.ok) {
+        if (res.status === 401) {
+          router.push("/admin/login");
+          return;
+        }
         setStatusType("error");
         setStatusMessage(data.error || "Failed to schedule campaign.");
       } else {
@@ -67,7 +94,7 @@ export default function AdminPage() {
           `Campaign created successfully! Enqueued as Job ID: ${data.jobId}. Background worker will dispatch it in batches.`
         );
       }
-    } catch (err: any) {
+    } catch {
       setStatusType("error");
       setStatusMessage("Failed to reach server API.");
     } finally {
@@ -92,27 +119,38 @@ export default function AdminPage() {
           </p>
         </div>
 
-        {/* Tab Controls */}
-        <div className="flex bg-surface-200 border border-border p-1 rounded-xl text-xs font-semibold text-slate-400">
+        {/* Tab Controls & Logout */}
+        <div className="flex items-center gap-3">
+          <div className="flex bg-surface-200 border border-border p-1 rounded-xl text-xs font-semibold text-slate-400">
+            <button
+              onClick={() => setActiveTab("overview")}
+              className={`px-4 py-2 rounded-lg transition-all ${
+                activeTab === "overview"
+                  ? "bg-brand text-white shadow-md shadow-brand/20"
+                  : "hover:text-white"
+              }`}
+            >
+              Overview &amp; Telemetry
+            </button>
+            <button
+              onClick={() => setActiveTab("compose")}
+              className={`px-4 py-2 rounded-lg transition-all ${
+                activeTab === "compose"
+                  ? "bg-brand text-white shadow-md shadow-brand/20"
+                  : "hover:text-white"
+              }`}
+            >
+              Compose Campaign
+            </button>
+          </div>
+
           <button
-            onClick={() => setActiveTab("overview")}
-            className={`px-4 py-2 rounded-lg transition-all ${
-              activeTab === "overview"
-                ? "bg-brand text-white shadow-md shadow-brand/20"
-                : "hover:text-white"
-            }`}
+            onClick={handleLogout}
+            title="Log out"
+            className="p-2 rounded-xl bg-surface-200 border border-border text-slate-400 hover:text-red-400 hover:border-red-500/30 transition-all text-xs flex items-center gap-1.5"
           >
-            Overview &amp; Telemetry
-          </button>
-          <button
-            onClick={() => setActiveTab("compose")}
-            className={`px-4 py-2 rounded-lg transition-all ${
-              activeTab === "compose"
-                ? "bg-brand text-white shadow-md shadow-brand/20"
-                : "hover:text-white"
-            }`}
-          >
-            Compose Campaign
+            <LogOut className="w-4 h-4" />
+            <span className="hidden sm:inline">Logout</span>
           </button>
         </div>
       </div>

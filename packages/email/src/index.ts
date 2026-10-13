@@ -16,27 +16,39 @@ export * from "./sanitizer";
 
 let providerInstance: EmailProvider | null = null;
 
-export function getEmailProvider(): EmailProvider {
-  if (providerInstance) return providerInstance;
+export function getEmailProvider(overrideProvider?: string): EmailProvider {
+  const chosenProvider = overrideProvider || config.email.provider;
 
-  if (process.env.NODE_ENV === "production" && config.email.provider === "console") {
+  if (process.env.NODE_ENV === "production" && chosenProvider === "console") {
     throw new Error(
       "[CRITICAL EMAIL ERROR] Console mock provider cannot be used in production. Configure EMAIL_PROVIDER=resend or EMAIL_PROVIDER=ses."
     );
   }
 
-  switch (config.email.provider) {
+  if (providerInstance && !overrideProvider) return providerInstance;
+
+  let instance: EmailProvider;
+  switch (chosenProvider) {
     case "resend":
-      providerInstance = new ResendEmailProvider();
+      instance = new ResendEmailProvider();
       break;
     case "ses":
-      providerInstance = new SesEmailProvider();
+      instance = new SesEmailProvider();
       break;
     case "console":
-    default:
-      providerInstance = new ConsoleMockEmailProvider();
+      if (process.env.NODE_ENV === "production") {
+        throw new Error("[CRITICAL EMAIL ERROR] Console mock provider is strictly forbidden in production.");
+      }
+      instance = new ConsoleMockEmailProvider();
       break;
+    default:
+      throw new Error(
+        `[CRITICAL EMAIL ERROR] Unsupported or unknown email provider: '${chosenProvider}'. Expected 'resend' or 'ses' (or 'console' in development). Mock fallback is disabled.`
+      );
   }
 
-  return providerInstance;
+  if (!overrideProvider) {
+    providerInstance = instance;
+  }
+  return instance;
 }

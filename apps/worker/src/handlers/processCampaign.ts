@@ -75,18 +75,19 @@ export async function handleProcessCampaignBatch(payload: { campaignId: string }
       .onConflictDoNothing();
   }
 
-  // 4. Fetch list of recipients to process
+  // 4. Fetch list of recipients to process (including stale 'processing' leases from crashed workers)
   const pendingRecipients = await db
     .select({
       recipientId: campaignRecipients.id,
       subscriberId: campaignRecipients.subscriberId,
       status: campaignRecipients.status,
+      providerMessageId: campaignRecipients.providerMessageId,
     })
     .from(campaignRecipients)
     .where(
       and(
         eq(campaignRecipients.campaignId, campaign.id),
-        sql`${campaignRecipients.status} IN ('queued', 'failed')`
+        sql`(${campaignRecipients.status} IN ('queued', 'failed') OR (${campaignRecipients.status} = 'processing' AND ${campaignRecipients.updatedAt} < NOW() - INTERVAL '5 minutes'))`
       )
     );
 
@@ -98,13 +99,13 @@ export async function handleProcessCampaignBatch(payload: { campaignId: string }
   let failCount = 0;
 
   for (const item of pendingRecipients) {
-    // Atomic Claim: Transition status from 'queued' -> 'processing' to prevent race conditions
+    // Atomic Claim: Transition status to 'processing' with fresh lease timestamp
     const claimResult = await db.execute<typeof campaignRecipients.$inferSelect>(
       sql`
         UPDATE campaign_recipients
-        SET status = 'processing'
+        SET status = 'processing', updated_at = NOW()
         WHERE id = ${item.recipientId}
-          AND status IN ('queued', 'failed')
+          AND (status IN ('queued', 'failed') OR (status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes'))
         RETURNING *;
       `
     );
@@ -112,6 +113,23 @@ export async function handleProcessCampaignBatch(payload: { campaignId: string }
     const claimed = (claimResult as any)?.[0];
     if (!claimed) {
       // Already claimed by another worker or already marked 'sent'
+      continue;
+    }
+
+    // Crash Recovery Check: If providerMessageId already exists on claimed record,
+    // the email was already accepted by SES/Resend before the worker crashed!
+    // Do NOT duplicate send!
+    if (claimed.provider_message_id) {
+      console.log(`[Worker Recovery] Recipient ${claimed.id} already has providerMessageId ${claimed.provider_message_id}. Marking sent.`);
+      await db
+        .update(campaignRecipients)
+        .set({
+          status: "sent",
+          sentAt: claimed.sent_at || new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(campaignRecipients.id, item.recipientId));
+      successCount++;
       continue;
     }
 
@@ -128,6 +146,7 @@ export async function handleProcessCampaignBatch(payload: { campaignId: string }
           .set({
             status: "failed",
             errorMessage: `Subscriber not in active state (currently: ${freshSub?.status || "deleted"})`,
+            updatedAt: new Date(),
           })
           .where(eq(campaignRecipients.id, item.recipientId));
         failCount++;
@@ -146,6 +165,7 @@ export async function handleProcessCampaignBatch(payload: { campaignId: string }
           .set({
             status: "failed",
             errorMessage: "Recipient email is currently on the suppression list",
+            updatedAt: new Date(),
           })
           .where(eq(campaignRecipients.id, item.recipientId));
         failCount++;
@@ -198,6 +218,7 @@ export async function handleProcessCampaignBatch(payload: { campaignId: string }
             status: "sent",
             providerMessageId: sendResult.messageId,
             sentAt: new Date(),
+            updatedAt: new Date(),
             errorMessage: null,
           })
           .where(eq(campaignRecipients.id, item.recipientId));
@@ -208,6 +229,7 @@ export async function handleProcessCampaignBatch(payload: { campaignId: string }
           .set({
             status: "failed",
             errorMessage: sendResult.error || "Email provider dispatch failed",
+            updatedAt: new Date(),
           })
           .where(eq(campaignRecipients.id, item.recipientId));
       }
@@ -219,6 +241,7 @@ export async function handleProcessCampaignBatch(payload: { campaignId: string }
         .set({
           status: "failed",
           errorMessage: sendErr.message || "Unexpected exception during dispatch",
+          updatedAt: new Date(),
         })
         .where(eq(campaignRecipients.id, item.recipientId));
     }
@@ -232,8 +255,30 @@ export async function handleProcessCampaignBatch(payload: { campaignId: string }
 
   const total = allRecipients.length;
   const sent = allRecipients.filter((r) => r.status === "sent").length;
-  const failed = allRecipients.filter((r) => r.status === "failed").length;
+  const failed = allRecipients.filter((r) => r.status === "failed" || r.status === "bounced").length;
+  const pendingOrProcessing = allRecipients.filter(
+    (r) => r.status === "queued" || r.status === "processing"
+  ).length;
 
+  // CRITICAL: Do NOT mark campaign 'sent' if any recipient is still queued or processing
+  if (pendingOrProcessing > 0) {
+    console.log(
+      `[Worker] Campaign '${campaign.title}' still has ${pendingOrProcessing} pending/processing recipients. Maintaining 'sending' status.`
+    );
+    await db
+      .update(campaigns)
+      .set({
+        status: "sending",
+        totalRecipients: total,
+        successfulSends: sent,
+        failedSends: failed,
+        updatedAt: new Date(),
+      })
+      .where(eq(campaigns.id, campaignId));
+    return;
+  }
+
+  // Only when ALL recipients have reached a terminal state:
   let finalCampaignStatus: "sent" | "partially_failed" | "failed" = "sent";
   if (failed > 0 && sent > 0) {
     finalCampaignStatus = "partially_failed";

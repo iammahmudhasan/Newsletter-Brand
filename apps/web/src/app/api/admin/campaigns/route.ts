@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, campaigns } from "@ai-signal/db";
+import { db, campaigns, eq } from "@ai-signal/db";
 import { enqueueJob } from "@ai-signal/queue";
 import { sanitizeNewsletterHtml } from "@ai-signal/email";
 import { isAuthorizedAdmin } from "@/lib/auth";
@@ -47,11 +47,20 @@ export async function POST(req: NextRequest) {
 
     // 2. If immediate dispatch requested, atomically enqueue with idempotency key
     if (isImmediateSend) {
-      jobId = await enqueueJob(
-        "process_campaign",
-        { campaignId: inserted.id },
-        { idempotencyKey: `campaign:${inserted.id}:dispatch` }
-      );
+      try {
+        jobId = await enqueueJob(
+          "process_campaign",
+          { campaignId: inserted.id },
+          { idempotencyKey: `campaign:${inserted.id}:dispatch` }
+        );
+      } catch (enqueueErr: any) {
+        console.error(`[Campaign Dispatch Error] Enqueue failed for ${inserted.id}. Reverting to draft:`, enqueueErr.message);
+        await db
+          .update(campaigns)
+          .set({ status: "draft", updatedAt: new Date() })
+          .where(eq(campaigns.id, inserted.id));
+        throw new Error(`Immediate dispatch queue failed: ${enqueueErr.message}`);
+      }
     }
 
     return NextResponse.json(

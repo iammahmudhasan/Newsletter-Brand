@@ -1,5 +1,7 @@
 import Link from "next/link";
+import { Suspense } from "react";
 import { ArrowLeft, ShieldCheck } from "lucide-react";
+import { GdprForm } from "./GdprForm";
 
 export default function PrivacyPage() {
   return (
@@ -61,8 +63,11 @@ export default function PrivacyPage() {
             <a href="mailto:privacy@aisignal.dev" className="text-brand-accent underline">
               privacy@aisignal.dev
             </a>{" "}
-            or use our automated data management tools.
+            or use our automated self-service data management tool below:
           </p>
+          <Suspense fallback={<div className="p-6 text-slate-500 text-xs">Loading portal...</div>}>
+            <GdprForm />
+          </Suspense>
         </section>
       </div>
     </div>

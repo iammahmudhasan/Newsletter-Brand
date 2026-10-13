@@ -17,6 +17,9 @@ const KNOWN_INSECURE_PASSWORDS = new Set([
   "root",
 ]);
 
+export const ALLOWED_EMAIL_PROVIDERS = ["console", "resend", "ses"] as const;
+export type EmailProviderType = (typeof ALLOWED_EMAIL_PROVIDERS)[number];
+
 /**
  * Validates configuration against fail-closed security rules in production
  */
@@ -25,8 +28,8 @@ export function validateProductionConfig(env: NodeJS.ProcessEnv = process.env): 
     return;
   }
 
-  // During next build static compilation phase, skip runtime-only secret checks
-  if (env.NEXT_PHASE === "phase-production-build" || env.SKIP_ENV_VALIDATION === "true") {
+  // Strict: Only skip runtime secret validation during Next.js static compilation phase (next build)
+  if (env.NEXT_PHASE === "phase-production-build") {
     return;
   }
 
@@ -61,9 +64,13 @@ export function validateProductionConfig(env: NodeJS.ProcessEnv = process.env): 
   }
 
   // 4. EMAIL_PROVIDER
-  const provider = env.EMAIL_PROVIDER || "console";
-  if (provider === "console") {
-    errors.push("EMAIL_PROVIDER=console is not permitted in production");
+  const provider = env.EMAIL_PROVIDER;
+  if (!provider) {
+    errors.push("EMAIL_PROVIDER is required in production (must be 'resend' or 'ses')");
+  } else if (provider === "console") {
+    errors.push("EMAIL_PROVIDER=console is not permitted in production. Must use 'resend' or 'ses'");
+  } else if (!["resend", "ses"].includes(provider)) {
+    errors.push(`EMAIL_PROVIDER '${provider}' is unrecognized and invalid. Must be 'resend' or 'ses'`);
   } else if (provider === "resend" && !env.RESEND_API_KEY) {
     errors.push("RESEND_API_KEY is required when EMAIL_PROVIDER=resend in production");
   } else if (provider === "ses") {
@@ -96,7 +103,7 @@ export const config = {
   authSecret: process.env.AUTH_SECRET || "fallback-secret-development-only-change-me",
   adminPassword: process.env.ADMIN_PASSWORD || "admin123",
   email: {
-    provider: (process.env.EMAIL_PROVIDER || "console") as "console" | "resend" | "ses",
+    provider: (process.env.EMAIL_PROVIDER || "console") as EmailProviderType,
     fromName: process.env.EMAIL_FROM_NAME || "AI Signal",
     fromAddress: process.env.EMAIL_FROM_ADDRESS || "newsletter@aisignal.dev",
     replyTo: process.env.EMAIL_REPLY_TO || "curator@aisignal.dev",
@@ -105,6 +112,7 @@ export const config = {
       region: process.env.AWS_REGION || "us-east-1",
       accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+      snsTopicArn: process.env.AWS_SNS_TOPIC_ARN || "",
     },
     webhookSecret: process.env.EMAIL_WEBHOOK_SECRET || "dev-webhook-secret",
   },

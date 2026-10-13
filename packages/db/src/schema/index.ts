@@ -113,6 +113,7 @@ export const campaignRecipients = pgTable(
     errorMessage: text("error_message"),
     sentAt: timestamp("sent_at"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
   (table) => [
     uniqueIndex("campaign_recipient_unique_idx").on(table.campaignId, table.subscriberId),

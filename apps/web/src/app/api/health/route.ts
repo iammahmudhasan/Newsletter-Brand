@@ -1,13 +1,29 @@
-import { NextResponse } from "next/server";
-import { db, subscribers, suppressions, automationJobs, emailEvents, sql } from "@ai-signal/db";
+import { NextRequest, NextResponse } from "next/server";
+import { db, subscribers, automationJobs, emailEvents, sql } from "@ai-signal/db";
+import { isAuthorizedAdmin } from "@/lib/auth";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const startTime = Date.now();
-  const alerts: string[] = [];
 
   try {
-    // 1. Check DB connectivity
+    // 1. Check basic DB connectivity
     await db.execute(sql`SELECT 1`);
+
+    const isAdmin = isAuthorizedAdmin(req);
+
+    // Public health response: minimal status, no internal telemetry leaks
+    if (!isAdmin) {
+      return NextResponse.json(
+        {
+          status: "healthy",
+          timestamp: new Date().toISOString(),
+        },
+        { status: 200 }
+      );
+    }
+
+    // Authenticated admin response: detailed operational metrics
+    const alerts: string[] = [];
 
     // 2. Fetch subscriber health counts
     const [subStats] = await db
@@ -77,11 +93,11 @@ export async function GET() {
       alerts,
     });
   } catch (err: any) {
+    const isAdmin = isAuthorizedAdmin(req);
     return NextResponse.json(
       {
         status: "unhealthy",
-        error: err.message,
-        latencyMs: Date.now() - startTime,
+        ...(isAdmin ? { error: err.message } : {}),
         timestamp: new Date().toISOString(),
       },
       { status: 503 }

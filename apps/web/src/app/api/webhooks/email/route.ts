@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db, subscribers, suppressions, emailEvents, eq, and } from "@ai-signal/db";
 import { normalizeEmail, config } from "@ai-signal/config";
 import crypto from "crypto";
+import { verifyAwsSnsSignature } from "@/lib/sns";
 
 /**
  * Verifies Resend / Svix webhook signature
@@ -77,54 +78,11 @@ function verifyResendSvixSignature(
   }
 }
 
-/**
- * Verifies AWS SNS webhook message signature / token
- */
-function verifyAwsSnsSignature(payload: any, headers: Headers, secret: string): boolean {
-  // If a shared token or secret header is configured for SES/SNS HTTPS subscription
-  const tokenHeader = headers.get("x-amz-sns-token") || headers.get("x-webhook-secret");
-  if (tokenHeader && tokenHeader === secret) {
-    return true;
-  }
-
-  // Basic validation that SNS message has required structure
-  if (payload.Type && (payload.Type === "Notification" || payload.Type === "SubscriptionConfirmation")) {
-    if (payload.TopicArn && payload.MessageId) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 export async function POST(req: NextRequest) {
   try {
     const rawBody = await req.text();
     const isProduction = process.env.NODE_ENV === "production";
     const webhookSecret = config.email.webhookSecret;
-
-    const signatureHeader =
-      req.headers.get("svix-signature") ||
-      req.headers.get("x-resend-signature") ||
-      req.headers.get("x-webhook-signature") ||
-      req.headers.get("x-amz-sns-message-type");
-
-    // In production, signature or SNS authentication header is MANDATORY
-    if (isProduction) {
-      if (!signatureHeader) {
-        return NextResponse.json(
-          { error: "Unauthorized: Missing required webhook signature header" },
-          { status: 401 }
-        );
-      }
-
-      if (!webhookSecret || webhookSecret === "dev-webhook-secret") {
-        return NextResponse.json(
-          { error: "Server misconfiguration: EMAIL_WEBHOOK_SECRET is not configured" },
-          { status: 500 }
-        );
-      }
-    }
 
     let payload: any;
     try {
@@ -133,23 +91,53 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Malformed JSON payload" }, { status: 400 });
     }
 
-    // Determine provider & verify signature
-    const isAwsSns = payload.Type === "Notification" || payload.Type === "SubscriptionConfirmation";
+    const isAwsSns =
+      payload.Type === "Notification" ||
+      payload.Type === "SubscriptionConfirmation" ||
+      req.headers.has("x-amz-sns-message-type");
 
-    // Whenever a signature is supplied or secret is configured, strictly enforce signature verification
-    if (signatureHeader || (webhookSecret && isProduction)) {
-      let isSignatureValid = false;
-      if (isAwsSns) {
-        isSignatureValid = verifyAwsSnsSignature(payload, req.headers, webhookSecret);
-      } else {
-        isSignatureValid = verifyResendSvixSignature(rawBody, webhookSecret, req.headers);
-      }
+    if (isAwsSns) {
+      // 1. Strictly verify AWS SNS cryptographic signature
+      const snsResult = await verifyAwsSnsSignature(payload, {
+        allowedTopicArn: config.email.aws.snsTopicArn,
+      });
 
-      if (!isSignatureValid) {
+      if (!snsResult.valid) {
+        console.warn(`[Webhook Security] Rejected illegitimate AWS SNS notification: ${snsResult.error}`);
         return NextResponse.json(
-          { error: "Unauthorized: Invalid webhook signature" },
+          { error: `Unauthorized: ${snsResult.error || "Invalid AWS SNS signature"}` },
           { status: 401 }
         );
+      }
+    } else {
+      // 2. Strictly verify Resend Svix signature
+      const svixSignatureHeader =
+        req.headers.get("svix-signature") ||
+        req.headers.get("x-resend-signature") ||
+        req.headers.get("x-webhook-signature");
+
+      if (isProduction && !svixSignatureHeader) {
+        return NextResponse.json(
+          { error: "Unauthorized: Missing required webhook signature header" },
+          { status: 401 }
+        );
+      }
+
+      if (svixSignatureHeader || (webhookSecret && isProduction)) {
+        if (!webhookSecret || (isProduction && webhookSecret === "dev-webhook-secret")) {
+          return NextResponse.json(
+            { error: "Server misconfiguration: EMAIL_WEBHOOK_SECRET is not configured" },
+            { status: 500 }
+          );
+        }
+
+        const isSignatureValid = verifyResendSvixSignature(rawBody, webhookSecret, req.headers);
+        if (!isSignatureValid) {
+          return NextResponse.json(
+            { error: "Unauthorized: Invalid webhook signature" },
+            { status: 401 }
+          );
+        }
       }
     }
 
