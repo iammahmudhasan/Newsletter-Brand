@@ -14,6 +14,7 @@
     "db:generate": "npm run db:generate --workspace=packages/db",
     "db:push": "npm run db:push --workspace=packages/db",
     "db:studio": "npm run db:studio --workspace=packages/db",
+    "test": "bun run tests/unit/tokens.test.ts && bun run tests/integration/email-renderer.test.ts && bun run tests/e2e/subscriber-journey.test.ts",
     "typecheck": "tsc --build"
   },
   "devDependencies": {

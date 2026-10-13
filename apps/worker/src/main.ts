@@ -5,6 +5,7 @@ import { claimNextJob, completeJob, failJob } from "@ai-signal/queue";
 import { handleSendConfirmation } from "./handlers/sendConfirmation";
 import { handleSendWelcome } from "./handlers/sendWelcome";
 import { handleProcessCampaignBatch } from "./handlers/processCampaign";
+import { runCampaignScheduler } from "./scheduler/campaignScheduler";
 
 let isRunning = true;
 const POLL_INTERVAL_MS = 2000;
@@ -46,8 +47,18 @@ async function workerLoop() {
   console.log(`Mode: Poll interval ${POLL_INTERVAL_MS}ms`);
   console.log("=================================================");
 
+  let lastSchedulerRun = 0;
+  const SCHEDULER_INTERVAL_MS = 30000;
+
   while (isRunning) {
     try {
+      // Check scheduler if interval elapsed
+      const now = Date.now();
+      if (now - lastSchedulerRun >= SCHEDULER_INTERVAL_MS) {
+        lastSchedulerRun = now;
+        await runCampaignScheduler();
+      }
+
       const hadJob = await processNextJob();
       if (!hadJob) {
         // No pending jobs, wait for interval

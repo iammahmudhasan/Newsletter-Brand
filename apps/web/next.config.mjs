@@ -5,6 +5,7 @@ const nextConfig = {
     "@ai-signal/db",
     "@ai-signal/email",
     "@ai-signal/queue",
+    "@ai-signal/validation",
   ],
   reactStrictMode: true,
 };

@@ -22,7 +22,9 @@
       "@ai-signal/queue": ["packages/queue/src"],
       "@ai-signal/queue/*": ["packages/queue/src/*"],
       "@ai-signal/config": ["packages/config/src"],
-      "@ai-signal/config/*": ["packages/config/src/*"]
+      "@ai-signal/config/*": ["packages/config/src/*"],
+      "@ai-signal/validation": ["packages/validation/src"],
+      "@ai-signal/validation/*": ["packages/validation/src/*"]
     }
   },
   "exclude": ["node_modules"]

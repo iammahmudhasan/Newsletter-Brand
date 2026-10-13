@@ -5,6 +5,10 @@ import { SesEmailProvider } from "./providers/ses";
 import { config } from "@ai-signal/config";
 
 export * from "./types";
+export * from "./renderer";
+export * from "./providers/console";
+export * from "./providers/resend";
+export * from "./providers/ses";
 export * from "./templates/confirmation";
 export * from "./templates/welcome";
 export * from "./templates/newsletter";

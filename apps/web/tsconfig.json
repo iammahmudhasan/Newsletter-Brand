@@ -23,7 +23,8 @@
       "@ai-signal/config": ["../../packages/config/src"],
       "@ai-signal/db": ["../../packages/db/src"],
       "@ai-signal/email": ["../../packages/email/src"],
-      "@ai-signal/queue": ["../../packages/queue/src"]
+      "@ai-signal/queue": ["../../packages/queue/src"],
+      "@ai-signal/validation": ["../../packages/validation/src"]
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
