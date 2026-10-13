@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, subscribers, suppressions, emailEvents, eq, and } from "@ai-signal/db";
+import { db, subscribers, suppressions, emailEvents, campaignRecipients, eq, and, sql } from "@ai-signal/db";
 import { normalizeEmail, config } from "@ai-signal/config";
 import crypto from "crypto";
-import { verifyAwsSnsSignature } from "@/lib/sns";
+import { verifyAwsSnsSignature, confirmSnsSubscription } from "@/lib/sns";
 
 /**
  * Verifies Resend / Svix webhook signature
@@ -150,10 +150,33 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Handle AWS SNS Subscription Confirmation
-    if (payload.Type === "SubscriptionConfirmation" && payload.SubscribeURL) {
-      console.log(`[Webhook SES/SNS] Subscription confirmation URL received: ${payload.SubscribeURL}`);
-      return NextResponse.json({ success: true, message: "Subscription confirmation acknowledged" });
+    // 3. Handle AWS SNS Subscription Confirmation (complete verification via SDK or verified URL)
+    if (payload.Type === "SubscriptionConfirmation") {
+      const confirmResult = await confirmSnsSubscription({
+        TopicArn: payload.TopicArn,
+        Token: payload.Token,
+        SubscribeURL: payload.SubscribeURL,
+      });
+
+      if (!confirmResult.success) {
+        console.error(`[Webhook SES/SNS] Failed to confirm subscription: ${confirmResult.error}`);
+        return NextResponse.json(
+          { error: `Failed to confirm SNS subscription: ${confirmResult.error}` },
+          { status: 500 }
+        );
+      }
+
+      console.log(
+        `[Webhook SES/SNS] Subscription confirmed successfully! SubscriptionArn: ${confirmResult.subscriptionArn || "verified"}`
+      );
+      return NextResponse.json(
+        {
+          success: true,
+          message: "AWS SNS subscription confirmed successfully",
+          subscriptionArn: confirmResult.subscriptionArn,
+        },
+        { status: 200 }
+      );
     }
 
     // If it's an SNS Notification wrapping an SES event, unwrap the Message string
@@ -172,12 +195,18 @@ export async function POST(req: NextRequest) {
     let providerMessageId: string | null = null;
     let isHardBounce = false;
     let isSoftBounce = false;
+    let recipientIdTag: string | null = null;
 
     // 1. Resend structure
     if (eventData.type && typeof eventData.type === "string") {
       eventType = eventData.type;
       recipientEmail = eventData.data?.to?.[0] || eventData.data?.email || null;
       providerMessageId = eventData.data?.email_id || eventData.id || null;
+
+      if (Array.isArray(eventData.data?.tags)) {
+        const found = eventData.data.tags.find((t: any) => t.name === "recipient_id");
+        if (found) recipientIdTag = found.value;
+      }
 
       if (eventType === "email.bounced") {
         const bounceType = eventData.data?.bounce?.type || "";
@@ -192,6 +221,12 @@ export async function POST(req: NextRequest) {
     else if (eventData.eventType || eventData.notificationType) {
       const sesType = eventData.eventType || eventData.notificationType;
       providerMessageId = eventData.mail?.messageId || null;
+
+      // Check SES message tags
+      if (eventData.mail?.tags?.recipient_id) {
+        const tagVal = eventData.mail.tags.recipient_id;
+        recipientIdTag = Array.isArray(tagVal) ? tagVal[0] : tagVal;
+      }
 
       if (sesType === "Bounce") {
         eventType = "email.bounced";
@@ -235,86 +270,111 @@ export async function POST(req: NextRequest) {
         ? "delivered"
         : "unknown";
 
-    // Database Idempotency Check: atomic insert with onConflictDoNothing
-    // Prevents concurrent duplicate webhooks from double-processing
-    if (providerMessageId) {
-      const inserted = await db
-        .insert(emailEvents)
-        .values({
-          providerMessageId,
+    // 4. ATOMIC TRANSACTION: Event logging, suppression updates, and campaign recipient reconciliation
+    // Wrapping in a single ACID transaction ensures that if suppression or status updates fail,
+    // the event insert rolls back, allowing provider retries to re-attempt suppression processing!
+    const txResult = await db.transaction(async (tx) => {
+      // Step A: Idempotency check with ON CONFLICT DO NOTHING
+      if (providerMessageId) {
+        const inserted = await tx
+          .insert(emailEvents)
+          .values({
+            providerMessageId,
+            recipientEmail: email,
+            eventType: standardizedType,
+            payload: eventData,
+          })
+          .onConflictDoNothing({
+            target: [emailEvents.providerMessageId, emailEvents.eventType],
+          })
+          .returning({ id: emailEvents.id });
+
+        if (inserted.length === 0) {
+          // Event was ALREADY successfully processed in a committed transaction
+          return { isDuplicate: true };
+        }
+      } else {
+        await tx.insert(emailEvents).values({
+          providerMessageId: null,
           recipientEmail: email,
           eventType: standardizedType,
           payload: eventData,
-        })
-        .onConflictDoNothing({
-          target: [emailEvents.providerMessageId, emailEvents.eventType],
-        })
-        .returning({ id: emailEvents.id });
-
-      if (inserted.length === 0) {
-        // Row was not inserted because this exact (providerMessageId, eventType) already exists!
-        return NextResponse.json(
-          { received: true, duplicate: true, note: "Event already processed" },
-          { status: 200 }
-        );
+        });
       }
-    } else {
-      // Fallback if provider didn't supply providerMessageId
-      await db.insert(emailEvents).values({
-        providerMessageId: null,
-        recipientEmail: email,
-        eventType: standardizedType,
-        payload: eventData,
-      });
+
+      // Step B: Reconcile campaign recipient status if tag exists
+      if (recipientIdTag && providerMessageId) {
+        await tx
+          .update(campaignRecipients)
+          .set({
+            status: "sent",
+            providerMessageId,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(campaignRecipients.id, recipientIdTag),
+              sql`${campaignRecipients.status} != 'sent'`
+            )
+          );
+      }
+
+      // Step C: Process Hard Bounce: suppress permanently
+      if (standardizedType === "bounce") {
+        if (isHardBounce) {
+          console.warn(`[Webhook] Permanent hard bounce detected for ${email}. Suppressing.`);
+          await tx
+            .update(subscribers)
+            .set({ status: "bounced" })
+            .where(eq(subscribers.email, email));
+
+          await tx
+            .insert(suppressions)
+            .values({
+              email,
+              reason: "hard_bounce",
+              details: JSON.stringify(eventData.bounce || eventData.data?.bounce || "Permanent delivery failure"),
+            })
+            .onConflictDoNothing();
+        } else if (isSoftBounce) {
+          console.log(`[Webhook] Transient/soft bounce recorded for ${email}. Subscriber retained.`);
+        }
+      }
+
+      // Step D: Process Spam Complaint: suppress immediately
+      if (standardizedType === "complaint") {
+        console.warn(`[Webhook] Spam complaint reported for ${email}. Suppressing immediately.`);
+        await tx
+          .update(subscribers)
+          .set({ status: "complained" })
+          .where(eq(subscribers.email, email));
+
+        await tx
+          .insert(suppressions)
+          .values({
+            email,
+            reason: "complaint",
+            details: "Spam complaint received from ISP / mailbox provider",
+          })
+          .onConflictDoNothing();
+      }
+
+      return { isDuplicate: false };
+    });
+
+    if (txResult.isDuplicate) {
+      return NextResponse.json(
+        { received: true, duplicate: true, note: "Event already processed in previous transaction" },
+        { status: 200 }
+      );
     }
 
-    // Skip suppression or analytics side effects if event type is unknown
     if (standardizedType === "unknown") {
       console.warn(`[Webhook] Recorded unclassified or unknown event type '${eventType}' for ${email}`);
       return NextResponse.json(
         { received: true, unhandledType: eventType, note: "Unknown event type recorded without state modification" },
         { status: 200 }
       );
-    }
-
-    // Process Hard Bounce: suppress permanently
-    if (standardizedType === "bounce") {
-      if (isHardBounce) {
-        console.warn(`[Webhook] Permanent hard bounce detected for ${email}. Suppressing.`);
-        await db
-          .update(subscribers)
-          .set({ status: "bounced" })
-          .where(eq(subscribers.email, email));
-
-        await db
-          .insert(suppressions)
-          .values({
-            email,
-            reason: "hard_bounce",
-            details: JSON.stringify(eventData.bounce || eventData.data?.bounce || "Permanent delivery failure"),
-          })
-          .onConflictDoNothing();
-      } else if (isSoftBounce) {
-        console.log(`[Webhook] Transient/soft bounce recorded for ${email}. Subscriber retained.`);
-      }
-    }
-
-    // Process Spam Complaint: suppress immediately
-    if (standardizedType === "complaint") {
-      console.warn(`[Webhook] Spam complaint reported for ${email}. Suppressing immediately.`);
-      await db
-        .update(subscribers)
-        .set({ status: "complained" })
-        .where(eq(subscribers.email, email));
-
-      await db
-        .insert(suppressions)
-        .values({
-          email,
-          reason: "complaint",
-          details: "Spam complaint received from ISP / mailbox provider",
-        })
-        .onConflictDoNothing();
     }
 
     return NextResponse.json({ success: true, processed: true }, { status: 200 });

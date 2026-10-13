@@ -5,8 +5,8 @@
   "types": "./src/index.ts",
   "scripts": {
     "db:generate": "drizzle-kit generate",
-    "db:push": "drizzle-kit push --force",
-    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:migrate": "bun run ./src/migrate.ts",
     "db:studio": "drizzle-kit studio",
     "typecheck": "tsc --noEmit"
   },

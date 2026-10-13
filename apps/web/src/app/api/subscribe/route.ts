@@ -43,26 +43,62 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 2. Check existing subscriber record
-    let subscriberId: string;
-    const [existing] = await db
-      .select({ id: subscribers.id, status: subscribers.status })
-      .from(subscribers)
-      .where(eq(subscribers.email, email));
+    const clientIp =
+      req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+      req.headers.get("x-real-ip") ||
+      "127.0.0.1";
+    const userAgent = req.headers.get("user-agent") || "unknown";
 
-    if (existing) {
-      if (existing.status === "active") {
-        return NextResponse.json(
+    // 2. ATOMIC TRANSACTION: Persist subscriber, consent audit log, and confirmation outbox job together
+    const txResult = await db.transaction(async (tx) => {
+      // Check existing subscriber record
+      const [existing] = await tx
+        .select({ id: subscribers.id, status: subscribers.status })
+        .from(subscribers)
+        .where(eq(subscribers.email, email));
+
+      if (existing) {
+        if (existing.status === "active") {
+          return { alreadyActive: true };
+        }
+
+        const subscriberId = existing.id;
+
+        // Ensure consent event exists (healing missing consent records on signup retries)
+        const [existingConsent] = await tx
+          .select({ id: consentEvents.id })
+          .from(consentEvents)
+          .where(eq(consentEvents.subscriberId, subscriberId))
+          .limit(1);
+
+        if (!existingConsent) {
+          await tx.insert(consentEvents).values({
+            subscriberId,
+            source: signupSource,
+            consentText: "Subscriber opted in via aisignal.dev web form.",
+            ipHash: hashIp(clientIp),
+            userAgent: userAgent.slice(0, 255),
+          });
+        }
+
+        // Atomically enqueue confirmation email job in outbox
+        await enqueueJob(
+          "send_confirmation",
           {
-            message: "You are already an active subscriber to AI Signal! Watch your inbox this Friday.",
+            subscriberId,
+            email,
           },
-          { status: 200 }
+          {
+            idempotencyKey: `confirm:${subscriberId}:${Math.floor(Date.now() / (1000 * 300))}`, // 5-minute deduplication
+          },
+          tx
         );
+
+        return { alreadyActive: false, subscriberId };
       }
-      subscriberId = existing.id;
-    } else {
-      // 3. Atomically persist subscriber and consent audit log
-      const [inserted] = await db
+
+      // New subscriber path: atomically create subscriber, consent event, and confirmation job
+      const [inserted] = await tx
         .insert(subscribers)
         .values({
           email,
@@ -71,34 +107,39 @@ export async function POST(req: NextRequest) {
         })
         .returning({ id: subscribers.id });
 
-      subscriberId = inserted.id;
+      const subscriberId = inserted.id;
 
-      const clientIp =
-        req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-        req.headers.get("x-real-ip") ||
-        "127.0.0.1";
-      const userAgent = req.headers.get("user-agent") || "unknown";
-
-      await db.insert(consentEvents).values({
+      await tx.insert(consentEvents).values({
         subscriberId,
         source: signupSource,
         consentText: "Subscriber opted in via aisignal.dev web form.",
         ipHash: hashIp(clientIp),
         userAgent: userAgent.slice(0, 255),
       });
-    }
 
-    // 4. Enqueue confirmation email job
-    await enqueueJob(
-      "send_confirmation",
-      {
-        subscriberId,
-        email,
-      },
-      {
-        idempotencyKey: `confirm:${subscriberId}:${Math.floor(Date.now() / (1000 * 300))}`, // 5-minute deduplication
-      }
-    );
+      await enqueueJob(
+        "send_confirmation",
+        {
+          subscriberId,
+          email,
+        },
+        {
+          idempotencyKey: `confirm:${subscriberId}:${Math.floor(Date.now() / (1000 * 300))}`,
+        },
+        tx
+      );
+
+      return { alreadyActive: false, subscriberId };
+    });
+
+    if (txResult.alreadyActive) {
+      return NextResponse.json(
+        {
+          message: "You are already an active subscriber to AI Signal! Watch your inbox this Friday.",
+        },
+        { status: 200 }
+      );
+    }
 
     return NextResponse.json(
       {

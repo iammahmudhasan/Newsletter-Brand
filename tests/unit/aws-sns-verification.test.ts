@@ -278,4 +278,55 @@ describe("AWS SNS Webhook Signature Verification Security", () => {
       expect(result.error).toBeUndefined();
     });
   });
+
+  describe("confirmSnsSubscription", () => {
+    it("fails when TopicArn or Token is missing", async () => {
+      const { confirmSnsSubscription } = await import("../../apps/web/src/lib/sns");
+      const res = await confirmSnsSubscription({
+        TopicArn: "",
+        Token: "",
+      });
+      expect(res.success).toBe(false);
+      expect(res.error).toContain("Missing required TopicArn or Token");
+    });
+
+    it("rejects untrusted or malicious SubscribeURL hosts (SSRF prevention)", async () => {
+      const { confirmSnsSubscription } = await import("../../apps/web/src/lib/sns");
+      const res = await confirmSnsSubscription({
+        TopicArn: "arn:aws:sns:us-east-1:123:test",
+        Token: "tok-123",
+        SubscribeURL: "https://attacker-controlled-site.com/confirm",
+      });
+      expect(res.success).toBe(false);
+      expect(res.error).toContain("Untrusted SubscribeURL");
+    });
+
+    it("rejects non-https SubscribeURL", async () => {
+      const { confirmSnsSubscription } = await import("../../apps/web/src/lib/sns");
+      const res = await confirmSnsSubscription({
+        TopicArn: "arn:aws:sns:us-east-1:123:test",
+        Token: "tok-123",
+        SubscribeURL: "http://sns.us-east-1.amazonaws.com/confirm",
+      });
+      expect(res.success).toBe(false);
+      expect(res.error).toContain("Untrusted SubscribeURL");
+    });
+
+    it("confirms subscription successfully with valid AWS SNS SubscribeURL", async () => {
+      const { confirmSnsSubscription } = await import("../../apps/web/src/lib/sns");
+      let calledUrl = "";
+      const res = await confirmSnsSubscription({
+        TopicArn: "arn:aws:sns:us-east-1:123:test",
+        Token: "tok-123",
+        SubscribeURL: "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-east-1:123:test&Token=tok-123",
+        customFetcher: async (url) => {
+          calledUrl = url;
+          return { ok: true, status: 200 };
+        },
+      });
+
+      expect(res.success).toBe(true);
+      expect(calledUrl).toContain("https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription");
+    });
+  });
 });

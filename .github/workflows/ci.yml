@@ -47,7 +47,7 @@ jobs:
         run: bun install
 
       - name: Run Database Migrations
-        run: bun run db:push
+        run: bun run db:migrate
 
       - name: Run Lint Verification
         run: bun run lint

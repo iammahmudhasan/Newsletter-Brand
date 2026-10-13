@@ -12,7 +12,7 @@ export function getDb() {
     client = postgres(connectionString, {
       max: 10,
       idle_timeout: 20,
-      connect_timeout: 10,
+      connect_timeout: process.env.NODE_ENV === "test" && !process.env.CI ? 1 : 10,
       prepare: false, // Required for transaction poolers like Supabase & PgBouncer
     });
     dbInstance = drizzle(client, { schema });

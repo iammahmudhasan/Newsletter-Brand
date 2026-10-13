@@ -40,12 +40,31 @@ export class SesEmailProvider implements EmailProvider {
         ...(options.idempotencyKey ? { "X-Idempotency-Key": options.idempotencyKey } : {}),
       };
 
+      const emailTags: Array<{ Name: string; Value: string }> = [];
+      if (options.tags) {
+        for (const [key, val] of Object.entries(options.tags)) {
+          if (val) {
+            emailTags.push({
+              Name: key.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 256),
+              Value: String(val).slice(0, 256),
+            });
+          }
+        }
+      }
+      if (options.idempotencyKey && !emailTags.some((t) => t.Name === "idempotency_key")) {
+        emailTags.push({
+          Name: "idempotency_key",
+          Value: options.idempotencyKey.slice(0, 256),
+        });
+      }
+
       const command = new SendEmailCommand({
         FromEmailAddress: from,
         Destination: {
           ToAddresses: Array.isArray(options.to) ? options.to : [options.to],
         },
         ReplyToAddresses: [config.email.replyTo],
+        EmailTags: emailTags.length > 0 ? emailTags : undefined,
         Content: {
           Simple: {
             Subject: {

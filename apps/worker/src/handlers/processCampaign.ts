@@ -4,6 +4,7 @@ import {
   subscribers,
   suppressions,
   campaignRecipients,
+  emailEvents,
   eq,
   and,
   sql,
@@ -152,6 +153,41 @@ export async function handleProcessCampaignBatch(
         continue;
       }
 
+      // Ambiguous Send Reconciliation: If this record was stuck in 'processing',
+      // check if a webhook event (SES or Resend) already recorded delivery/bounce for this recipient
+      if (item.status === "processing") {
+        const [reconciledEvent] = await db
+          .select({
+            providerMessageId: emailEvents.providerMessageId,
+          })
+          .from(emailEvents)
+          .where(
+            and(
+              sql`(${emailEvents.payload}->'mail'->'tags'->'recipient_id' ? ${item.recipientId}
+                OR ${emailEvents.payload}->'mail'->'tags'->>'recipient_id' = ${item.recipientId}
+                OR ${emailEvents.payload}->'data'->'tags'->>0 = ${item.recipientId})`
+            )
+          )
+          .limit(1);
+
+        if (reconciledEvent && reconciledEvent.providerMessageId) {
+          console.log(
+            `[Worker Ambiguous Recovery] Recipient ${item.recipientId} reconciled from webhook telemetry ${reconciledEvent.providerMessageId}. Marking sent without duplicate send.`
+          );
+          await db
+            .update(campaignRecipients)
+            .set({
+              status: "sent",
+              providerMessageId: reconciledEvent.providerMessageId,
+              sentAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(campaignRecipients.id, item.recipientId));
+          successCount++;
+          continue;
+        }
+      }
+
       try {
         // Fresh check of subscriber status and suppression list immediately prior to dispatch
         const [freshSub] = await db
@@ -230,6 +266,10 @@ export async function handleProcessCampaignBatch(
           html,
           text,
           headers,
+          tags: {
+            campaign_id: campaign.id,
+            recipient_id: item.recipientId,
+          },
           idempotencyKey,
         });
 

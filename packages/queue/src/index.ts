@@ -7,15 +7,17 @@ export interface EnqueueOptions {
 }
 
 /**
- * Durable job enqueueing backed by PostgreSQL with idempotency
+ * Durable job enqueueing backed by PostgreSQL with idempotency.
+ * Accepts an optional transaction client for atomic outbox patterns.
  */
 export async function enqueueJob(
   jobName: string,
   payload: Record<string, any>,
-  options: EnqueueOptions = {}
+  options: EnqueueOptions = {},
+  client: any = db
 ): Promise<string> {
   try {
-    const [inserted] = await db
+    const [inserted] = await client
       .insert(automationJobs)
       .values({
         jobName,

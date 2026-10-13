@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, adminLoginAttempts, eq } from "@ai-signal/db";
+import { db, adminLoginAttempts, eq, sql } from "@ai-signal/db";
 import { config, hashIp } from "@ai-signal/config";
 import {
   createAdminSessionToken,
@@ -22,12 +22,19 @@ const fallbackRateLimits = new Map<string, FallbackRecord>();
  * Extracts verified client IP address from trusted headers or fallback
  */
 function getClientIp(req: NextRequest): string {
+  // 1. Next.js / Edge runtime trusted client IP
+  const nextIp = (req as any).ip;
+  if (nextIp && typeof nextIp === "string") return nextIp.trim();
+
+  // 2. Cloudflare trusted client IP
   const cfIp = req.headers.get("cf-connecting-ip");
   if (cfIp) return cfIp.trim();
 
+  // 3. X-Real-IP from trusted reverse proxy
   const realIp = req.headers.get("x-real-ip");
   if (realIp) return realIp.trim();
 
+  // 4. Standard X-Forwarded-For (client is leftmost entry)
   const forwarded = req.headers.get("x-forwarded-for");
   if (forwarded) return forwarded.split(",")[0].trim();
 
@@ -35,7 +42,7 @@ function getClientIp(req: NextRequest): string {
 }
 
 /**
- * Checks login rate limit using PostgreSQL for distributed environments with in-memory fallback
+ * Checks login rate limit using PostgreSQL for distributed environments with fail-closed production policy
  */
 async function checkDistributedRateLimit(
   ipHash: string
@@ -65,7 +72,13 @@ async function checkDistributedRateLimit(
 
     return { allowed: true };
   } catch (err: any) {
-    console.warn("[RateLimit DB Error] Falling back to memory limiter:", err.message);
+    if (process.env.NODE_ENV === "production") {
+      console.error("[RateLimit Production Fail-Closed]: Database error checking rate limits:", err.message);
+      // In production, fail-closed to prevent brute force bypass during database outage
+      return { allowed: false, retryAfterSeconds: 60 };
+    }
+
+    console.warn("[RateLimit DB Error] Falling back to memory limiter in non-production:", err.message);
     const rec = fallbackRateLimits.get(ipHash);
     if (rec && now < rec.resetAt && rec.attempts >= MAX_LOGIN_ATTEMPTS) {
       return { allowed: false, retryAfterSeconds: Math.ceil((rec.resetAt - now) / 1000) };
@@ -75,42 +88,31 @@ async function checkDistributedRateLimit(
 }
 
 /**
- * Records a failed login attempt in PostgreSQL
+ * Records a failed login attempt in PostgreSQL atomically using ON CONFLICT DO UPDATE
+ * Completely prevents race conditions across concurrent requests.
  */
 async function recordFailedAttempt(ipHash: string): Promise<void> {
-  const now = new Date();
-
   try {
-    const [existing] = await db
-      .select()
-      .from(adminLoginAttempts)
-      .where(eq(adminLoginAttempts.ipHash, ipHash));
-
-    if (!existing) {
-      await db.insert(adminLoginAttempts).values({
-        ipHash,
-        attempts: 1,
-        updatedAt: now,
-      });
-    } else {
-      const windowExpired = existing.updatedAt.getTime() + LOCKOUT_WINDOW_MS < now.getTime();
-      const newAttempts = windowExpired ? 1 : existing.attempts + 1;
-      const lockedUntil =
-        newAttempts >= MAX_LOGIN_ATTEMPTS
-          ? new Date(now.getTime() + LOCKOUT_WINDOW_MS)
-          : null;
-
-      await db
-        .update(adminLoginAttempts)
-        .set({
-          attempts: newAttempts,
-          lockedUntil,
-          updatedAt: now,
-        })
-        .where(eq(adminLoginAttempts.id, existing.id));
-    }
+    await db.execute(sql`
+      INSERT INTO admin_login_attempts (ip_hash, attempts, locked_until, updated_at)
+      VALUES (${ipHash}, 1, NULL, NOW())
+      ON CONFLICT (ip_hash) DO UPDATE
+      SET
+        attempts = CASE
+          WHEN admin_login_attempts.updated_at < NOW() - INTERVAL '15 minutes' THEN 1
+          ELSE admin_login_attempts.attempts + 1
+        END,
+        locked_until = CASE
+          WHEN (CASE WHEN admin_login_attempts.updated_at < NOW() - INTERVAL '15 minutes' THEN 1 ELSE admin_login_attempts.attempts + 1 END) >= ${MAX_LOGIN_ATTEMPTS}
+          THEN NOW() + INTERVAL '15 minutes'
+          ELSE NULL
+        END,
+        updated_at = NOW();
+    `);
   } catch (err: any) {
-    console.warn("[RateLimit DB Error] Recording failed attempt in fallback memory:", err.message);
+    if (process.env.NODE_ENV === "production") {
+      console.error("[RateLimit Production Error] Failed to atomically record failed attempt in database:", err.message);
+    }
     const rec = fallbackRateLimits.get(ipHash);
     const nowMs = Date.now();
     if (!rec || nowMs > rec.resetAt) {

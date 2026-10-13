@@ -29,44 +29,38 @@ export async function POST(req: NextRequest) {
     const isImmediateSend = sendNow === true || !scheduledAt || new Date(scheduledAt).getTime() <= Date.now();
     const scheduleDate = scheduledAt ? new Date(scheduledAt) : new Date();
 
-    // 1. Create campaign in DB
-    const [inserted] = await db
-      .insert(campaigns)
-      .values({
-        title: title.trim(),
-        subject: subject.trim(),
-        previewText: previewText?.trim() || "",
-        contentHtml: sanitizedHtml,
-        contentPlain: contentPlain?.trim() || "",
-        status: isImmediateSend ? "sending" : "scheduled",
-        scheduledAt: scheduleDate,
-      })
-      .returning({ id: campaigns.id });
+    // Transactional Outbox: Atomically persist campaign and outbox job in a single database transaction
+    const { campaignId, jobId } = await db.transaction(async (tx) => {
+      const [inserted] = await tx
+        .insert(campaigns)
+        .values({
+          title: title.trim(),
+          subject: subject.trim(),
+          previewText: previewText?.trim() || "",
+          contentHtml: sanitizedHtml,
+          contentPlain: contentPlain?.trim() || "",
+          status: isImmediateSend ? "sending" : "scheduled",
+          scheduledAt: scheduleDate,
+        })
+        .returning({ id: campaigns.id });
 
-    let jobId: string | null = null;
-
-    // 2. If immediate dispatch requested, atomically enqueue with idempotency key
-    if (isImmediateSend) {
-      try {
-        jobId = await enqueueJob(
+      let enqueuedJobId: string | null = null;
+      if (isImmediateSend) {
+        enqueuedJobId = await enqueueJob(
           "process_campaign",
           { campaignId: inserted.id },
-          { idempotencyKey: `campaign:${inserted.id}:dispatch` }
+          { idempotencyKey: `campaign:${inserted.id}:dispatch` },
+          tx
         );
-      } catch (enqueueErr: any) {
-        console.error(`[Campaign Dispatch Error] Enqueue failed for ${inserted.id}. Reverting to draft:`, enqueueErr.message);
-        await db
-          .update(campaigns)
-          .set({ status: "draft", updatedAt: new Date() })
-          .where(eq(campaigns.id, inserted.id));
-        throw new Error(`Immediate dispatch queue failed: ${enqueueErr.message}`);
       }
-    }
+
+      return { campaignId: inserted.id, jobId: enqueuedJobId };
+    });
 
     return NextResponse.json(
       {
         success: true,
-        campaignId: inserted.id,
+        campaignId,
         jobId,
         status: isImmediateSend ? "sending" : "scheduled",
         message: isImmediateSend

@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { config } from "@ai-signal/config";
 
 // In-memory certificate cache: URL -> PEM certificate string
 const certCache = new Map<string, { pem: string; expiresAt: number }>();
@@ -211,3 +212,101 @@ export async function verifyAwsSnsSignature(
     return { valid: false, error: `Signature verification exception: ${err.message}` };
   }
 }
+
+export interface ConfirmSubscriptionOptions {
+  TopicArn: string;
+  Token: string;
+  SubscribeURL?: string;
+  customFetcher?: (url: string) => Promise<{ ok: boolean; status: number }>;
+}
+
+/**
+ * Confirms an AWS SNS subscription using either the official AWS SNS ConfirmSubscriptionCommand
+ * or by programmatically visiting the strictly verified SubscribeURL.
+ */
+export async function confirmSnsSubscription(
+  options: ConfirmSubscriptionOptions
+): Promise<{ success: boolean; subscriptionArn?: string; error?: string }> {
+  const { TopicArn, Token, SubscribeURL, customFetcher } = options;
+
+  if (!TopicArn || !Token) {
+    return {
+      success: false,
+      error: "Missing required TopicArn or Token for subscription confirmation",
+    };
+  }
+
+  // 1. If AWS credentials are configured, use AWS SDK's ConfirmSubscriptionCommand
+  const { accessKeyId, secretAccessKey, region } = config.email.aws;
+  if (accessKeyId && secretAccessKey) {
+    try {
+      const { SNSClient, ConfirmSubscriptionCommand } = await import("@aws-sdk/client-sns");
+      const snsClient = new SNSClient({
+        region: region || "us-east-1",
+        credentials: { accessKeyId, secretAccessKey },
+      });
+      const response = await snsClient.send(
+        new ConfirmSubscriptionCommand({
+          TopicArn,
+          Token,
+        })
+      );
+      return {
+        success: true,
+        subscriptionArn: response.SubscriptionArn,
+      };
+    } catch (sdkErr: any) {
+      console.warn(
+        `[SNS ConfirmSubscription SDK Warning]: ${sdkErr.message}. Attempting secure SubscribeURL fallback...`
+      );
+    }
+  }
+
+  // 2. Fallback: Programmatically visit SubscribeURL with strict AWS domain verification
+  if (SubscribeURL) {
+    try {
+      const parsedUrl = new URL(SubscribeURL);
+      const isHttps = parsedUrl.protocol === "https:";
+      const isAwsSnsHost = /^sns\.[a-zA-Z0-9-]+\.amazonaws\.com(\.cn)?$/.test(parsedUrl.hostname);
+
+      if (!isHttps || !isAwsSnsHost) {
+        return {
+          success: false,
+          error: `Untrusted SubscribeURL: ${SubscribeURL}`,
+        };
+      }
+
+      if (customFetcher) {
+        const fetchRes = await customFetcher(SubscribeURL);
+        if (!fetchRes.ok) {
+          return {
+            success: false,
+            error: `SubscribeURL HTTP error: status ${fetchRes.status}`,
+          };
+        }
+        return { success: true };
+      }
+
+      const res = await fetch(SubscribeURL, { method: "GET" });
+      if (!res.ok) {
+        return {
+          success: false,
+          error: `SubscribeURL HTTP request failed with status ${res.status}`,
+        };
+      }
+
+      return { success: true };
+    } catch (urlErr: any) {
+      return {
+        success: false,
+        error: `Failed to confirm subscription via SubscribeURL: ${urlErr.message}`,
+      };
+    }
+  }
+
+  return {
+    success: false,
+    error: "Unable to confirm subscription: neither AWS credentials nor valid SubscribeURL available",
+  };
+}
+
