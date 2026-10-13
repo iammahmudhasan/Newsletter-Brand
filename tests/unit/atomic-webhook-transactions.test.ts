@@ -1,10 +1,9 @@
 import { describe, it, expect } from "bun:test";
 import { POST } from "../../apps/web/src/app/api/webhooks/email/route";
-import { NextRequest } from "next/server";
 
 describe("Webhook Atomic Transaction & Rollback Protection", () => {
   it("rejects malformed JSON payloads gracefully with HTTP 400", async () => {
-    const req = new NextRequest("http://localhost:3000/api/webhooks/email", {
+    const req = new Request("http://localhost:3000/api/webhooks/email", {
       method: "POST",
       body: "not-json{",
       headers: { "Content-Type": "application/json" },
@@ -24,7 +23,7 @@ describe("Webhook Atomic Transaction & Rollback Protection", () => {
       data: {},
     };
 
-    const req = new NextRequest("http://localhost:3000/api/webhooks/email", {
+    const req = new Request("http://localhost:3000/api/webhooks/email", {
       method: "POST",
       body: JSON.stringify(payload),
       headers: { "Content-Type": "application/json" },

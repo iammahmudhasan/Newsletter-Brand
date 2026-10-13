@@ -56,9 +56,8 @@ describe("Atomic Outbox & Signup Transactions", () => {
 
   it("validates signup flow requires valid email", async () => {
     const { POST } = await import("../../apps/web/src/app/api/subscribe/route");
-    const { NextRequest } = await import("next/server");
 
-    const req = new NextRequest("http://localhost:3000/api/subscribe", {
+    const req = new Request("http://localhost:3000/api/subscribe", {
       method: "POST",
       body: JSON.stringify({ email: "invalid-email" }),
       headers: { "Content-Type": "application/json" },
