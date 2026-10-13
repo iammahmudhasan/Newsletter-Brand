@@ -5,6 +5,9 @@ import crypto from "crypto";
 const SESSION_COOKIE_NAME = "ai_signal_admin_session";
 const SESSION_MAX_AGE_SECONDS = 86400 * 7; // 7 days
 
+/**
+ * Creates a cryptographically signed admin session token with timestamp
+ */
 export function createAdminSessionToken(): string {
   const timestamp = Math.floor(Date.now() / 1000);
   const data = `admin:${timestamp}`;
@@ -15,6 +18,9 @@ export function createAdminSessionToken(): string {
   return `${Buffer.from(data).toString("base64url")}.${signature}`;
 }
 
+/**
+ * Verifies that an admin session token is valid, cryptographically un-tampered, and unexpired
+ */
 export function verifyAdminSessionToken(token: string | undefined | null): boolean {
   if (!token) return false;
   try {
@@ -27,11 +33,12 @@ export function verifyAdminSessionToken(token: string | undefined | null): boole
       .update(Buffer.from(base64Data, "base64url").toString("utf-8"))
       .digest("base64url");
 
+    const sigBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expectedSig);
+
     if (
-      !crypto.timingSafeEqual(
-        Buffer.from(signature),
-        Buffer.from(expectedSig)
-      )
+      sigBuffer.length !== expectedBuffer.length ||
+      !crypto.timingSafeEqual(sigBuffer, expectedBuffer)
     ) {
       return false;
     }
@@ -51,21 +58,35 @@ export function verifyAdminSessionToken(token: string | undefined | null): boole
   }
 }
 
+/**
+ * Timing-safe password verification
+ */
+export function verifyAdminPassword(passwordAttempt: string): boolean {
+  if (!passwordAttempt || !config.adminPassword) return false;
+
+  const attemptHash = crypto.createHash("sha256").update(passwordAttempt).digest();
+  const actualHash = crypto.createHash("sha256").update(config.adminPassword).digest();
+
+  return crypto.timingSafeEqual(attemptHash, actualHash);
+}
+
+/**
+ * Enforces admin authorization strictly via signed session token (Cookie or Bearer).
+ * Raw passwords are NEVER accepted as bearer tokens.
+ */
 export function isAuthorizedAdmin(req: NextRequest): boolean {
+  // 1. Check Bearer token header (must be a valid signed session token)
   const authHeader = req.headers.get("authorization");
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const bearer = authHeader.replace("Bearer ", "").trim();
-    if (bearer === config.adminPassword) return true;
-    if (verifyAdminSessionToken(bearer)) return true;
+    if (verifyAdminSessionToken(bearer)) {
+      return true;
+    }
   }
 
+  // 2. Check HTTP-only session cookie
   const cookie = req.cookies.get(SESSION_COOKIE_NAME);
   if (cookie?.value && verifyAdminSessionToken(cookie.value)) {
-    return true;
-  }
-
-  // Allow dev access if configured
-  if (process.env.NODE_ENV === "development" && !config.adminPassword) {
     return true;
   }
 

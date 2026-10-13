@@ -1,5 +1,95 @@
 import crypto from "crypto";
 
+const KNOWN_INSECURE_SECRETS = new Set([
+  "fallback-secret-development-only-change-me",
+  "change-me",
+  "secret",
+  "default",
+  "123456",
+  "password",
+]);
+
+const KNOWN_INSECURE_PASSWORDS = new Set([
+  "admin123",
+  "admin",
+  "password",
+  "123456",
+  "root",
+]);
+
+/**
+ * Validates configuration against fail-closed security rules in production
+ */
+export function validateProductionConfig(env: NodeJS.ProcessEnv = process.env): void {
+  if (env.NODE_ENV !== "production") {
+    return;
+  }
+
+  // During next build static compilation phase, skip runtime-only secret checks
+  if (env.NEXT_PHASE === "phase-production-build" || env.SKIP_ENV_VALIDATION === "true") {
+    return;
+  }
+
+  const errors: string[] = [];
+
+  // 1. AUTH_SECRET
+  const authSecret = env.AUTH_SECRET;
+  if (!authSecret) {
+    errors.push("AUTH_SECRET is required in production");
+  } else if (KNOWN_INSECURE_SECRETS.has(authSecret)) {
+    errors.push("AUTH_SECRET cannot use insecure development placeholders");
+  } else if (authSecret.length < 32) {
+    errors.push(`AUTH_SECRET must be at least 32 characters (currently ${authSecret.length})`);
+  }
+
+  // 2. ADMIN_PASSWORD
+  const adminPassword = env.ADMIN_PASSWORD;
+  if (!adminPassword) {
+    errors.push("ADMIN_PASSWORD is required in production");
+  } else if (KNOWN_INSECURE_PASSWORDS.has(adminPassword)) {
+    errors.push("ADMIN_PASSWORD cannot use default or common passwords");
+  } else if (adminPassword.length < 12) {
+    errors.push(`ADMIN_PASSWORD must be at least 12 characters (currently ${adminPassword.length})`);
+  }
+
+  // 3. DATABASE_URL
+  const databaseUrl = env.DATABASE_URL;
+  if (!databaseUrl) {
+    errors.push("DATABASE_URL is required in production");
+  } else if (databaseUrl.includes("localhost") || databaseUrl.includes("127.0.0.1")) {
+    errors.push("DATABASE_URL cannot point to localhost in production");
+  }
+
+  // 4. EMAIL_PROVIDER
+  const provider = env.EMAIL_PROVIDER || "console";
+  if (provider === "console") {
+    errors.push("EMAIL_PROVIDER=console is not permitted in production");
+  } else if (provider === "resend" && !env.RESEND_API_KEY) {
+    errors.push("RESEND_API_KEY is required when EMAIL_PROVIDER=resend in production");
+  } else if (provider === "ses") {
+    if (!env.AWS_ACCESS_KEY_ID || !env.AWS_SECRET_ACCESS_KEY || !env.AWS_REGION) {
+      errors.push("AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION are required for SES in production");
+    }
+  }
+
+  // 5. EMAIL_WEBHOOK_SECRET
+  const webhookSecret = env.EMAIL_WEBHOOK_SECRET;
+  if (!webhookSecret || webhookSecret === "dev-webhook-secret") {
+    errors.push("A secure EMAIL_WEBHOOK_SECRET is required in production");
+  }
+
+  if (errors.length > 0) {
+    throw new Error(
+      `[CRITICAL CONFIG ERROR] Production startup aborted due to security validation failures:\n- ${errors.join("\n- ")}`
+    );
+  }
+}
+
+// Run validation immediately if loaded in production
+if (process.env.NODE_ENV === "production") {
+  validateProductionConfig(process.env);
+}
+
 export const config = {
   appUrl: process.env.APP_URL || "http://localhost:3000",
   databaseUrl: process.env.DATABASE_URL || "postgres://postgres:postgres@localhost:5432/ai_signal",
@@ -35,10 +125,12 @@ export function hashIp(ip: string | undefined): string {
   return crypto.createHash("sha256").update(ip + config.authSecret).digest("hex").slice(0, 32);
 }
 
+export type TokenPurpose = "confirm" | "unsubscribe" | "data_export" | "data_delete";
+
 export interface TokenPayload {
   id: string;
   email: string;
-  purpose: "confirm" | "unsubscribe";
+  purpose: TokenPurpose;
   exp: number; // Unix timestamp in seconds
 }
 
@@ -61,9 +153,12 @@ export function generateSignedToken(
 }
 
 /**
- * Verifies and decodes a signed token
+ * Verifies and decodes a signed token with purpose and expiry enforcement
  */
-export function verifySignedToken(token: string): {
+export function verifySignedToken(
+  token: string,
+  expectedPurpose?: TokenPurpose
+): {
   valid: boolean;
   payload?: TokenPayload;
   error?: string;
@@ -79,11 +174,12 @@ export function verifySignedToken(token: string): {
       .update(base64Data)
       .digest("base64url");
 
+    const providedBuffer = Buffer.from(providedSig);
+    const expectedBuffer = Buffer.from(expectedSig);
+
     if (
-      !crypto.timingSafeEqual(
-        Buffer.from(providedSig),
-        Buffer.from(expectedSig)
-      )
+      providedBuffer.length !== expectedBuffer.length ||
+      !crypto.timingSafeEqual(providedBuffer, expectedBuffer)
     ) {
       return { valid: false, error: "Invalid signature" };
     }
@@ -94,6 +190,13 @@ export function verifySignedToken(token: string): {
     const now = Math.floor(Date.now() / 1000);
     if (payload.exp && payload.exp < now) {
       return { valid: false, error: "Token expired" };
+    }
+
+    if (expectedPurpose && payload.purpose !== expectedPurpose) {
+      return {
+        valid: false,
+        error: `Invalid token purpose: expected '${expectedPurpose}', received '${payload.purpose}'`,
+      };
     }
 
     return { valid: true, payload };

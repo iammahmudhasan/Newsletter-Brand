@@ -12,11 +12,18 @@ export * from "./providers/ses";
 export * from "./templates/confirmation";
 export * from "./templates/welcome";
 export * from "./templates/newsletter";
+export * from "./sanitizer";
 
 let providerInstance: EmailProvider | null = null;
 
 export function getEmailProvider(): EmailProvider {
   if (providerInstance) return providerInstance;
+
+  if (process.env.NODE_ENV === "production" && config.email.provider === "console") {
+    throw new Error(
+      "[CRITICAL EMAIL ERROR] Console mock provider cannot be used in production. Configure EMAIL_PROVIDER=resend or EMAIL_PROVIDER=ses."
+    );
+  }
 
   switch (config.email.provider) {
     case "resend":

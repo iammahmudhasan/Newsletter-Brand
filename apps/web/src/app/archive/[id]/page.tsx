@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { db, campaigns, eq } from "@ai-signal/db";
+import { sanitizeNewsletterHtml } from "@ai-signal/email";
 import { SignupForm } from "@/components/SignupForm";
 import { ArrowLeft, Calendar, Clock, Share2, Tag } from "lucide-react";
 
@@ -71,7 +72,7 @@ export default async function IssueDetailPage({
       {htmlContent ? (
         <article
           className="prose prose-invert max-w-none text-slate-200 leading-relaxed space-y-6"
-          dangerouslySetInnerHTML={{ __html: htmlContent }}
+          dangerouslySetInnerHTML={{ __html: sanitizeNewsletterHtml(htmlContent) }}
         />
       ) : (
         <article className="space-y-12 text-slate-200 leading-relaxed">

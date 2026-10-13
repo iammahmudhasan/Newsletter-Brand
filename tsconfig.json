@@ -14,7 +14,9 @@
     "jsx": "preserve",
     "incremental": true,
     "baseUrl": ".",
+    "types": ["bun"],
     "paths": {
+      "@/*": ["apps/web/src/*"],
       "@ai-signal/db": ["packages/db/src"],
       "@ai-signal/db/*": ["packages/db/src/*"],
       "@ai-signal/email": ["packages/email/src"],
@@ -27,5 +29,5 @@
       "@ai-signal/validation/*": ["packages/validation/src/*"]
     }
   },
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", ".next"]
 }

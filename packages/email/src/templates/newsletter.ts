@@ -5,7 +5,9 @@ export interface NewsletterIssueProps {
   previewText: string;
   htmlContent: string;
   recipientEmail: string;
-  unsubscribeUrl: string;
+  unsubscribeWebUrl?: string;
+  unsubscribeApiUrl?: string;
+  unsubscribeUrl?: string; // fallback
   archiveUrl: string;
 }
 
@@ -21,13 +23,19 @@ export function renderNewsletterEmail(props: NewsletterIssueProps): {
     previewText,
     htmlContent,
     recipientEmail,
+    unsubscribeWebUrl,
+    unsubscribeApiUrl,
     unsubscribeUrl,
     archiveUrl,
   } = props;
 
-  // RFC 2369 / RFC 8058 standard one-click unsubscribe headers
+  // RFC 8058 standard one-click unsubscribe endpoint MUST accept POST
+  const apiUrl = unsubscribeApiUrl || unsubscribeUrl || "";
+  // Web page URL for user action confirmation in browser
+  const webUrl = unsubscribeWebUrl || unsubscribeUrl || "";
+
   const headers = {
-    "List-Unsubscribe": `<${unsubscribeUrl}>`,
+    "List-Unsubscribe": `<${apiUrl}>`,
     "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
     "Precedence": "bulk",
     "X-Auto-Response-Suppress": "OOF, AutoReply",
@@ -46,7 +54,7 @@ Read the full interactive issue with code samples and graphics:
 ${archiveUrl}
 
 To unsubscribe at any time:
-${unsubscribeUrl}
+${webUrl}
 
 AI Signal Media · Strict Permission Distribution
   `.trim();
@@ -126,7 +134,7 @@ AI Signal Media · Strict Permission Distribution
                 You received this email because you subscribed to AI Signal at <strong>${recipientEmail}</strong>.
               </p>
               <p style="margin: 0 0 8px;">
-                <a href="${unsubscribeUrl}" style="color: #94a3b8; text-decoration: underline;">Unsubscribe with 1-click</a> · 
+                <a href="${webUrl}" style="color: #94a3b8; text-decoration: underline;">Manage preferences / Unsubscribe</a> · 
                 <a href="${archiveUrl}" style="color: #94a3b8; text-decoration: underline;">Issue Archive</a>
               </p>
               <p style="margin: 0; font-size: 11px; color: #475569;">

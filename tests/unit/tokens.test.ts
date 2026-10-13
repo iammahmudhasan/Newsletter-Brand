@@ -1,3 +1,4 @@
+import { describe, it, expect } from "bun:test";
 import {
   generateSignedToken,
   verifySignedToken,
@@ -5,52 +6,102 @@ import {
   hashIp,
 } from "../../packages/config/src/index";
 
-export function testTokens() {
-  console.log("▶ [UNIT TEST] Testing Token Cryptography & Normalization...");
+describe("Token Cryptography, Purpose Enforcement & Normalization", () => {
+  it("normalizes mixed-case and whitespace-padded emails", () => {
+    const raw = "  Alex.ML+tester@Domain.COM  ";
+    expect(normalizeEmail(raw)).toBe("alex.ml+tester@domain.com");
+  });
 
-  // 1. Normalization
-  const raw = "  Alex.ML+tester@Domain.COM  ";
-  const norm = normalizeEmail(raw);
-  if (norm !== "alex.ml+tester@domain.com") {
-    throw new Error(`Normalization failed: expected 'alex.ml+tester@domain.com', got '${norm}'`);
-  }
+  it("hashes IP addresses deterministically with auth secret salting", () => {
+    const hash1 = hashIp("192.168.1.100");
+    const hash2 = hashIp("192.168.1.100");
+    const hash3 = hashIp("10.0.0.1");
 
-  // 2. IP Anonymization
-  const hash1 = hashIp("192.168.1.100");
-  const hash2 = hashIp("192.168.1.100");
-  const hash3 = hashIp("10.0.0.1");
-  if (hash1 !== hash2 || hash1 === hash3) {
-    throw new Error("IP hashing consistency check failed");
-  }
+    expect(hash1).toBe(hash2);
+    expect(hash1).not.toBe(hash3);
+    expect(hashIp(undefined)).toBe("unknown");
+  });
 
-  // 3. HMAC Token signing and decoding
-  const payload = {
-    id: "sub_test_99",
-    email: norm,
-    purpose: "confirm" as const,
-  };
-  const token = generateSignedToken(payload, 3600);
-  const result = verifySignedToken(token);
+  it("verifies a valid signed token when expected purpose matches", () => {
+    const payload = {
+      id: "sub_test_99",
+      email: "engineer@domain.com",
+      purpose: "confirm" as const,
+    };
+    const token = generateSignedToken(payload, 3600);
+    const result = verifySignedToken(token, "confirm");
 
-  if (!result.valid || result.payload?.id !== payload.id || result.payload?.email !== norm) {
-    throw new Error("Valid token was rejected or payload mismatched");
-  }
+    expect(result.valid).toBe(true);
+    expect(result.payload?.id).toBe("sub_test_99");
+    expect(result.payload?.email).toBe("engineer@domain.com");
+    expect(result.payload?.purpose).toBe("confirm");
+  });
 
-  // 4. Tampering rejection
-  const tampered = token.slice(0, -6) + "xxxxxx";
-  const tamperedResult = verifySignedToken(tampered);
-  if (tamperedResult.valid) {
-    throw new Error("Tampered token signature was incorrectly accepted!");
-  }
+  it("strictly rejects a valid token when expected purpose mismatches", () => {
+    const confirmToken = generateSignedToken(
+      {
+        id: "sub_test_99",
+        email: "engineer@domain.com",
+        purpose: "confirm",
+      },
+      3600
+    );
 
-  // 5. Expiration rejection
-  const expiredToken = generateSignedToken(payload, -10); // already expired
-  const expiredResult = verifySignedToken(expiredToken);
-  if (expiredResult.valid) {
-    throw new Error("Expired token was incorrectly accepted!");
-  }
+    // Attempt to misuse confirmation token on unsubscribe or GDPR endpoint
+    const unsubResult = verifySignedToken(confirmToken, "unsubscribe");
+    expect(unsubResult.valid).toBe(false);
+    expect(unsubResult.error).toContain("Invalid token purpose");
 
-  console.log("✔ [UNIT TEST] Token Cryptography & Normalization PASSED.");
-}
+    const gdprExportResult = verifySignedToken(confirmToken, "data_export");
+    expect(gdprExportResult.valid).toBe(false);
 
-testTokens();
+    const gdprDeleteResult = verifySignedToken(confirmToken, "data_delete");
+    expect(gdprDeleteResult.valid).toBe(false);
+  });
+
+  it("correctly accepts distinct GDPR export and delete tokens", () => {
+    const exportToken = generateSignedToken({
+      id: "sub_gdpr_01",
+      email: "user@privacy.org",
+      purpose: "data_export",
+    });
+    expect(verifySignedToken(exportToken, "data_export").valid).toBe(true);
+    expect(verifySignedToken(exportToken, "data_delete").valid).toBe(false);
+
+    const deleteToken = generateSignedToken({
+      id: "sub_gdpr_01",
+      email: "user@privacy.org",
+      purpose: "data_delete",
+    });
+    expect(verifySignedToken(deleteToken, "data_delete").valid).toBe(true);
+    expect(verifySignedToken(deleteToken, "data_export").valid).toBe(false);
+  });
+
+  it("rejects tampered token signatures", () => {
+    const token = generateSignedToken({
+      id: "sub_1",
+      email: "safe@aisignal.dev",
+      purpose: "confirm",
+    });
+    const tampered = token.slice(0, -6) + "xxxxxx";
+    const result = verifySignedToken(tampered);
+
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("Invalid signature");
+  });
+
+  it("rejects expired tokens", () => {
+    const expiredToken = generateSignedToken(
+      {
+        id: "sub_1",
+        email: "expired@aisignal.dev",
+        purpose: "confirm",
+      },
+      -10 // Expired 10 seconds ago
+    );
+    const result = verifySignedToken(expiredToken);
+
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("Token expired");
+  });
+});

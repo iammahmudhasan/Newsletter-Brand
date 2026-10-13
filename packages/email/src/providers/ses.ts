@@ -1,11 +1,27 @@
+import { SESv2Client, SendEmailCommand } from "@aws-sdk/client-sesv2";
 import { EmailProvider, SendEmailOptions, SendEmailResult } from "../types";
 import { config } from "@ai-signal/config";
 
 export class SesEmailProvider implements EmailProvider {
   name = "ses" as const;
+  private client: SESv2Client | null = null;
+
+  private getClient(): SESv2Client {
+    if (!this.client) {
+      const { accessKeyId, secretAccessKey, region } = config.email.aws;
+      this.client = new SESv2Client({
+        region: region || "us-east-1",
+        credentials: {
+          accessKeyId,
+          secretAccessKey,
+        },
+      });
+    }
+    return this.client;
+  }
 
   async sendEmail(options: SendEmailOptions): Promise<SendEmailResult> {
-    const { accessKeyId, secretAccessKey, region } = config.email.aws;
+    const { accessKeyId, secretAccessKey } = config.email.aws;
     if (!accessKeyId || !secretAccessKey) {
       return {
         success: false,
@@ -16,14 +32,55 @@ export class SesEmailProvider implements EmailProvider {
     }
 
     try {
-      // For production SES v2 sending via AWS SDK or raw SendEmail command
-      // Can be wired directly to @aws-sdk/client-ses
-      console.log(`[SES Dispatcher] Preparing SES send for ${region} to ${options.to}`);
-      
-      // Note: In production, install @aws-sdk/client-ses and instantiate SESClient
+      const client = this.getClient();
+      const from = `${config.email.fromName} <${config.email.fromAddress}>`;
+
+      const command = new SendEmailCommand({
+        FromEmailAddress: from,
+        Destination: {
+          ToAddresses: Array.isArray(options.to) ? options.to : [options.to],
+        },
+        ReplyToAddresses: [config.email.replyTo],
+        Content: {
+          Simple: {
+            Subject: {
+              Data: options.subject,
+              Charset: "UTF-8",
+            },
+            Body: {
+              Html: {
+                Data: options.html,
+                Charset: "UTF-8",
+              },
+              Text: {
+                Data: options.text,
+                Charset: "UTF-8",
+              },
+            },
+            Headers: options.headers
+              ? Object.entries(options.headers).map(([Name, Value]) => ({
+                  Name,
+                  Value: Array.isArray(Value) ? Value.join(", ") : String(Value),
+                }))
+              : undefined,
+          },
+        },
+      });
+
+      const response = await client.send(command);
+
+      if (!response.MessageId) {
+        return {
+          success: false,
+          messageId: "",
+          provider: "ses",
+          error: "SES SendEmail response did not contain a valid MessageId",
+        };
+      }
+
       return {
         success: true,
-        messageId: `ses_${Date.now()}`,
+        messageId: response.MessageId,
         provider: "ses",
       };
     } catch (err: any) {

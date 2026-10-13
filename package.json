@@ -10,17 +10,22 @@
   "scripts": {
     "dev": "npm run dev --workspace=apps/web",
     "worker": "npm run worker --workspace=apps/worker",
-    "build": "npm run build --workspaces --if-present",
+    "build": "bun run --cwd apps/web build",
     "db:generate": "npm run db:generate --workspace=packages/db",
     "db:push": "npm run db:push --workspace=packages/db",
     "db:studio": "npm run db:studio --workspace=packages/db",
-    "test": "bun run tests/unit/tokens.test.ts && bun run tests/integration/email-renderer.test.ts && bun run tests/e2e/subscriber-journey.test.ts",
+    "test": "bun test",
     "verify:dns": "bun run scripts/verify_dns.ts",
     "validate:email": "bun run scripts/validate_email_content.ts",
     "backup:db": "bun run scripts/backup_db.ts",
-    "typecheck": "tsc --build"
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@types/bun": "^1.4.3",
     "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "@types/sanitize-html": "^2.16.2",
+    "sanitize-html": "^2.18.0"
   }
 }

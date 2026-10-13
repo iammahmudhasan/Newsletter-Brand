@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, subscribers, consentEvents, suppressions, eq } from "@ai-signal/db";
-import { verifySignedToken } from "@ai-signal/config";
+import { db, subscribers, consentEvents, suppressions, eq, and } from "@ai-signal/db";
+import { verifySignedToken, normalizeEmail } from "@ai-signal/config";
 
-// GDPR Data Export (Right of Access)
+// GDPR Data Export (Right of Access) - strictly requires 'data_export' purpose token
 export async function GET(req: NextRequest) {
   try {
     const token = req.nextUrl.searchParams.get("token");
@@ -10,20 +10,32 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: "Missing authentication token" }, { status: 400 });
     }
 
-    const verification = verifySignedToken(token);
+    const verification = verifySignedToken(token, "data_export");
     if (!verification.valid || !verification.payload) {
-      return NextResponse.json({ error: "Invalid or expired token" }, { status: 401 });
+      return NextResponse.json(
+        { error: verification.error || "Invalid or expired data_export token" },
+        { status: 401 }
+      );
     }
 
-    const { id: subscriberId, email } = verification.payload;
+    const { id: subscriberId, email: tokenEmail } = verification.payload;
+    const normalizedEmail = normalizeEmail(tokenEmail);
 
     const [subscriber] = await db
       .select()
       .from(subscribers)
-      .where(eq(subscribers.id, subscriberId));
+      .where(
+        and(
+          eq(subscribers.id, subscriberId),
+          eq(subscribers.email, normalizedEmail)
+        )
+      );
 
     if (!subscriber) {
-      return NextResponse.json({ error: "Subscriber not found" }, { status: 404 });
+      return NextResponse.json(
+        { error: "Subscriber not found or identity mismatch" },
+        { status: 404 }
+      );
     }
 
     const consents = await db
@@ -48,7 +60,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// GDPR Right to be Forgotten (Permanent Deletion)
+// GDPR Right to be Forgotten (Permanent Deletion) - strictly requires 'data_delete' purpose token
 export async function POST(req: NextRequest) {
   try {
     const { token } = await req.json();
@@ -56,12 +68,34 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Missing authorization token" }, { status: 400 });
     }
 
-    const verification = verifySignedToken(token);
+    const verification = verifySignedToken(token, "data_delete");
     if (!verification.valid || !verification.payload) {
-      return NextResponse.json({ error: "Invalid or expired token" }, { status: 401 });
+      return NextResponse.json(
+        { error: verification.error || "Invalid or expired data_delete token" },
+        { status: 401 }
+      );
     }
 
-    const { id: subscriberId, email } = verification.payload;
+    const { id: subscriberId, email: tokenEmail } = verification.payload;
+    const normalizedEmail = normalizeEmail(tokenEmail);
+
+    // Verify subscriber existence and email match before destruction
+    const [subscriber] = await db
+      .select()
+      .from(subscribers)
+      .where(
+        and(
+          eq(subscribers.id, subscriberId),
+          eq(subscribers.email, normalizedEmail)
+        )
+      );
+
+    if (!subscriber) {
+      return NextResponse.json(
+        { error: "Subscriber not found or identity mismatch" },
+        { status: 404 }
+      );
+    }
 
     // 1. Delete subscriber record (cascades to campaign_recipients & consent_events)
     await db.delete(subscribers).where(eq(subscribers.id, subscriberId));
@@ -70,9 +104,9 @@ export async function POST(req: NextRequest) {
     await db
       .insert(suppressions)
       .values({
-        email,
+        email: normalizedEmail,
         reason: "manual_unsubscribe",
-        details: "GDPR Right to Be Forgotten deletion request",
+        details: "GDPR Right to Be Forgotten validated deletion request",
       })
       .onConflictDoNothing();
 

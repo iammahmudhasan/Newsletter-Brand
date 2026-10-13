@@ -1,0 +1,61 @@
+name: CI Pipeline & Production Quality Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-and-test:
+    name: Lint, Test & Production Build Verification
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ai_signal_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgres://postgres:postgrespassword@localhost:5432/ai_signal_test
+      AUTH_SECRET: ci-testing-auth-secret-super-long-random-string-32-chars
+      ADMIN_PASSWORD: StrongCIPassword2026!#
+      EMAIL_PROVIDER: console
+      EMAIL_WEBHOOK_SECRET: ci-webhook-secret-long-string-key
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun Runtime
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Dependencies
+        run: bun install
+
+      - name: Run Database Migrations
+        run: bun run db:push
+
+      - name: Typecheck TypeScript Workspaces
+        run: bun run typecheck
+
+      - name: Run Automated Test Suites
+        run: bun test
+
+      - name: Production Web Build Verification
+        run: bun run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1

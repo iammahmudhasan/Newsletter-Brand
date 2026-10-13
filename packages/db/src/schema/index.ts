@@ -73,7 +73,7 @@ export const campaigns = pgTable(
     contentHtml: text("content_html").notNull(),
     contentPlain: text("content_plain"),
     status: text("status", {
-      enum: ["draft", "scheduled", "sending", "sent", "cancelled"],
+      enum: ["draft", "scheduled", "sending", "sent", "partially_failed", "failed", "cancelled"],
     })
       .notNull()
       .default("draft"),
@@ -105,7 +105,7 @@ export const campaignRecipients = pgTable(
       .notNull()
       .references(() => subscribers.id, { onDelete: "cascade" }),
     status: text("status", {
-      enum: ["queued", "sent", "failed", "bounced"],
+      enum: ["queued", "processing", "sent", "failed", "bounced"],
     })
       .notNull()
       .default("queued"),

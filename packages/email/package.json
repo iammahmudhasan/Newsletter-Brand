@@ -7,7 +7,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ai-signal/config": "*"
+    "@ai-signal/config": "*",
+    "@aws-sdk/client-sesv2": "^3.1150.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.4",

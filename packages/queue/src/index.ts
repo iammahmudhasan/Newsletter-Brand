@@ -30,7 +30,7 @@ export async function enqueueJob(
 
     return inserted?.id || `idempotent_${options.idempotencyKey}`;
   } catch (err: any) {
-    console.error(`[Queue] Failed to enqueue job '${jobName}':`, err.message);
+    console.error(`[Queue Error] Failed to enqueue job '${jobName}':`, err.message);
     throw err;
   }
 }
@@ -42,7 +42,6 @@ export async function claimNextJob(
   allowedJobNames?: string[]
 ): Promise<typeof automationJobs.$inferSelect | null> {
   try {
-    // Execute atomic claim query
     const results = await db.transaction(async (tx) => {
       let filterClause = sql`status = 'pending' AND scheduled_for <= NOW()`;
 
@@ -70,8 +69,65 @@ export async function claimNextJob(
 
     return results;
   } catch (err: any) {
-    // If DB is offline or table doesn't exist yet, return null
+    console.error("[Queue Error] Database error claiming next job:", err.message);
     return null;
+  }
+}
+
+/**
+ * Reclaims stale jobs stuck in 'processing' due to worker crash or unhandled timeout.
+ * Jobs exceeding maxRetries are moved to 'failed'; others are reset to 'pending' for retry.
+ */
+export async function reclaimStaleJobs(staleMinutes: number = 10): Promise<number> {
+  try {
+    const staleRows = await db.execute<typeof automationJobs.$inferSelect>(
+      sql`
+        SELECT * FROM automation_jobs
+        WHERE status = 'processing'
+          AND locked_at < NOW() - (INTERVAL '1 minute' * ${staleMinutes})
+        FOR UPDATE SKIP LOCKED;
+      `
+    );
+
+    const jobs = (staleRows as any) || [];
+    if (jobs.length === 0) return 0;
+
+    let reclaimedCount = 0;
+    for (const job of jobs) {
+      const newRetries = (job.retry_count || 0) + 1;
+      const maxRetries = job.max_retries || 3;
+
+      if (newRetries >= maxRetries) {
+        await db
+          .update(automationJobs)
+          .set({
+            status: "failed",
+            retryCount: newRetries,
+            lastError: `Worker lease expired after ${staleMinutes}m (worker crash detected)`,
+            lockedAt: null,
+          })
+          .where(eq(automationJobs.id, job.id));
+        console.warn(`[Queue Recovery] Stale job ${job.id} ('${job.job_name}') moved to failed after ${newRetries} attempts.`);
+      } else {
+        await db
+          .update(automationJobs)
+          .set({
+            status: "pending",
+            retryCount: newRetries,
+            lastError: `Worker lease expired after ${staleMinutes}m. Automatically reclaimed for retry #${newRetries}.`,
+            lockedAt: null,
+            scheduledFor: new Date(),
+          })
+          .where(eq(automationJobs.id, job.id));
+        console.log(`[Queue Recovery] Reclaimed stale job ${job.id} ('${job.job_name}') for retry #${newRetries}.`);
+      }
+      reclaimedCount++;
+    }
+
+    return reclaimedCount;
+  } catch (err: any) {
+    console.error("[Queue Recovery Error] Failed to reclaim stale jobs:", err.message);
+    return 0;
   }
 }
 
@@ -80,16 +136,22 @@ export async function claimNextJob(
  */
 export async function completeJob(jobId: string): Promise<void> {
   try {
-    await db
+    const result = await db
       .update(automationJobs)
       .set({
         status: "completed",
         completedAt: new Date(),
         lockedAt: null,
       })
-      .where(eq(automationJobs.id, jobId));
+      .where(eq(automationJobs.id, jobId))
+      .returning({ id: automationJobs.id });
+
+    if (result.length === 0) {
+      console.warn(`[Queue Warning] Attempted to complete job ${jobId}, but row was not found.`);
+    }
   } catch (err: any) {
-    console.error(`[Queue] Failed to complete job ${jobId}:`, err.message);
+    console.error(`[Queue Error] Failed to complete job ${jobId}:`, err.message);
+    throw err;
   }
 }
 
@@ -106,13 +168,15 @@ export async function failJob(
       .from(automationJobs)
       .where(eq(automationJobs.id, jobId));
 
-    if (!job) return;
+    if (!job) {
+      console.warn(`[Queue Warning] Attempted to fail job ${jobId}, but row was not found.`);
+      return;
+    }
 
     const newRetryCount = (job.retryCount || 0) + 1;
     const maxRetries = job.maxRetries || 3;
 
     if (newRetryCount >= maxRetries) {
-      // Move to permanent failure
       await db
         .update(automationJobs)
         .set({
@@ -122,9 +186,8 @@ export async function failJob(
           lockedAt: null,
         })
         .where(eq(automationJobs.id, jobId));
-      console.warn(`[Queue] Job ${jobId} permanently failed after ${newRetryCount} attempts.`);
+      console.warn(`[Queue] Job ${jobId} ('${job.jobName}') permanently marked as failed after ${newRetryCount} attempts.`);
     } else {
-      // Exponential backoff: 30s, 2m, 8m...
       const delaySeconds = Math.pow(4, newRetryCount) * 15;
       const nextRun = new Date(Date.now() + delaySeconds * 1000);
 
@@ -141,6 +204,7 @@ export async function failJob(
       console.log(`[Queue] Job ${jobId} scheduled for retry #${newRetryCount} at ${nextRun.toISOString()}`);
     }
   } catch (err: any) {
-    console.error(`[Queue] Error updating failed job ${jobId}:`, err.message);
+    console.error(`[Queue Error] Error updating failed job ${jobId}:`, err.message);
+    throw err;
   }
 }
