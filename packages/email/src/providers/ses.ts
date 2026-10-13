@@ -35,6 +35,11 @@ export class SesEmailProvider implements EmailProvider {
       const client = this.getClient();
       const from = `${config.email.fromName} <${config.email.fromAddress}>`;
 
+      const headersToSend = {
+        ...options.headers,
+        ...(options.idempotencyKey ? { "X-Idempotency-Key": options.idempotencyKey } : {}),
+      };
+
       const command = new SendEmailCommand({
         FromEmailAddress: from,
         Destination: {
@@ -57,12 +62,10 @@ export class SesEmailProvider implements EmailProvider {
                 Charset: "UTF-8",
               },
             },
-            Headers: options.headers
-              ? Object.entries(options.headers).map(([Name, Value]) => ({
-                  Name,
-                  Value: Array.isArray(Value) ? Value.join(", ") : String(Value),
-                }))
-              : undefined,
+            Headers: Object.entries(headersToSend).map(([Name, Value]) => ({
+              Name,
+              Value: Array.isArray(Value) ? Value.join(", ") : String(Value),
+            })),
           },
         },
       });

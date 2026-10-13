@@ -134,6 +134,21 @@ export async function reclaimStaleJobs(staleMinutes: number = 10): Promise<numbe
 }
 
 /**
+ * Renews the lock lease for an actively running job so long-running tasks
+ * (e.g. large campaign dispatches) are never prematurely reclaimed as stale.
+ */
+export async function renewJobLease(jobId: string): Promise<void> {
+  try {
+    await db
+      .update(automationJobs)
+      .set({ lockedAt: new Date() })
+      .where(eq(automationJobs.id, jobId));
+  } catch (err: any) {
+    console.warn(`[Queue Lease Warning] Failed to renew lease for job ${jobId}:`, err.message);
+  }
+}
+
+/**
  * Marks a job as completed
  */
 export async function completeJob(jobId: string): Promise<void> {

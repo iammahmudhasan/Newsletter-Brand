@@ -132,7 +132,7 @@ export const emailEvents = pgTable(
     providerMessageId: text("provider_message_id"),
     recipientEmail: text("recipient_email").notNull(),
     eventType: text("event_type", {
-      enum: ["delivered", "bounce", "complaint", "click", "open"],
+      enum: ["delivered", "bounce", "complaint", "click", "open", "unknown"],
     }).notNull(),
     payload: jsonb("payload").$type<Record<string, any>>(),
     createdAt: timestamp("created_at").notNull().defaultNow(),
@@ -141,6 +141,7 @@ export const emailEvents = pgTable(
     index("email_events_msg_idx").on(table.providerMessageId),
     index("email_events_recipient_idx").on(table.recipientEmail),
     index("email_events_type_idx").on(table.eventType),
+    uniqueIndex("email_events_msg_type_idx").on(table.providerMessageId, table.eventType),
   ]
 );
 
@@ -207,6 +208,23 @@ export const adminUsers = pgTable(
   },
   (table) => [
     uniqueIndex("admin_email_idx").on(table.email),
+  ]
+);
+
+// ----------------------------------------------------
+// 9. Admin Login Rate Limiting (Distributed brute-force defense)
+// ----------------------------------------------------
+export const adminLoginAttempts = pgTable(
+  "admin_login_attempts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    ipHash: text("ip_hash").notNull(),
+    attempts: integer("attempts").notNull().default(1),
+    lockedUntil: timestamp("locked_until"),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("admin_login_ip_hash_idx").on(table.ipHash),
   ]
 );
 

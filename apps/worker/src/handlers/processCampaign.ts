@@ -10,8 +10,12 @@ import {
 } from "@ai-signal/db";
 import { getEmailProvider, renderNewsletterEmail } from "@ai-signal/email";
 import { config, generateSignedToken, normalizeEmail } from "@ai-signal/config";
+import { renewJobLease } from "@ai-signal/queue";
 
-export async function handleProcessCampaignBatch(payload: { campaignId: string }) {
+export async function handleProcessCampaignBatch(
+  payload: { campaignId: string },
+  jobId?: string
+) {
   const { campaignId } = payload;
   const provider = getEmailProvider();
 
@@ -97,153 +101,178 @@ export async function handleProcessCampaignBatch(payload: { campaignId: string }
 
   let successCount = 0;
   let failCount = 0;
+  const BATCH_SIZE = 50;
 
-  for (const item of pendingRecipients) {
-    // Atomic Claim: Transition status to 'processing' with fresh lease timestamp
-    const claimResult = await db.execute<typeof campaignRecipients.$inferSelect>(
-      sql`
-        UPDATE campaign_recipients
-        SET status = 'processing', updated_at = NOW()
-        WHERE id = ${item.recipientId}
-          AND (status IN ('queued', 'failed') OR (status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes'))
-        RETURNING *;
-      `
-    );
+  for (let i = 0; i < pendingRecipients.length; i += BATCH_SIZE) {
+    const batch = pendingRecipients.slice(i, i + BATCH_SIZE);
 
-    const claimed = (claimResult as any)?.[0];
-    if (!claimed) {
-      // Already claimed by another worker or already marked 'sent'
-      continue;
+    // Heartbeat: renew job lock lease in queue so long campaigns never get falsely reclaimed as stale
+    if (jobId) {
+      await renewJobLease(jobId);
     }
 
-    // Crash Recovery Check: If providerMessageId already exists on claimed record,
-    // the email was already accepted by SES/Resend before the worker crashed!
-    // Do NOT duplicate send!
-    if (claimed.provider_message_id) {
-      console.log(`[Worker Recovery] Recipient ${claimed.id} already has providerMessageId ${claimed.provider_message_id}. Marking sent.`);
-      await db
-        .update(campaignRecipients)
-        .set({
-          status: "sent",
-          sentAt: claimed.sent_at || new Date(),
-          updatedAt: new Date(),
-        })
-        .where(eq(campaignRecipients.id, item.recipientId));
-      successCount++;
-      continue;
-    }
+    // Touch campaign updatedAt to record active progress
+    await db
+      .update(campaigns)
+      .set({ updatedAt: new Date() })
+      .where(eq(campaigns.id, campaignId));
 
-    try {
-      // Fresh check of subscriber status and suppression list immediately prior to dispatch
-      const [freshSub] = await db
-        .select()
-        .from(subscribers)
-        .where(eq(subscribers.id, item.subscriberId));
-
-      if (!freshSub || freshSub.status !== "active") {
-        await db
-          .update(campaignRecipients)
-          .set({
-            status: "failed",
-            errorMessage: `Subscriber not in active state (currently: ${freshSub?.status || "deleted"})`,
-            updatedAt: new Date(),
-          })
-          .where(eq(campaignRecipients.id, item.recipientId));
-        failCount++;
-        continue;
-      }
-
-      const normalizedEmail = normalizeEmail(freshSub.email);
-      const [suppressed] = await db
-        .select({ id: suppressions.id })
-        .from(suppressions)
-        .where(eq(suppressions.email, normalizedEmail));
-
-      if (suppressed) {
-        await db
-          .update(campaignRecipients)
-          .set({
-            status: "failed",
-            errorMessage: "Recipient email is currently on the suppression list",
-            updatedAt: new Date(),
-          })
-          .where(eq(campaignRecipients.id, item.recipientId));
-        failCount++;
-        continue;
-      }
-
-      // Generate signed unsubscribe tokens with purpose: 'unsubscribe'
-      const unsubToken = generateSignedToken(
-        {
-          id: freshSub.id,
-          email: freshSub.email,
-          purpose: "unsubscribe",
-        },
-        365 * 86400
+    for (const item of batch) {
+      // Atomic Claim: Transition status to 'processing' with fresh lease timestamp
+      const claimResult = await db.execute<typeof campaignRecipients.$inferSelect>(
+        sql`
+          UPDATE campaign_recipients
+          SET status = 'processing', updated_at = NOW()
+          WHERE id = ${item.recipientId}
+            AND (status IN ('queued', 'failed') OR (status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes'))
+          RETURNING *;
+        `
       );
 
-      const unsubscribeWebUrl = `${config.appUrl}/unsubscribe?token=${unsubToken}`;
-      const unsubscribeApiUrl = `${config.appUrl}/api/unsubscribe?token=${unsubToken}`;
-      const archiveUrl = `${config.appUrl}/archive/${campaign.id}`;
+      const claimed = (claimResult as any)?.[0];
+      if (!claimed) {
+        // Already claimed by another worker or already marked 'sent'
+        continue;
+      }
 
-      const { html, text, headers } = renderNewsletterEmail({
-        issueNumber: 1,
-        issueDate: new Date().toLocaleDateString("en-US", {
-          month: "short",
-          day: "numeric",
-          year: "numeric",
-        }),
-        title: campaign.title,
-        previewText: campaign.previewText || "",
-        htmlContent: campaign.contentHtml,
-        recipientEmail: freshSub.email,
-        unsubscribeWebUrl,
-        unsubscribeApiUrl,
-        archiveUrl,
-      });
-
-      const sendResult = await provider.sendEmail({
-        to: freshSub.email,
-        subject: campaign.subject,
-        html,
-        text,
-        headers,
-      });
-
-      if (sendResult.success) {
-        successCount++;
+      // Crash Recovery Check: If providerMessageId already exists on claimed record,
+      // the email was already accepted by SES/Resend before the worker crashed!
+      // Do NOT duplicate send!
+      if (claimed.provider_message_id) {
+        console.log(`[Worker Recovery] Recipient ${claimed.id} already has providerMessageId ${claimed.provider_message_id}. Marking sent.`);
         await db
           .update(campaignRecipients)
           .set({
             status: "sent",
-            providerMessageId: sendResult.messageId,
-            sentAt: new Date(),
+            sentAt: claimed.sent_at || new Date(),
             updatedAt: new Date(),
-            errorMessage: null,
           })
           .where(eq(campaignRecipients.id, item.recipientId));
-      } else {
+        successCount++;
+        continue;
+      }
+
+      try {
+        // Fresh check of subscriber status and suppression list immediately prior to dispatch
+        const [freshSub] = await db
+          .select()
+          .from(subscribers)
+          .where(eq(subscribers.id, item.subscriberId));
+
+        if (!freshSub || freshSub.status !== "active") {
+          await db
+            .update(campaignRecipients)
+            .set({
+              status: "failed",
+              errorMessage: `Subscriber not in active state (currently: ${freshSub?.status || "deleted"})`,
+              updatedAt: new Date(),
+            })
+            .where(eq(campaignRecipients.id, item.recipientId));
+          failCount++;
+          continue;
+        }
+
+        const normalizedEmail = normalizeEmail(freshSub.email);
+        const [suppressed] = await db
+          .select({ id: suppressions.id })
+          .from(suppressions)
+          .where(eq(suppressions.email, normalizedEmail));
+
+        if (suppressed) {
+          await db
+            .update(campaignRecipients)
+            .set({
+              status: "failed",
+              errorMessage: "Recipient email is currently on the suppression list",
+              updatedAt: new Date(),
+            })
+            .where(eq(campaignRecipients.id, item.recipientId));
+          failCount++;
+          continue;
+        }
+
+        // Generate signed unsubscribe tokens with purpose: 'unsubscribe'
+        const unsubToken = generateSignedToken(
+          {
+            id: freshSub.id,
+            email: freshSub.email,
+            purpose: "unsubscribe",
+          },
+          365 * 86400
+        );
+
+        const unsubscribeWebUrl = `${config.appUrl}/unsubscribe?token=${unsubToken}`;
+        const unsubscribeApiUrl = `${config.appUrl}/api/unsubscribe?token=${unsubToken}`;
+        const archiveUrl = `${config.appUrl}/archive/${campaign.id}`;
+
+        const { html, text, headers } = renderNewsletterEmail({
+          issueNumber: 1,
+          issueDate: new Date().toLocaleDateString("en-US", {
+            month: "short",
+            day: "numeric",
+            year: "numeric",
+          }),
+          title: campaign.title,
+          previewText: campaign.previewText || "",
+          htmlContent: campaign.contentHtml,
+          recipientEmail: freshSub.email,
+          unsubscribeWebUrl,
+          unsubscribeApiUrl,
+          archiveUrl,
+        });
+
+        // Use recipient-specific idempotency key for provider-level duplicate dispatch protection
+        const idempotencyKey = `campaign:${campaign.id}:recipient:${item.recipientId}`;
+
+        const sendResult = await provider.sendEmail({
+          to: freshSub.email,
+          subject: campaign.subject,
+          html,
+          text,
+          headers,
+          idempotencyKey,
+        });
+
+        if (sendResult.success) {
+          successCount++;
+          await db
+            .update(campaignRecipients)
+            .set({
+              status: "sent",
+              providerMessageId: sendResult.messageId,
+              sentAt: new Date(),
+              updatedAt: new Date(),
+              errorMessage: null,
+            })
+            .where(eq(campaignRecipients.id, item.recipientId));
+        } else {
+          failCount++;
+          await db
+            .update(campaignRecipients)
+            .set({
+              status: "failed",
+              errorMessage: sendResult.error || "Email provider dispatch failed",
+              updatedAt: new Date(),
+            })
+            .where(eq(campaignRecipients.id, item.recipientId));
+        }
+      } catch (sendErr: any) {
         failCount++;
+        console.error(`[Worker] Send exception for subscriber ${item.subscriberId}:`, sendErr.message);
         await db
           .update(campaignRecipients)
           .set({
             status: "failed",
-            errorMessage: sendResult.error || "Email provider dispatch failed",
+            errorMessage: sendErr.message || "Unexpected exception during dispatch",
             updatedAt: new Date(),
           })
           .where(eq(campaignRecipients.id, item.recipientId));
       }
-    } catch (sendErr: any) {
-      failCount++;
-      console.error(`[Worker] Send exception for subscriber ${item.subscriberId}:`, sendErr.message);
-      await db
-        .update(campaignRecipients)
-        .set({
-          status: "failed",
-          errorMessage: sendErr.message || "Unexpected exception during dispatch",
-          updatedAt: new Date(),
-        })
-        .where(eq(campaignRecipients.id, item.recipientId));
+    }
+
+    // Refresh lease after completing each batch chunk
+    if (jobId) {
+      await renewJobLease(jobId);
     }
   }
 

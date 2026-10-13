@@ -73,4 +73,63 @@ describe("Webhook Security, Signature Verification & Bounce Classification", () 
     expect(isResendSoftHard).toBe(false);
     expect(isResendHardHard).toBe(true);
   });
+
+  it("normalizes unknown event types to 'unknown' and never defaults to 'delivered'", () => {
+    // Normalization logic check as enforced in route.ts
+    const testCases = [
+      { raw: "email.opened", expected: "open" },
+      { raw: "email.clicked", expected: "click" },
+      { raw: "email.delivered", expected: "delivered" },
+      { raw: "email.bounced", expected: "bounce" },
+      { raw: "email.complained", expected: "complaint" },
+      { raw: "ses.Send", expected: "unknown" },
+      { raw: "ses.RenderingFailure", expected: "unknown" },
+      { raw: "arbitrary.custom.event", expected: "unknown" },
+      { raw: "malicious_fake_event", expected: "unknown" },
+    ];
+
+    for (const tc of testCases) {
+      const lower = tc.raw.toLowerCase();
+      const standardized = lower.includes("bounce")
+        ? "bounce"
+        : lower.includes("complain")
+        ? "complaint"
+        : lower.includes("click")
+        ? "click"
+        : lower.includes("open")
+        ? "open"
+        : lower.includes("deliver")
+        ? "delivered"
+        : "unknown";
+
+      expect(standardized).toBe(tc.expected);
+    }
+  });
+
+  it("rejects untrusted AWS SNS notification webhook with invalid signature", async () => {
+    const fakeSnsPayload = JSON.stringify({
+      Type: "Notification",
+      MessageId: "msg-fake-123",
+      TopicArn: "arn:aws:sns:us-east-1:123456789012:ai-signal-ses-events",
+      Message: JSON.stringify({ eventType: "Bounce" }),
+      Timestamp: "2026-10-14T00:00:00.000Z",
+      SignatureVersion: "2",
+      Signature: "tampered_fake_signature_bytes",
+      SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
+    });
+
+    const req = {
+      text: async () => fakeSnsPayload,
+      headers: new Headers({
+        "Content-Type": "application/json",
+        "x-amz-sns-message-type": "Notification",
+      }),
+    } as any;
+
+    const res = await POST(req);
+    expect(res.status).toBe(401);
+
+    const data = await res.json();
+    expect(data.error).toContain("Unauthorized");
+  });
 });

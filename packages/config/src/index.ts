@@ -77,6 +77,9 @@ export function validateProductionConfig(env: NodeJS.ProcessEnv = process.env): 
     if (!env.AWS_ACCESS_KEY_ID || !env.AWS_SECRET_ACCESS_KEY || !env.AWS_REGION) {
       errors.push("AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION are required for SES in production");
     }
+    if (!env.AWS_SNS_TOPIC_ARN) {
+      errors.push("AWS_SNS_TOPIC_ARN is required for SES in production to validate SNS webhooks");
+    }
   }
 
   // 5. EMAIL_WEBHOOK_SECRET

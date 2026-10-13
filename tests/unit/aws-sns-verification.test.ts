@@ -127,54 +127,116 @@ describe("AWS SNS Webhook Signature Verification Security", () => {
     // Create a self-signed cert PEM wrapper
     const mockCertPem = `-----BEGIN CERTIFICATE-----\n${Buffer.from(publicKey).toString("base64")}\n-----END CERTIFICATE-----`;
 
+    it("rejects verification when allowedTopicArn option is missing or empty", async () => {
+      const result = await verifyAwsSnsSignature(
+        {
+          Type: "Notification",
+          Message: "test",
+          Signature: "sig",
+          SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
+          TopicArn: "arn:aws:sns:us-east-1:123:topic",
+        },
+        { allowedTopicArn: "" }
+      );
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain("allowedTopicArn is required");
+    });
+
     it("rejects payload missing signature or cert URL", async () => {
-      const result = await verifyAwsSnsSignature({
-        Type: "Notification",
-        Message: "test",
-      });
+      const result = await verifyAwsSnsSignature(
+        {
+          Type: "Notification",
+          Message: "test",
+          TopicArn: "arn:aws:sns:us-east-1:123:topic",
+        },
+        { allowedTopicArn: "arn:aws:sns:us-east-1:123:topic" }
+      );
       expect(result.valid).toBe(false);
       expect(result.error).toContain("Missing required SNS signature fields");
     });
 
-    it("rejects payload with untrusted SigningCertURL", async () => {
-      const result = await verifyAwsSnsSignature({
-        Type: "Notification",
-        Message: "test",
-        MessageId: "123",
-        TopicArn: "arn:aws:sns:us-east-1:123:topic",
-        Timestamp: "2026-10-14T01:00:00.000Z",
-        Signature: "fake-sig",
-        SigningCertURL: "https://evil.com/fake-cert.pem",
-      });
-
+    it("rejects payload missing TopicArn", async () => {
+      const result = await verifyAwsSnsSignature(
+        {
+          Type: "Notification",
+          Message: "test",
+          Signature: "sig",
+          SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
+        },
+        { allowedTopicArn: "arn:aws:sns:us-east-1:123:topic" }
+      );
       expect(result.valid).toBe(false);
-      expect(result.error).toContain("Untrusted SigningCertURL");
+      expect(result.error).toContain("Incoming SNS message is missing TopicArn");
     });
 
-    it("rejects payload when TopicArn does not match allowed TopicArn", async () => {
+    it("rejects payload with untrusted SigningCertURL", async () => {
       const result = await verifyAwsSnsSignature(
         {
           Type: "Notification",
           Message: "test",
           MessageId: "123",
-          TopicArn: "arn:aws:sns:us-east-1:123:wrong-topic",
+          TopicArn: "arn:aws:sns:us-east-1:123:topic",
+          Timestamp: "2026-10-14T01:00:00.000Z",
+          Signature: "fake-sig",
+          SigningCertURL: "https://evil.com/fake-cert.pem",
+        },
+        { allowedTopicArn: "arn:aws:sns:us-east-1:123:topic" }
+      );
+
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain("Untrusted SigningCertURL");
+    });
+
+    it("rejects payload when TopicArn does not match allowed TopicArn (wrong topic)", async () => {
+      const result = await verifyAwsSnsSignature(
+        {
+          Type: "Notification",
+          Message: "test",
+          MessageId: "123",
+          TopicArn: "arn:aws:sns:us-east-1:123:attacker-rogue-topic",
           Timestamp: "2026-10-14T01:00:00.000Z",
           Signature: "fake-sig",
           SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
         },
-        { allowedTopicArn: "arn:aws:sns:us-east-1:123:expected-topic" }
+        { allowedTopicArn: "arn:aws:sns:us-east-1:123:expected-production-topic" }
       );
 
       expect(result.valid).toBe(false);
-      expect(result.error).toContain("does not match allowed TopicArn");
+      expect(result.error).toContain("TopicArn mismatch");
     });
 
-    it("rejects forged or tampered signatures", async () => {
+    it("rejects valid RSA signature when TopicArn is from an untrusted rogue topic", async () => {
+      // Simulates an attacker sending an authentic, cryptographically signed message from their OWN AWS account's SNS topic
+      const attackerPayload: Record<string, any> = {
+        Type: "Notification",
+        Message: JSON.stringify({ eventType: "Bounce", mail: { messageId: "spoofed-msg" } }),
+        MessageId: "sns-attacker-999",
+        TopicArn: "arn:aws:sns:us-east-1:999999999999:attacker-controlled-topic",
+        Timestamp: "2026-10-14T01:00:00.000Z",
+        SignatureVersion: "2",
+        SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
+      };
+
+      const canonical = buildSnsCanonicalString(attackerPayload)!;
+      const signer = crypto.createSign("RSA-SHA256");
+      signer.update(canonical, "utf8");
+      attackerPayload.Signature = signer.sign(privateKey, "base64");
+
+      const result = await verifyAwsSnsSignature(attackerPayload, {
+        allowedTopicArn: "arn:aws:sns:us-east-1:123456789012:ai-signal-legitimate-topic",
+        certificateFetcher: async () => publicKey,
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain("TopicArn mismatch");
+    });
+
+    it("rejects forged or tampered signatures even when TopicArn matches", async () => {
       const payload = {
         Type: "Notification",
         Message: "test",
         MessageId: "123",
-        TopicArn: "arn:aws:sns:us-east-1:123:topic",
+        TopicArn: "arn:aws:sns:us-east-1:123:legitimate-topic",
         Timestamp: "2026-10-14T01:00:00.000Z",
         SignatureVersion: "1",
         Signature: Buffer.from("forged_invalid_signature_bytes").toString("base64"),
@@ -182,13 +244,15 @@ describe("AWS SNS Webhook Signature Verification Security", () => {
       };
 
       const result = await verifyAwsSnsSignature(payload, {
+        allowedTopicArn: "arn:aws:sns:us-east-1:123:legitimate-topic",
         certificateFetcher: async () => publicKey,
       });
 
       expect(result.valid).toBe(false);
+      expect(result.error).toContain("Cryptographic signature mismatch");
     });
 
-    it("successfully verifies genuine cryptographically signed SNS notification", async () => {
+    it("successfully verifies genuine cryptographically signed SNS notification with matching TopicArn", async () => {
       const payload: Record<string, any> = {
         Type: "Notification",
         Message: JSON.stringify({ eventType: "Bounce", mail: { messageId: "ses-msg-1" } }),

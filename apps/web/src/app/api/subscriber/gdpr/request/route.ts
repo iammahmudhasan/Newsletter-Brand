@@ -76,12 +76,22 @@ export async function POST(req: NextRequest) {
       isExport ? "export your personal data archive" : "permanently delete your subscriber record"
     }.\n\nClick the link below:\n${actionUrl}\n\nThis link expires in 2 hours.`;
 
-    await provider.sendEmail({
+    const sendResult = await provider.sendEmail({
       to: sub.email,
       subject: emailSubject,
       html: emailHtml,
       text: emailText,
     });
+
+    if (!sendResult.success) {
+      console.error(
+        `[GDPR Request Error] Verification email dispatch failed for subscriber ${sub.id}: ${sendResult.error}`
+      );
+      return NextResponse.json(
+        { error: "Unable to dispatch verification email. Please try again later." },
+        { status: 500 }
+      );
+    }
 
     return NextResponse.json({
       success: true,

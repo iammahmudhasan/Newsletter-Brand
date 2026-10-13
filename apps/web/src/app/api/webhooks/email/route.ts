@@ -97,9 +97,18 @@ export async function POST(req: NextRequest) {
       req.headers.has("x-amz-sns-message-type");
 
     if (isAwsSns) {
-      // 1. Strictly verify AWS SNS cryptographic signature
+      const allowedTopicArn = config.email.aws.snsTopicArn || (isProduction ? "" : (payload.TopicArn as string) || "");
+      if (isProduction && !config.email.aws.snsTopicArn) {
+        console.error("[Webhook Security] AWS_SNS_TOPIC_ARN is not configured in production");
+        return NextResponse.json(
+          { error: "Server misconfiguration: AWS_SNS_TOPIC_ARN is not configured" },
+          { status: 500 }
+        );
+      }
+
+      // 1. Strictly verify AWS SNS cryptographic signature and TopicArn
       const snsResult = await verifyAwsSnsSignature(payload, {
-        allowedTopicArn: config.email.aws.snsTopicArn,
+        allowedTopicArn,
       });
 
       if (!snsResult.valid) {
@@ -211,49 +220,61 @@ export async function POST(req: NextRequest) {
 
     const email = normalizeEmail(recipientEmail);
 
-    // Standardize event type
-    const standardizedType = eventType.includes("bounce")
-      ? "bounce"
-      : eventType.includes("complaint")
-      ? "complaint"
-      : eventType.includes("click")
-      ? "click"
-      : eventType.includes("open")
-      ? "open"
-      : eventType.includes("deliver")
-      ? "delivered"
-      : "delivered";
+    // Standardize event type with explicit allowlist (never default to "delivered"!)
+    const lowerEventType = eventType.toLowerCase();
+    const standardizedType: "delivered" | "bounce" | "complaint" | "click" | "open" | "unknown" =
+      lowerEventType.includes("bounce")
+        ? "bounce"
+        : lowerEventType.includes("complain")
+        ? "complaint"
+        : lowerEventType.includes("click")
+        ? "click"
+        : lowerEventType.includes("open")
+        ? "open"
+        : lowerEventType.includes("deliver")
+        ? "delivered"
+        : "unknown";
 
-    // Database Idempotency Check: prevent duplicate event processing
+    // Database Idempotency Check: atomic insert with onConflictDoNothing
+    // Prevents concurrent duplicate webhooks from double-processing
     if (providerMessageId) {
-      const [existingEvent] = await db
-        .select({ id: emailEvents.id })
-        .from(emailEvents)
-        .where(
-          and(
-            eq(emailEvents.providerMessageId, providerMessageId),
-            eq(emailEvents.eventType, standardizedType)
-          )
-        );
+      const inserted = await db
+        .insert(emailEvents)
+        .values({
+          providerMessageId,
+          recipientEmail: email,
+          eventType: standardizedType,
+          payload: eventData,
+        })
+        .onConflictDoNothing({
+          target: [emailEvents.providerMessageId, emailEvents.eventType],
+        })
+        .returning({ id: emailEvents.id });
 
-      if (existingEvent) {
+      if (inserted.length === 0) {
+        // Row was not inserted because this exact (providerMessageId, eventType) already exists!
         return NextResponse.json(
           { received: true, duplicate: true, note: "Event already processed" },
           { status: 200 }
         );
       }
-    }
-
-    // Log event in audit table
-    try {
+    } else {
+      // Fallback if provider didn't supply providerMessageId
       await db.insert(emailEvents).values({
-        providerMessageId,
+        providerMessageId: null,
         recipientEmail: email,
         eventType: standardizedType,
         payload: eventData,
       });
-    } catch (e: any) {
-      console.warn("[Webhook] Failed to insert email event log:", e.message);
+    }
+
+    // Skip suppression or analytics side effects if event type is unknown
+    if (standardizedType === "unknown") {
+      console.warn(`[Webhook] Recorded unclassified or unknown event type '${eventType}' for ${email}`);
+      return NextResponse.json(
+        { received: true, unhandledType: eventType, note: "Unknown event type recorded without state modification" },
+        { status: 200 }
+      );
     }
 
     // Process Hard Bounce: suppress permanently

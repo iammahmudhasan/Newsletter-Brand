@@ -16,12 +16,22 @@ export class ResendEmailProvider implements EmailProvider {
     }
 
     try {
+      const fetchHeaders: Record<string, string> = {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      };
+      if (options.idempotencyKey) {
+        fetchHeaders["Idempotency-Key"] = options.idempotencyKey;
+      }
+
+      const emailHeaders = {
+        ...options.headers,
+        ...(options.idempotencyKey ? { "X-Entity-Ref-ID": options.idempotencyKey } : {}),
+      };
+
       const response = await fetch("https://api.resend.com/emails", {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
+        headers: fetchHeaders,
         body: JSON.stringify({
           from: options.from || `${config.email.fromName} <${config.email.fromAddress}>`,
           to: options.to,
@@ -29,7 +39,7 @@ export class ResendEmailProvider implements EmailProvider {
           subject: options.subject,
           html: options.html,
           text: options.text,
-          headers: options.headers,
+          headers: emailHeaders,
           tags: options.tags
             ? Object.entries(options.tags).map(([name, value]) => ({ name, value }))
             : undefined,

@@ -46,6 +46,36 @@ describe("Email Provider Fail-Closed Security Rules", () => {
     );
   });
 
+  it("fails startup if EMAIL_PROVIDER=ses and AWS_SNS_TOPIC_ARN is missing in production", () => {
+    const sesEnvWithoutTopic: NodeJS.ProcessEnv = {
+      ...baseValidProductionEnv,
+      EMAIL_PROVIDER: "ses",
+      AWS_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+      AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      AWS_REGION: "us-east-1",
+      // AWS_SNS_TOPIC_ARN is missing!
+    };
+    delete sesEnvWithoutTopic.RESEND_API_KEY;
+
+    expect(() => validateProductionConfig(sesEnvWithoutTopic)).toThrow(
+      /AWS_SNS_TOPIC_ARN is required for SES in production to validate SNS webhooks/
+    );
+  });
+
+  it("passes validation when EMAIL_PROVIDER=ses and all AWS keys and AWS_SNS_TOPIC_ARN are present", () => {
+    const validSesEnv: NodeJS.ProcessEnv = {
+      ...baseValidProductionEnv,
+      EMAIL_PROVIDER: "ses",
+      AWS_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+      AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      AWS_REGION: "us-east-1",
+      AWS_SNS_TOPIC_ARN: "arn:aws:sns:us-east-1:123456789012:ai-signal-ses-webhook-topic",
+    };
+    delete validSesEnv.RESEND_API_KEY;
+
+    expect(() => validateProductionConfig(validSesEnv)).not.toThrow();
+  });
+
   it("strictly prohibits runtime SKIP_ENV_VALIDATION bypass unless in Next.js static build phase", () => {
     const insecureEnv: NodeJS.ProcessEnv = {
       NODE_ENV: "production",

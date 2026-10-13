@@ -31,7 +31,7 @@ async function processNextJob(): Promise<boolean> {
         break;
 
       case "process_campaign":
-        await handleProcessCampaignBatch(job.payload as any);
+        await handleProcessCampaignBatch(job.payload as any, job.id);
         await completeJob(job.id);
         console.log(`[Worker] Job ${job.id} completed successfully.`);
         break;

@@ -1,64 +1,66 @@
-import { db, campaigns, sql, eq } from "@ai-signal/db";
+import { db, campaigns, automationJobs, sql, eq } from "@ai-signal/db";
 import { enqueueJob } from "@ai-signal/queue";
 
 /**
- * Atomically claims and schedules due campaigns using FOR UPDATE SKIP LOCKED
- * to guarantee zero duplicate job dispatches across multiple worker instances.
+ * Atomically claims and schedules due campaigns using the Transactional Outbox Pattern:
+ * The status transition ('scheduled' -> 'sending') and the queue job creation
+ * occur within the EXACT same PostgreSQL transaction.
+ * If enqueue fails, the entire transaction rolls back, guaranteeing that a campaign
+ * is NEVER orphaned in 'sending' status without an active worker job.
  */
 export async function runCampaignScheduler(): Promise<number> {
   let claimedCount = 0;
 
   try {
-    // 1. Process due scheduled campaigns
+    // 1. Process due scheduled campaigns using Transactional Outbox pattern
     while (true) {
-      // Atomically select and transition one due campaign from 'scheduled' -> 'sending'
-      const claimedRows = await db.execute<typeof campaigns.$inferSelect>(
-        sql`
-          UPDATE campaigns
-          SET status = 'sending', updated_at = NOW()
-          WHERE id = (
-            SELECT id FROM campaigns
-            WHERE status = 'scheduled' AND scheduled_at <= NOW()
-            ORDER BY scheduled_at ASC
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-          )
-          RETURNING *;
-        `
-      );
+      const scheduledCampaign = await db.transaction(async (tx) => {
+        // Atomically select and lock one due campaign
+        const claimedRows = await tx.execute<typeof campaigns.$inferSelect>(
+          sql`
+            UPDATE campaigns
+            SET status = 'sending', updated_at = NOW()
+            WHERE id = (
+              SELECT id FROM campaigns
+              WHERE status = 'scheduled' AND scheduled_at <= NOW()
+              ORDER BY scheduled_at ASC
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+            )
+            RETURNING *;
+          `
+        );
 
-      const claimedCampaign = (claimedRows as any)?.[0];
-      if (!claimedCampaign) {
+        const claimed = (claimedRows as any)?.[0];
+        if (!claimed) {
+          return null;
+        }
+
+        // Transactional Outbox: Insert process_campaign job within the SAME atomic database transaction
+        const idempotencyKey = `campaign:${claimed.id}:dispatch`;
+        await tx
+          .insert(automationJobs)
+          .values({
+            jobName: "process_campaign",
+            payload: { campaignId: claimed.id },
+            status: "pending",
+            scheduledFor: new Date(),
+            maxRetries: 3,
+            idempotencyKey,
+          })
+          .onConflictDoNothing({ target: automationJobs.idempotencyKey });
+
+        return claimed;
+      });
+
+      if (!scheduledCampaign) {
         break; // No more due campaigns to process
       }
 
       console.log(
-        `[Scheduler] Atomically claimed campaign '${claimedCampaign.title}' (ID: ${claimedCampaign.id})`
+        `[Scheduler Outbox] Atomically claimed and enqueued campaign '${scheduledCampaign.title}' (ID: ${scheduledCampaign.id})`
       );
-
-      try {
-        // Enqueue job with unique idempotency key
-        await enqueueJob(
-          "process_campaign",
-          {
-            campaignId: claimedCampaign.id,
-          },
-          {
-            idempotencyKey: `campaign:${claimedCampaign.id}:dispatch`,
-          }
-        );
-        claimedCount++;
-      } catch (enqueueErr: any) {
-        console.error(
-          `[Scheduler Error] Failed to enqueue job for campaign ${claimedCampaign.id}. Rolling back status to 'scheduled':`,
-          enqueueErr.message
-        );
-        // Rollback campaign status to scheduled so it isn't orphaned
-        await db
-          .update(campaigns)
-          .set({ status: "scheduled", updatedAt: new Date() })
-          .where(eq(campaigns.id, claimedCampaign.id));
-      }
+      claimedCount++;
     }
 
     // 2. Recovery: Check for any campaigns stuck in 'sending' for > 15 minutes without progress

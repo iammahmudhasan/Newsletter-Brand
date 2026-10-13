@@ -7,6 +7,7 @@ export interface SendEmailOptions {
   text?: string;
   headers?: Record<string, string>;
   tags?: Record<string, string>;
+  idempotencyKey?: string;
 }
 
 export interface SendEmailResult {

@@ -121,15 +121,17 @@ async function fetchSnsCertificate(certUrl: string): Promise<string | null> {
   }
 }
 
+export interface VerifyAwsSnsOptions {
+  allowedTopicArn: string;
+  certificateFetcher?: (url: string) => Promise<string | null>;
+}
+
 /**
- * Verifies cryptographic signature of an AWS SNS message
+ * Verifies cryptographic signature of an AWS SNS message and validates TopicArn
  */
 export async function verifyAwsSnsSignature(
   payload: Record<string, any>,
-  options: {
-    allowedTopicArn?: string;
-    certificateFetcher?: (url: string) => Promise<string | null>;
-  } = {}
+  options: VerifyAwsSnsOptions
 ): Promise<{ valid: boolean; error?: string }> {
   // 1. Basic structural validation
   if (!payload || typeof payload !== "object") {
@@ -142,14 +144,34 @@ export async function verifyAwsSnsSignature(
     return { valid: false, error: "Missing required SNS signature fields" };
   }
 
-  // 2. Validate TopicArn allowlist if specified
-  if (options.allowedTopicArn && options.allowedTopicArn.trim() !== "") {
-    if (TopicArn !== options.allowedTopicArn) {
-      return {
-        valid: false,
-        error: `TopicArn '${TopicArn}' does not match allowed TopicArn '${options.allowedTopicArn}'`,
-      };
-    }
+  // 2. Strict TopicArn validation: allowedTopicArn MUST be non-empty and configured
+  if (
+    !options ||
+    !options.allowedTopicArn ||
+    typeof options.allowedTopicArn !== "string" ||
+    options.allowedTopicArn.trim() === ""
+  ) {
+    return {
+      valid: false,
+      error: "Verification failed: allowedTopicArn is required and cannot be empty",
+    };
+  }
+
+  if (!TopicArn || typeof TopicArn !== "string") {
+    return {
+      valid: false,
+      error: "Verification failed: Incoming SNS message is missing TopicArn",
+    };
+  }
+
+  const expectedTopicArn = options.allowedTopicArn.trim();
+  const incomingTopicArn = TopicArn.trim();
+
+  if (incomingTopicArn !== expectedTopicArn) {
+    return {
+      valid: false,
+      error: `TopicArn mismatch: received '${incomingTopicArn}', expected '${expectedTopicArn}'`,
+    };
   }
 
   // 3. Validate SigningCertURL domain
