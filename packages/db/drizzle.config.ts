@@ -11,5 +11,5 @@ export default defineConfig({
     url: process.env.DATABASE_URL || "postgres://postgres:postgres@localhost:5432/ai_signal",
   },
   verbose: true,
-  strict: true,
+  strict: false,
 });
