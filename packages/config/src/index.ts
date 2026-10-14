@@ -150,9 +150,11 @@ export interface TokenPayload {
  */
 export function generateSignedToken(
   payload: Omit<TokenPayload, "exp">,
-  expiresInSeconds: number = 86400 * 3 // 3 days default
+  expiresInSeconds: number = 86400 * 3, // 3 days default
+  baseTimestampSeconds?: number
 ): string {
-  const exp = Math.floor(Date.now() / 1000) + expiresInSeconds;
+  const baseTime = baseTimestampSeconds !== undefined ? baseTimestampSeconds : Math.floor(Date.now() / 1000);
+  const exp = baseTime + expiresInSeconds;
   const data: TokenPayload = { ...payload, exp };
   const jsonStr = JSON.stringify(data);
   const base64Data = Buffer.from(jsonStr).toString("base64url");

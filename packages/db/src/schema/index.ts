@@ -193,6 +193,7 @@ export const automationJobs = pgTable(
     idempotencyKey: text("idempotency_key"),
     scheduledFor: timestamp("scheduled_for").defaultNow(),
     lockedAt: timestamp("locked_at"),
+    leaseToken: uuid("lease_token"),
     completedAt: timestamp("completed_at"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },

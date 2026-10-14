@@ -35,6 +35,11 @@ export class SesEmailProvider implements EmailProvider {
       const client = this.getClient();
       const from = `${config.email.fromName} <${config.email.fromAddress}>`;
 
+      // NOTE: AWS SES SendEmailCommand does NOT support native request deduplication via idempotency keys.
+      // Unlike Resend/Stripe, SES SendEmail has no native server-side idempotency parameter.
+      // Therefore, X-Idempotency-Key and EmailTags attached here serve strictly as downstream metadata
+      // for webhook event correlation (SNS Delivery/Bounce). Callers must treat SES as an at-least-once
+      // dispatch system and perform webhook reconciliation prior to retrying unconfirmed sends.
       const headersToSend = {
         ...options.headers,
         ...(options.idempotencyKey ? { "X-Idempotency-Key": options.idempotencyKey } : {}),

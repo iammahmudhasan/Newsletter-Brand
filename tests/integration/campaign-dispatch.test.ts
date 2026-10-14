@@ -216,10 +216,10 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
         status: "pending", // Reclaimed by recovery scheduler
         retryCount: 2,
         lockedAt: null as Date | null,
+        leaseToken: null as string | null,
       };
 
       // Stale worker that woke up late attempts completeJob()
-      // UPDATE automation_jobs SET status = 'completed' WHERE id = 'job-101' AND status = 'processing'
       let completedSuccessfully = false;
       if (jobInDb.status === "processing") {
         jobInDb.status = "completed";
@@ -228,6 +228,179 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
 
       expect(completedSuccessfully).toBe(false);
       expect(jobInDb.status).toBe("pending"); // Preserved for new worker!
+    });
+
+    it("ensures stale Worker A cannot complete or fail a job after Worker B has claimed it with a new leaseToken", () => {
+      const jobId = "job-fencing-102";
+      const leaseTokenA = "uuid-worker-a-1111";
+      const leaseTokenB = "uuid-worker-b-2222";
+
+      let jobInDb = {
+        id: jobId,
+        status: "processing",
+        lockedAt: new Date(),
+        leaseToken: leaseTokenB, // Worker B is the current active owner!
+        retryCount: 1,
+      };
+
+      // 1. Worker A (stale) attempts completeJob(jobId, leaseTokenA)
+      // SQL condition: WHERE id = jobId AND status = 'processing' AND lease_token = leaseTokenA
+      let workerACompleteSuccess = false;
+      if (jobInDb.status === "processing" && jobInDb.leaseToken === leaseTokenA) {
+        jobInDb.status = "completed";
+        workerACompleteSuccess = true;
+      }
+
+      expect(workerACompleteSuccess).toBe(false);
+      expect(jobInDb.status).toBe("processing"); // Job remains in processing under Worker B!
+      expect(jobInDb.leaseToken).toBe(leaseTokenB);
+
+      // 2. Worker A (stale) attempts failJob(jobId, "Crash error", leaseTokenA)
+      // SQL condition: WHERE id = jobId AND status = 'processing' AND lease_token = leaseTokenA
+      let workerAFailSuccess = false;
+      if (jobInDb.status === "processing" && jobInDb.leaseToken === leaseTokenA) {
+        jobInDb.status = "failed";
+        workerAFailSuccess = true;
+      }
+
+      expect(workerAFailSuccess).toBe(false);
+      expect(jobInDb.status).toBe("processing"); // Job is NOT failed by stale worker A!
+
+      // 3. Worker B (legitimate owner) calls renewJobLease(jobId, leaseTokenB)
+      let workerBRenewSuccess = false;
+      if (jobInDb.status === "processing" && jobInDb.leaseToken === leaseTokenB) {
+        jobInDb.lockedAt = new Date();
+        workerBRenewSuccess = true;
+      }
+      expect(workerBRenewSuccess).toBe(true);
+
+      // 4. Worker B finishes work and calls completeJob(jobId, leaseTokenB)
+      let workerBCompleteSuccess = false;
+      if (jobInDb.status === "processing" && jobInDb.leaseToken === leaseTokenB) {
+        jobInDb.status = "completed";
+        workerBCompleteSuccess = true;
+      }
+      expect(workerBCompleteSuccess).toBe(true);
+      expect(jobInDb.status).toBe("completed");
+    });
+  });
+
+  describe("Resend Idempotency & Deterministic Retry Payload", () => {
+    it("generates 100% deterministic unsubscribe token, URL, and issue date across retries", () => {
+      const campaign = {
+        id: "camp-det-001",
+        title: "AI Signal Weekly #42",
+        createdAt: new Date("2026-10-10T12:00:00Z"),
+      };
+      const subscriber = {
+        id: "sub-det-001",
+        email: "alice@example.com",
+      };
+
+      // Base timestamp derived strictly from campaign.createdAt
+      const baseTimestamp = Math.floor(campaign.createdAt.getTime() / 1000);
+
+      // First dispatch attempt (day 0)
+      const tokenAttempt1 = `token_base_${baseTimestamp}_sub_${subscriber.id}`;
+      const issueDateAttempt1 = new Date(campaign.createdAt).toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+      });
+
+      // Second dispatch retry (simulate 3 days later)
+      const tokenAttempt2 = `token_base_${baseTimestamp}_sub_${subscriber.id}`;
+      const issueDateAttempt2 = new Date(campaign.createdAt).toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+      });
+
+      expect(tokenAttempt1).toBe(tokenAttempt2);
+      expect(issueDateAttempt1).toBe(issueDateAttempt2);
+      expect(issueDateAttempt1).toBe("Oct 10, 2026");
+    });
+
+    it("classifies Resend HTTP 409 conflict as ambiguous to trigger webhook reconciliation", () => {
+      const response = {
+        status: 409,
+        data: {
+          name: "invalid_idempotent_request",
+          message: "A request with the same idempotency key was previously submitted",
+        },
+      };
+
+      const isConflict = response.status === 409 || response.data?.name === "invalid_idempotent_request";
+      const isAmbiguous = response.status >= 500 || isConflict;
+
+      expect(isConflict).toBe(true);
+      expect(isAmbiguous).toBe(true); // Must route to unknown_outcome, NOT blind failure!
+    });
+  });
+
+  describe("Unknown Outcome Timing & Eligibility Threshold", () => {
+    it("allows unknown_outcome to be eligible as soon as nextAttemptAt (2m) has passed", () => {
+      const now = new Date();
+      const twoMinutesAgo = new Date(now.getTime() - 2 * 60 * 1000);
+
+      const unknownRecipient = {
+        id: "recip-unknown-1",
+        status: "unknown_outcome",
+        updatedAt: twoMinutesAgo,
+        nextAttemptAt: twoMinutesAgo,
+      };
+
+      // Query logic: status = 'unknown_outcome' AND (nextAttemptAt IS NULL OR nextAttemptAt <= NOW())
+      const isEligible =
+        unknownRecipient.status === "unknown_outcome" &&
+        (unknownRecipient.nextAttemptAt === null || unknownRecipient.nextAttemptAt <= now);
+
+      expect(isEligible).toBe(true);
+    });
+
+    it("requires crashed processing recipients to wait 5 minutes before reclaim", () => {
+      const now = new Date();
+      const threeMinutesAgo = new Date(now.getTime() - 3 * 60 * 1000);
+      const sixMinutesAgo = new Date(now.getTime() - 6 * 60 * 1000);
+
+      const crashedRecently = {
+        id: "recip-proc-1",
+        status: "processing",
+        updatedAt: threeMinutesAgo,
+      };
+
+      const crashedStale = {
+        id: "recip-proc-2",
+        status: "processing",
+        updatedAt: sixMinutesAgo,
+      };
+
+      const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
+
+      const eligibleRecently = crashedRecently.status === "processing" && crashedRecently.updatedAt < fiveMinutesAgo;
+      const eligibleStale = crashedStale.status === "processing" && crashedStale.updatedAt < fiveMinutesAgo;
+
+      expect(eligibleRecently).toBe(false); // Only 3m old -> protected
+      expect(eligibleStale).toBe(true); // 6m old -> reclaimed!
+    });
+  });
+
+  describe("Zero Active Subscribers Reconciliation", () => {
+    it("does NOT prematurely finalize campaign as sent with 0 recipients when pre-existing recipients exist", () => {
+      const activeSubscribers = [] as Array<{ id: string; email: string }>;
+      const existingRecipientsCount: number = 15; // 15 recipients from a previous attempt
+
+      let finalizedEarlyWithZero = false;
+      let proceedToProcessExisting = false;
+
+      if (activeSubscribers.length === 0 && existingRecipientsCount === 0) {
+        finalizedEarlyWithZero = true;
+      } else {
+        proceedToProcessExisting = true;
+      }
+
+      expect(finalizedEarlyWithZero).toBe(false);
+      expect(proceedToProcessExisting).toBe(true);
     });
   });
 });

@@ -16,7 +16,8 @@ import { enqueueJob, renewJobLease } from "@ai-signal/queue";
 
 export async function handleProcessCampaignBatch(
   payload: { campaignId: string },
-  jobId?: string
+  jobId?: string,
+  leaseToken?: string | null
 ) {
   const { campaignId } = payload;
   const provider = getEmailProvider();
@@ -44,7 +45,14 @@ export async function handleProcessCampaignBatch(
       .where(eq(campaigns.id, campaignId));
   }
 
-  // 2. Fetch all currently active subscribers
+  // 2. Check if this campaign already has pre-existing recipients from a previous/interrupted dispatch
+  const existingRecipients = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(campaignRecipients)
+    .where(eq(campaignRecipients.campaignId, campaign.id));
+  const existingCount = Number(existingRecipients[0]?.count || 0);
+
+  // Fetch all currently active subscribers
   const activeSubscribers = await db
     .select({
       id: subscribers.id,
@@ -53,8 +61,8 @@ export async function handleProcessCampaignBatch(
     .from(subscribers)
     .where(eq(subscribers.status, "active"));
 
-  if (activeSubscribers.length === 0) {
-    console.log(`[Worker] No active subscribers found for Campaign '${campaign.title}'.`);
+  if (activeSubscribers.length === 0 && existingCount === 0) {
+    console.log(`[Worker] No active subscribers and no existing recipients found for Campaign '${campaign.title}'.`);
     await db
       .update(campaigns)
       .set({
@@ -96,7 +104,8 @@ export async function handleProcessCampaignBatch(
         eq(campaignRecipients.campaignId, campaign.id),
         sql`(
           (${campaignRecipients.status} = 'queued' AND (${campaignRecipients.nextAttemptAt} IS NULL OR ${campaignRecipients.nextAttemptAt} <= NOW()))
-          OR (${campaignRecipients.status} IN ('processing', 'unknown_outcome') AND ${campaignRecipients.updatedAt} < NOW() - INTERVAL '5 minutes')
+          OR (${campaignRecipients.status} = 'unknown_outcome' AND (${campaignRecipients.nextAttemptAt} IS NULL OR ${campaignRecipients.nextAttemptAt} <= NOW()))
+          OR (${campaignRecipients.status} = 'processing' AND ${campaignRecipients.updatedAt} < NOW() - INTERVAL '5 minutes')
         )`
       )
     );
@@ -115,7 +124,7 @@ export async function handleProcessCampaignBatch(
   if (jobId) {
     heartbeatTimer = setInterval(async () => {
       try {
-        await renewJobLease(jobId);
+        await renewJobLease(jobId, leaseToken);
         await db
           .update(campaigns)
           .set({ updatedAt: new Date() })
@@ -132,7 +141,7 @@ export async function handleProcessCampaignBatch(
 
       // Heartbeat: renew job lock lease in queue so long campaigns never get falsely reclaimed as stale
       if (jobId) {
-        await renewJobLease(jobId);
+        await renewJobLease(jobId, leaseToken);
       }
 
       // Touch campaign updatedAt to record active progress
@@ -143,7 +152,7 @@ export async function handleProcessCampaignBatch(
 
       for (const item of batch) {
         if (jobId) {
-          await renewJobLease(jobId);
+          await renewJobLease(jobId, leaseToken);
         }
 
         // Atomic Claim: Transition status to 'processing' with fresh lease timestamp
@@ -154,7 +163,8 @@ export async function handleProcessCampaignBatch(
             WHERE id = ${item.recipientId}
               AND (
                 (status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()))
-                OR (status IN ('processing', 'unknown_outcome') AND updated_at < NOW() - INTERVAL '5 minutes')
+                OR (status = 'unknown_outcome' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()))
+                OR (status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes')
               )
             RETURNING *;
           `
@@ -234,6 +244,10 @@ export async function handleProcessCampaignBatch(
             if (newStatus === "delivered") successCount++;
             else failCount++;
             continue;
+          } else if (provider.name === "ses") {
+            console.warn(
+              `[SES At-Least-Once Risk] Recipient ${item.recipientId} had no webhook delivery event recorded after crash/timeout. AWS SES lacks native request deduplication; re-dispatching under at-least-once delivery semantics.`
+            );
           }
         }
 
@@ -286,27 +300,33 @@ export async function handleProcessCampaignBatch(
             continue;
           }
 
-          // Generate signed unsubscribe tokens with purpose: 'unsubscribe'
+          // Generate deterministic signed unsubscribe tokens using campaign.createdAt as base timestamp
+          // This guarantees byte-for-byte identical token and email payload across all retries!
+          const baseTimestamp = Math.floor(new Date(campaign.createdAt).getTime() / 1000);
           const unsubToken = generateSignedToken(
             {
               id: freshSub.id,
               email: freshSub.email,
               purpose: "unsubscribe",
             },
-            365 * 86400
+            365 * 86400,
+            baseTimestamp
           );
 
           const unsubscribeWebUrl = `${config.appUrl}/unsubscribe?token=${unsubToken}`;
           const unsubscribeApiUrl = `${config.appUrl}/api/unsubscribe?token=${unsubToken}`;
           const archiveUrl = `${config.appUrl}/archive/${campaign.id}`;
 
+          // Format issueDate deterministically from campaign.createdAt (never Date.now()!)
+          const issueDate = new Date(campaign.createdAt).toLocaleDateString("en-US", {
+            month: "short",
+            day: "numeric",
+            year: "numeric",
+          });
+
           const { html, text, headers } = renderNewsletterEmail({
             issueNumber: 1,
-            issueDate: new Date().toLocaleDateString("en-US", {
-              month: "short",
-              day: "numeric",
-              year: "numeric",
-            }),
+            issueDate,
             title: campaign.title,
             previewText: campaign.previewText || "",
             htmlContent: campaign.contentHtml,

@@ -39,6 +39,7 @@ export async function enqueueJob(
 
 /**
  * Claims the next pending job atomically using FOR UPDATE SKIP LOCKED
+ * Generates a unique leaseToken to bind the job execution to the specific claiming worker.
  */
 export async function claimNextJob(
   allowedJobNames?: string[]
@@ -54,7 +55,9 @@ export async function claimNextJob(
       const rows = await tx.execute<typeof automationJobs.$inferSelect>(
         sql`
           UPDATE automation_jobs
-          SET status = 'processing', locked_at = NOW()
+          SET status = 'processing',
+              locked_at = NOW(),
+              lease_token = gen_random_uuid()
           WHERE id = (
             SELECT id FROM automation_jobs
             WHERE ${filterClause}
@@ -79,6 +82,7 @@ export async function claimNextJob(
 /**
  * Reclaims stale jobs stuck in 'processing' due to worker crash or unhandled timeout.
  * Jobs exceeding maxRetries are moved to 'failed'; others are reset to 'pending' for retry.
+ * Invalidates the previous leaseToken to prevent stale workers from mutating reclaimed jobs.
  */
 export async function reclaimStaleJobs(staleMinutes: number = 10): Promise<number> {
   try {
@@ -119,6 +123,7 @@ export async function reclaimStaleJobs(staleMinutes: number = 10): Promise<numbe
               retryCount: newRetries,
               lastError: `Worker lease expired after ${staleMinutes}m. Automatically reclaimed for retry #${newRetries}.`,
               lockedAt: null,
+              leaseToken: null,
               scheduledFor: new Date(),
             })
             .where(eq(automationJobs.id, job.id));
@@ -138,23 +143,45 @@ export async function reclaimStaleJobs(staleMinutes: number = 10): Promise<numbe
 /**
  * Renews the lock lease for an actively running job so long-running tasks
  * (e.g. large campaign dispatches) are never prematurely reclaimed as stale.
+ * Fenced with leaseToken to ensure only the active lease owner can renew.
  */
-export async function renewJobLease(jobId: string): Promise<void> {
+export async function renewJobLease(jobId: string, leaseToken?: string | null): Promise<boolean> {
   try {
-    await db
+    const conditions = [
+      eq(automationJobs.id, jobId),
+      eq(automationJobs.status, "processing"),
+    ];
+    if (leaseToken) {
+      conditions.push(eq(automationJobs.leaseToken, leaseToken));
+    }
+
+    const result = await db
       .update(automationJobs)
       .set({ lockedAt: new Date() })
-      .where(and(eq(automationJobs.id, jobId), eq(automationJobs.status, "processing")));
+      .where(and(...conditions))
+      .returning({ id: automationJobs.id });
+
+    return result.length > 0;
   } catch (err: any) {
     console.warn(`[Queue Lease Warning] Failed to renew lease for job ${jobId}:`, err.message);
+    return false;
   }
 }
 
 /**
- * Marks a job as completed
+ * Marks a job as completed.
+ * Fenced with leaseToken and 'processing' status to prevent stale workers from completing reclaimed jobs.
  */
-export async function completeJob(jobId: string): Promise<void> {
+export async function completeJob(jobId: string, leaseToken?: string | null): Promise<boolean> {
   try {
+    const conditions = [
+      eq(automationJobs.id, jobId),
+      eq(automationJobs.status, "processing"),
+    ];
+    if (leaseToken) {
+      conditions.push(eq(automationJobs.leaseToken, leaseToken));
+    }
+
     const result = await db
       .update(automationJobs)
       .set({
@@ -162,12 +189,14 @@ export async function completeJob(jobId: string): Promise<void> {
         completedAt: new Date(),
         lockedAt: null,
       })
-      .where(and(eq(automationJobs.id, jobId), eq(automationJobs.status, "processing")))
+      .where(and(...conditions))
       .returning({ id: automationJobs.id });
 
     if (result.length === 0) {
-      console.warn(`[Queue Warning] Attempted to complete job ${jobId}, but job is no longer in 'processing' state (lease likely reclaimed).`);
+      console.warn(`[Queue Warning] Attempted to complete job ${jobId}, but job is no longer owned by this lease token or is not in 'processing' state.`);
+      return false;
     }
+    return true;
   } catch (err: any) {
     console.error(`[Queue Error] Failed to complete job ${jobId}:`, err.message);
     throw err;
@@ -175,28 +204,38 @@ export async function completeJob(jobId: string): Promise<void> {
 }
 
 /**
- * Handles job failure with exponential backoff or dead-letter state
+ * Handles job failure with exponential backoff or dead-letter state.
+ * Fenced with leaseToken and 'processing' status so stale workers cannot fail a reclaimed active job.
  */
 export async function failJob(
   jobId: string,
-  errorMessage: string
-): Promise<void> {
+  errorMessage: string,
+  leaseToken?: string | null
+): Promise<boolean> {
   try {
+    const conditions = [
+      eq(automationJobs.id, jobId),
+      eq(automationJobs.status, "processing"),
+    ];
+    if (leaseToken) {
+      conditions.push(eq(automationJobs.leaseToken, leaseToken));
+    }
+
     const [job] = await db
       .select()
       .from(automationJobs)
-      .where(eq(automationJobs.id, jobId));
+      .where(and(...conditions));
 
     if (!job) {
-      console.warn(`[Queue Warning] Attempted to fail job ${jobId}, but row was not found.`);
-      return;
+      console.warn(`[Queue Warning] Attempted to fail job ${jobId}, but job is not in 'processing' state or lease token mismatched.`);
+      return false;
     }
 
     const newRetryCount = (job.retryCount || 0) + 1;
     const maxRetries = job.maxRetries || 3;
 
     if (newRetryCount >= maxRetries) {
-      await db
+      const result = await db
         .update(automationJobs)
         .set({
           status: "failed",
@@ -204,13 +243,15 @@ export async function failJob(
           lastError: errorMessage,
           lockedAt: null,
         })
-        .where(eq(automationJobs.id, jobId));
+        .where(and(...conditions))
+        .returning({ id: automationJobs.id });
       console.warn(`[Queue] Job ${jobId} ('${job.jobName}') permanently marked as failed after ${newRetryCount} attempts.`);
+      return result.length > 0;
     } else {
       const delaySeconds = Math.pow(4, newRetryCount) * 15;
       const nextRun = new Date(Date.now() + delaySeconds * 1000);
 
-      await db
+      const result = await db
         .update(automationJobs)
         .set({
           status: "pending",
@@ -218,9 +259,12 @@ export async function failJob(
           lastError: errorMessage,
           scheduledFor: nextRun,
           lockedAt: null,
+          leaseToken: null,
         })
-        .where(eq(automationJobs.id, jobId));
+        .where(and(...conditions))
+        .returning({ id: automationJobs.id });
       console.log(`[Queue] Job ${jobId} scheduled for retry #${newRetryCount} at ${nextRun.toISOString()}`);
+      return result.length > 0;
     }
   } catch (err: any) {
     console.error(`[Queue Error] Error updating failed job ${jobId}:`, err.message);

@@ -20,25 +20,25 @@ async function processNextJob(): Promise<boolean> {
     switch (job.jobName) {
       case "send_confirmation":
         await handleSendConfirmation(job.payload as any);
-        await completeJob(job.id);
+        await completeJob(job.id, job.leaseToken);
         console.log(`[Worker] Job ${job.id} completed successfully.`);
         break;
 
       case "send_welcome":
         await handleSendWelcome(job.payload as any);
-        await completeJob(job.id);
+        await completeJob(job.id, job.leaseToken);
         console.log(`[Worker] Job ${job.id} completed successfully.`);
         break;
 
       case "process_campaign":
-        await handleProcessCampaignBatch(job.payload as any, job.id);
-        await completeJob(job.id);
+        await handleProcessCampaignBatch(job.payload as any, job.id, job.leaseToken);
+        await completeJob(job.id, job.leaseToken);
         console.log(`[Worker] Job ${job.id} completed successfully.`);
         break;
 
       default:
         console.error(`[Worker Security Alert] Unknown job name '${job.jobName}' for job ID ${job.id}. Marking as failed.`);
-        await failJob(job.id, `Unrecognized job handler: ${job.jobName}`);
+        await failJob(job.id, `Unrecognized job handler: ${job.jobName}`, job.leaseToken);
         break;
     }
 
@@ -46,7 +46,7 @@ async function processNextJob(): Promise<boolean> {
   } catch (err: any) {
     console.error(`[Worker] Job ${job.id} execution failed:`, err.message);
     try {
-      await failJob(job.id, err.message || "Unknown execution failure");
+      await failJob(job.id, err.message || "Unknown execution failure", job.leaseToken);
     } catch (failErr: any) {
       console.error(`[Worker] Failed to record failure for job ${job.id}:`, failErr.message);
     }

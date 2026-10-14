@@ -50,7 +50,13 @@ export class ResendEmailProvider implements EmailProvider {
       const data = (await response.json()) as any;
 
       if (!response.ok) {
-        const isAmbiguous = response.status >= 500;
+        const isConflict = response.status === 409 || data?.name === "invalid_idempotent_request";
+        const isAmbiguous = response.status >= 500 || isConflict;
+        if (isConflict) {
+          console.warn(
+            `[Resend Idempotency Conflict] HTTP 409 returned for key '${options.idempotencyKey}': ${data?.message || "idempotent request conflict"}. Marking ambiguous for webhook reconciliation.`
+          );
+        }
         return {
           success: false,
           messageId: "",
