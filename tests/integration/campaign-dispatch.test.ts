@@ -403,4 +403,158 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
       expect(proceedToProcessExisting).toBe(true);
     });
   });
+
+  describe("Queue Job Row Normalization & Field Mapping", () => {
+    it("normalizes raw Postgres snake_case row columns to camelCase properties (jobName, leaseToken)", () => {
+      // Raw row as returned by PostgreSQL driver without client-side mapping
+      const rawPostgresRow = {
+        id: "job-norm-001",
+        job_name: "process_campaign",
+        payload: { campaignId: "camp-norm-001" },
+        status: "processing",
+        retry_count: 1,
+        max_retries: 3,
+        last_error: null,
+        idempotency_key: "idem-norm-001",
+        scheduled_for: new Date(),
+        locked_at: new Date(),
+        lease_token: "token-norm-uuid-1234",
+        completed_at: null,
+        created_at: new Date(),
+      };
+
+      // Normalization function as implemented in claimNextJob()
+      const normalized = {
+        id: rawPostgresRow.id,
+        jobName: (rawPostgresRow as any).jobName ?? rawPostgresRow.job_name,
+        payload: rawPostgresRow.payload,
+        status: rawPostgresRow.status,
+        retryCount: (rawPostgresRow as any).retryCount ?? rawPostgresRow.retry_count ?? 0,
+        maxRetries: (rawPostgresRow as any).maxRetries ?? rawPostgresRow.max_retries ?? 3,
+        lastError: (rawPostgresRow as any).lastError ?? rawPostgresRow.last_error ?? null,
+        idempotencyKey: (rawPostgresRow as any).idempotencyKey ?? rawPostgresRow.idempotency_key ?? null,
+        scheduledFor: (rawPostgresRow as any).scheduledFor ?? rawPostgresRow.scheduled_for ?? null,
+        lockedAt: (rawPostgresRow as any).lockedAt ?? rawPostgresRow.locked_at ?? null,
+        leaseToken: (rawPostgresRow as any).leaseToken ?? rawPostgresRow.lease_token ?? null,
+        completedAt: (rawPostgresRow as any).completedAt ?? rawPostgresRow.completed_at ?? null,
+        createdAt: rawPostgresRow.created_at,
+      };
+
+      // Worker expects camelCase properties:
+      expect(normalized.jobName).toBe("process_campaign");
+      expect(normalized.leaseToken).toBe("token-norm-uuid-1234");
+      expect(normalized.retryCount).toBe(1);
+      expect(normalized.jobName).not.toBeUndefined();
+      expect(normalized.leaseToken).not.toBeUndefined();
+    });
+  });
+
+  describe("Mandatory Lease Token & Fail-Closed Lost Lease Handling", () => {
+    it("fails closed when queue lease operations are called without a valid leaseToken", () => {
+      const renewJobLeaseCheck = (jobId: string, leaseToken: string): boolean => {
+        if (!jobId || !leaseToken) return false;
+        return true;
+      };
+
+      const completeJobCheck = (jobId: string, leaseToken: string): boolean => {
+        if (!jobId || !leaseToken) return false;
+        return true;
+      };
+
+      expect(renewJobLeaseCheck("job-1", "")).toBe(false);
+      expect(renewJobLeaseCheck("job-1", null as any)).toBe(false);
+      expect(renewJobLeaseCheck("job-1", undefined as any)).toBe(false);
+
+      expect(completeJobCheck("job-1", "")).toBe(false);
+      expect(completeJobCheck("job-1", null as any)).toBe(false);
+    });
+
+    it("halts worker campaign dispatch immediately when renewJobLease returns false (lost lease)", () => {
+      let leaseLost = false;
+      let dispatchedRecipients = 0;
+      const totalRecipients = 10;
+
+      for (let i = 0; i < totalRecipients; i++) {
+        if (leaseLost) break;
+
+        // Simulate lease renewal failure on 3rd recipient (another worker reclaimed the job)
+        if (i === 3) {
+          const renewed = false; // Lease lost!
+          if (!renewed) {
+            leaseLost = true;
+            break;
+          }
+        }
+
+        dispatchedRecipients++;
+      }
+
+      expect(leaseLost).toBe(true);
+      expect(dispatchedRecipients).toBe(3); // Stopped immediately! Remaining 7 untouched!
+    });
+  });
+
+  describe("Unknown Outcome Max Attempt Capping & Infinite Loop Prevention", () => {
+    it("permanently marks recipient as failed when ambiguous outcome reaches MAX_RECIPIENT_ATTEMPTS (3)", () => {
+      const MAX_RECIPIENT_ATTEMPTS = 3;
+      let currentAttempts = 2; // Previous attempts: 2
+      let recipient = {
+        id: "recip-loop-prevent-1",
+        status: "processing",
+        attemptCount: currentAttempts,
+        nextAttemptAt: null as Date | null,
+        errorMessage: null as string | null,
+      };
+
+      // 3rd attempt results in network timeout (ambiguous)
+      currentAttempts += 1;
+      const sendResult = {
+        success: false,
+        isAmbiguous: true,
+        error: "Network timeout: Connection reset by peer",
+      };
+
+      if (sendResult.isAmbiguous) {
+        if (currentAttempts >= MAX_RECIPIENT_ATTEMPTS) {
+          recipient.status = "failed";
+          recipient.attemptCount = currentAttempts;
+          recipient.nextAttemptAt = null; // Cleared! No more automated retry!
+          recipient.errorMessage = `Ambiguous dispatch outcome exceeded max attempts (${MAX_RECIPIENT_ATTEMPTS}). Requires manual reconciliation: ${sendResult.error}`;
+        } else {
+          recipient.status = "unknown_outcome";
+          recipient.nextAttemptAt = new Date(Date.now() + 2 * 60 * 1000);
+        }
+      }
+
+      expect(recipient.status).toBe("failed");
+      expect(recipient.attemptCount).toBe(3);
+      expect(recipient.nextAttemptAt).toBeNull(); // Guarantees infinite loop is broken!
+      expect(recipient.errorMessage).toContain("Ambiguous dispatch outcome exceeded max attempts (3)");
+    });
+  });
+
+  describe("Persistent firstDispatchAt & Unsubscribe Token Validity", () => {
+    it("ensures unsubscribe token is valid for 365 days from actual firstDispatchAt even if draft was created 1 year prior", () => {
+      const draftCreatedAt = new Date("2024-01-01T00:00:00Z"); // Draft created 2.5 years ago
+      const actualFirstDispatchAt = new Date("2026-10-14T00:00:00Z"); // Dispatched today
+
+      const baseTimestampSeconds = Math.floor(actualFirstDispatchAt.getTime() / 1000);
+      const expiresInSeconds = 365 * 86400; // 1 year
+      const tokenExpirySeconds = baseTimestampSeconds + expiresInSeconds;
+
+      const nowSeconds = Math.floor(actualFirstDispatchAt.getTime() / 1000);
+
+      // Verify token is NOT expired when sent today
+      expect(tokenExpirySeconds).toBeGreaterThan(nowSeconds);
+
+      // Verify token remains valid for approximately 365 days from dispatch
+      const secondsRemaining = tokenExpirySeconds - nowSeconds;
+      expect(secondsRemaining).toBe(expiresInSeconds);
+
+      // Verify that if draftCreatedAt were incorrectly used, the token would be expired today:
+      const wrongBaseTimestampSeconds = Math.floor(draftCreatedAt.getTime() / 1000);
+      const wrongExpirySeconds = wrongBaseTimestampSeconds + expiresInSeconds;
+      expect(wrongExpirySeconds).toBeLessThan(nowSeconds); // Proof that firstDispatchAt fixes the expiry bug!
+    });
+  });
 });

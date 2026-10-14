@@ -38,8 +38,9 @@ export async function enqueueJob(
 }
 
 /**
- * Claims the next pending job atomically using FOR UPDATE SKIP LOCKED
+ * Claims the next pending job atomically using FOR UPDATE SKIP LOCKED.
  * Generates a unique leaseToken to bind the job execution to the specific claiming worker.
+ * Returns fields explicitly mapped to camelCase to prevent driver-level snake_case mismatch.
  */
 export async function claimNextJob(
   allowedJobNames?: string[]
@@ -52,7 +53,7 @@ export async function claimNextJob(
         filterClause = sql`${filterClause} AND job_name IN ${allowedJobNames}`;
       }
 
-      const rows = await tx.execute<typeof automationJobs.$inferSelect>(
+      const rows = await tx.execute<any>(
         sql`
           UPDATE automation_jobs
           SET status = 'processing',
@@ -65,11 +66,42 @@ export async function claimNextJob(
             FOR UPDATE SKIP LOCKED
             LIMIT 1
           )
-          RETURNING *;
+          RETURNING
+            id,
+            job_name AS "jobName",
+            payload,
+            status,
+            retry_count AS "retryCount",
+            max_retries AS "maxRetries",
+            last_error AS "lastError",
+            idempotency_key AS "idempotencyKey",
+            scheduled_for AS "scheduledFor",
+            locked_at AS "lockedAt",
+            lease_token AS "leaseToken",
+            completed_at AS "completedAt",
+            created_at AS "createdAt";
         `
       );
 
-      return (rows as any)?.[0] || null;
+      const raw = (rows as any)?.[0];
+      if (!raw) return null;
+
+      // Normalization: Ensure camelCase properties are ALWAYS populated regardless of driver casing
+      return {
+        id: raw.id,
+        jobName: raw.jobName ?? raw.job_name,
+        payload: raw.payload,
+        status: raw.status,
+        retryCount: raw.retryCount ?? raw.retry_count ?? 0,
+        maxRetries: raw.maxRetries ?? raw.max_retries ?? 3,
+        lastError: raw.lastError ?? raw.last_error ?? null,
+        idempotencyKey: raw.idempotencyKey ?? raw.idempotency_key ?? null,
+        scheduledFor: raw.scheduledFor ?? raw.scheduled_for ?? null,
+        lockedAt: raw.lockedAt ?? raw.locked_at ?? null,
+        leaseToken: raw.leaseToken ?? raw.lease_token ?? null,
+        completedAt: raw.completedAt ?? raw.completed_at ?? null,
+        createdAt: raw.createdAt ?? raw.created_at,
+      } as typeof automationJobs.$inferSelect;
     });
 
     return results;
@@ -144,21 +176,25 @@ export async function reclaimStaleJobs(staleMinutes: number = 10): Promise<numbe
  * Renews the lock lease for an actively running job so long-running tasks
  * (e.g. large campaign dispatches) are never prematurely reclaimed as stale.
  * Fenced with leaseToken to ensure only the active lease owner can renew.
+ * Missing leaseToken fails closed immediately.
  */
-export async function renewJobLease(jobId: string, leaseToken?: string | null): Promise<boolean> {
-  try {
-    const conditions = [
-      eq(automationJobs.id, jobId),
-      eq(automationJobs.status, "processing"),
-    ];
-    if (leaseToken) {
-      conditions.push(eq(automationJobs.leaseToken, leaseToken));
-    }
+export async function renewJobLease(jobId: string, leaseToken: string): Promise<boolean> {
+  if (!jobId || !leaseToken) {
+    console.error(`[Queue Security Alert] renewJobLease called without mandatory jobId or leaseToken. Failing closed.`);
+    return false;
+  }
 
+  try {
     const result = await db
       .update(automationJobs)
       .set({ lockedAt: new Date() })
-      .where(and(...conditions))
+      .where(
+        and(
+          eq(automationJobs.id, jobId),
+          eq(automationJobs.status, "processing"),
+          eq(automationJobs.leaseToken, leaseToken)
+        )
+      )
       .returning({ id: automationJobs.id });
 
     return result.length > 0;
@@ -170,18 +206,16 @@ export async function renewJobLease(jobId: string, leaseToken?: string | null): 
 
 /**
  * Marks a job as completed.
- * Fenced with leaseToken and 'processing' status to prevent stale workers from completing reclaimed jobs.
+ * Fenced with mandatory leaseToken and 'processing' status to prevent stale workers from completing reclaimed jobs.
+ * Missing leaseToken fails closed immediately.
  */
-export async function completeJob(jobId: string, leaseToken?: string | null): Promise<boolean> {
-  try {
-    const conditions = [
-      eq(automationJobs.id, jobId),
-      eq(automationJobs.status, "processing"),
-    ];
-    if (leaseToken) {
-      conditions.push(eq(automationJobs.leaseToken, leaseToken));
-    }
+export async function completeJob(jobId: string, leaseToken: string): Promise<boolean> {
+  if (!jobId || !leaseToken) {
+    console.error(`[Queue Security Alert] completeJob called without mandatory jobId or leaseToken. Failing closed.`);
+    return false;
+  }
 
+  try {
     const result = await db
       .update(automationJobs)
       .set({
@@ -189,11 +223,17 @@ export async function completeJob(jobId: string, leaseToken?: string | null): Pr
         completedAt: new Date(),
         lockedAt: null,
       })
-      .where(and(...conditions))
+      .where(
+        and(
+          eq(automationJobs.id, jobId),
+          eq(automationJobs.status, "processing"),
+          eq(automationJobs.leaseToken, leaseToken)
+        )
+      )
       .returning({ id: automationJobs.id });
 
     if (result.length === 0) {
-      console.warn(`[Queue Warning] Attempted to complete job ${jobId}, but job is no longer owned by this lease token or is not in 'processing' state.`);
+      console.warn(`[Queue Warning] Attempted to complete job ${jobId}, but lease token mismatched or job is not in 'processing' state.`);
       return false;
     }
     return true;
@@ -205,26 +245,30 @@ export async function completeJob(jobId: string, leaseToken?: string | null): Pr
 
 /**
  * Handles job failure with exponential backoff or dead-letter state.
- * Fenced with leaseToken and 'processing' status so stale workers cannot fail a reclaimed active job.
+ * Fenced with mandatory leaseToken and 'processing' status so stale workers cannot fail a reclaimed active job.
+ * Missing leaseToken fails closed immediately.
  */
 export async function failJob(
   jobId: string,
   errorMessage: string,
-  leaseToken?: string | null
+  leaseToken: string
 ): Promise<boolean> {
-  try {
-    const conditions = [
-      eq(automationJobs.id, jobId),
-      eq(automationJobs.status, "processing"),
-    ];
-    if (leaseToken) {
-      conditions.push(eq(automationJobs.leaseToken, leaseToken));
-    }
+  if (!jobId || !leaseToken) {
+    console.error(`[Queue Security Alert] failJob called without mandatory jobId or leaseToken. Failing closed.`);
+    return false;
+  }
 
+  try {
     const [job] = await db
       .select()
       .from(automationJobs)
-      .where(and(...conditions));
+      .where(
+        and(
+          eq(automationJobs.id, jobId),
+          eq(automationJobs.status, "processing"),
+          eq(automationJobs.leaseToken, leaseToken)
+        )
+      );
 
     if (!job) {
       console.warn(`[Queue Warning] Attempted to fail job ${jobId}, but job is not in 'processing' state or lease token mismatched.`);
@@ -243,7 +287,13 @@ export async function failJob(
           lastError: errorMessage,
           lockedAt: null,
         })
-        .where(and(...conditions))
+        .where(
+          and(
+            eq(automationJobs.id, jobId),
+            eq(automationJobs.status, "processing"),
+            eq(automationJobs.leaseToken, leaseToken)
+          )
+        )
         .returning({ id: automationJobs.id });
       console.warn(`[Queue] Job ${jobId} ('${job.jobName}') permanently marked as failed after ${newRetryCount} attempts.`);
       return result.length > 0;
@@ -261,7 +311,13 @@ export async function failJob(
           lockedAt: null,
           leaseToken: null,
         })
-        .where(and(...conditions))
+        .where(
+          and(
+            eq(automationJobs.id, jobId),
+            eq(automationJobs.status, "processing"),
+            eq(automationJobs.leaseToken, leaseToken)
+          )
+        )
         .returning({ id: automationJobs.id });
       console.log(`[Queue] Job ${jobId} scheduled for retry #${newRetryCount} at ${nextRun.toISOString()}`);
       return result.length > 0;

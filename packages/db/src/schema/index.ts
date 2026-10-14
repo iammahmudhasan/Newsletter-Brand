@@ -78,6 +78,7 @@ export const campaigns = pgTable(
       .notNull()
       .default("draft"),
     scheduledAt: timestamp("scheduled_at"),
+    firstDispatchAt: timestamp("first_dispatch_at"),
     sentAt: timestamp("sent_at"),
     totalRecipients: integer("total_recipients").default(0),
     successfulSends: integer("successful_sends").default(0),

@@ -14,31 +14,38 @@ async function processNextJob(): Promise<boolean> {
   const job = await claimNextJob();
   if (!job) return false;
 
-  console.log(`[Worker] Claimed job '${job.jobName}' (ID: ${job.id})`);
+  console.log(`[Worker] Claimed job '${job.jobName}' (ID: ${job.id}, Token: ${job.leaseToken ? "present" : "missing"})`);
+
+  if (!job.leaseToken) {
+    console.error(`[Worker Security Alert] Job ${job.id} was claimed without a valid leaseToken. Failing closed.`);
+    return false;
+  }
+
+  const leaseToken: string = job.leaseToken;
 
   try {
     switch (job.jobName) {
       case "send_confirmation":
         await handleSendConfirmation(job.payload as any);
-        await completeJob(job.id, job.leaseToken);
+        await completeJob(job.id, leaseToken);
         console.log(`[Worker] Job ${job.id} completed successfully.`);
         break;
 
       case "send_welcome":
         await handleSendWelcome(job.payload as any);
-        await completeJob(job.id, job.leaseToken);
+        await completeJob(job.id, leaseToken);
         console.log(`[Worker] Job ${job.id} completed successfully.`);
         break;
 
       case "process_campaign":
-        await handleProcessCampaignBatch(job.payload as any, job.id, job.leaseToken);
-        await completeJob(job.id, job.leaseToken);
+        await handleProcessCampaignBatch(job.payload as any, job.id, leaseToken);
+        await completeJob(job.id, leaseToken);
         console.log(`[Worker] Job ${job.id} completed successfully.`);
         break;
 
       default:
         console.error(`[Worker Security Alert] Unknown job name '${job.jobName}' for job ID ${job.id}. Marking as failed.`);
-        await failJob(job.id, `Unrecognized job handler: ${job.jobName}`, job.leaseToken);
+        await failJob(job.id, `Unrecognized job handler: ${job.jobName}`, leaseToken);
         break;
     }
 
@@ -46,7 +53,7 @@ async function processNextJob(): Promise<boolean> {
   } catch (err: any) {
     console.error(`[Worker] Job ${job.id} execution failed:`, err.message);
     try {
-      await failJob(job.id, err.message || "Unknown execution failure", job.leaseToken);
+      await failJob(job.id, err.message || "Unknown execution failure", leaseToken);
     } catch (failErr: any) {
       console.error(`[Worker] Failed to record failure for job ${job.id}:`, failErr.message);
     }

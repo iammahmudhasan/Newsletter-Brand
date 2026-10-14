@@ -37,11 +37,16 @@ export async function handleProcessCampaignBatch(
     return;
   }
 
-  // Ensure campaign status is 'sending'
-  if (campaign.status !== "sending") {
+  // Ensure campaign status is 'sending' and persistent firstDispatchAt is established
+  const firstDispatchAt = campaign.firstDispatchAt || new Date();
+  if (campaign.status !== "sending" || !campaign.firstDispatchAt) {
     await db
       .update(campaigns)
-      .set({ status: "sending", updatedAt: new Date() })
+      .set({
+        status: "sending",
+        firstDispatchAt,
+        updatedAt: new Date(),
+      })
       .where(eq(campaigns.id, campaignId));
   }
 
@@ -119,16 +124,23 @@ export async function handleProcessCampaignBatch(
   const BATCH_SIZE = 50;
   const MAX_RECIPIENT_ATTEMPTS = 3;
 
+  let leaseLost = false;
+
   // Background heartbeat interval while worker batch is active (every 10 seconds)
   let heartbeatTimer: NodeJS.Timeout | null = null;
-  if (jobId) {
+  if (jobId && leaseToken) {
     heartbeatTimer = setInterval(async () => {
       try {
-        await renewJobLease(jobId, leaseToken);
-        await db
-          .update(campaigns)
-          .set({ updatedAt: new Date() })
-          .where(eq(campaigns.id, campaignId));
+        const renewed = await renewJobLease(jobId, leaseToken);
+        if (!renewed) {
+          console.error(`[Worker Heartbeat Alert] Lost queue lease for job ${jobId}. Another worker may have reclaimed this job.`);
+          leaseLost = true;
+        } else {
+          await db
+            .update(campaigns)
+            .set({ updatedAt: new Date() })
+            .where(eq(campaigns.id, campaignId));
+        }
       } catch (err: any) {
         console.warn(`[Worker Heartbeat Warning] Failed to pulse lease for job ${jobId}:`, err.message);
       }
@@ -137,11 +149,21 @@ export async function handleProcessCampaignBatch(
 
   try {
     for (let i = 0; i < pendingRecipients.length; i += BATCH_SIZE) {
+      if (leaseLost) {
+        console.error(`[Worker Lease Lost] Halting campaign dispatch for '${campaign.title}' due to lost lease.`);
+        break;
+      }
+
       const batch = pendingRecipients.slice(i, i + BATCH_SIZE);
 
       // Heartbeat: renew job lock lease in queue so long campaigns never get falsely reclaimed as stale
-      if (jobId) {
-        await renewJobLease(jobId, leaseToken);
+      if (jobId && leaseToken) {
+        const renewed = await renewJobLease(jobId, leaseToken);
+        if (!renewed) {
+          console.error(`[Worker Lease Lost] Failed to renew lease before batch ${i} for job ${jobId}. Halting execution.`);
+          leaseLost = true;
+          break;
+        }
       }
 
       // Touch campaign updatedAt to record active progress
@@ -151,8 +173,18 @@ export async function handleProcessCampaignBatch(
         .where(eq(campaigns.id, campaignId));
 
       for (const item of batch) {
-        if (jobId) {
-          await renewJobLease(jobId, leaseToken);
+        if (leaseLost) {
+          console.error(`[Worker Lease Lost] Aborting dispatch of recipient ${item.recipientId} due to lost lease.`);
+          break;
+        }
+
+        if (jobId && leaseToken) {
+          const renewed = await renewJobLease(jobId, leaseToken);
+          if (!renewed) {
+            console.error(`[Worker Lease Lost] Failed to renew lease before recipient ${item.recipientId}. Halting execution.`);
+            leaseLost = true;
+            break;
+          }
         }
 
         // Atomic Claim: Transition status to 'processing' with fresh lease timestamp
@@ -300,9 +332,9 @@ export async function handleProcessCampaignBatch(
             continue;
           }
 
-          // Generate deterministic signed unsubscribe tokens using campaign.createdAt as base timestamp
+          // Generate deterministic signed unsubscribe tokens using persistent firstDispatchAt as base timestamp
           // This guarantees byte-for-byte identical token and email payload across all retries!
-          const baseTimestamp = Math.floor(new Date(campaign.createdAt).getTime() / 1000);
+          const baseTimestamp = Math.floor(firstDispatchAt.getTime() / 1000);
           const unsubToken = generateSignedToken(
             {
               id: freshSub.id,
@@ -317,8 +349,8 @@ export async function handleProcessCampaignBatch(
           const unsubscribeApiUrl = `${config.appUrl}/api/unsubscribe?token=${unsubToken}`;
           const archiveUrl = `${config.appUrl}/archive/${campaign.id}`;
 
-          // Format issueDate deterministically from campaign.createdAt (never Date.now()!)
-          const issueDate = new Date(campaign.createdAt).toLocaleDateString("en-US", {
+          // Format issueDate deterministically from firstDispatchAt
+          const issueDate = new Date(firstDispatchAt).toLocaleDateString("en-US", {
             month: "short",
             day: "numeric",
             year: "numeric",
@@ -404,31 +436,53 @@ export async function handleProcessCampaignBatch(
               errorMsg.toLowerCase().includes("does not exist");
 
             if (sendResult.isAmbiguous) {
-              // AMBIGUOUS OUTCOME: Network timeout, 5xx server error, or connection reset
-              // Hold in 'unknown_outcome' for webhook reconciliation window (2 mins) before retrying
-              const reconciliationDelayMinutes = 2;
-              const nextAttemptAt = new Date(Date.now() + reconciliationDelayMinutes * 60 * 1000);
-
-              console.warn(
-                `[Worker Ambiguous Outcome] Potential in-flight dispatch for recipient ${item.recipientId}: '${errorMsg}'. Moving to 'unknown_outcome' until ${nextAttemptAt.toISOString()} for webhook reconciliation.`
-              );
-
-              await db
-                .update(campaignRecipients)
-                .set({
-                  status: "unknown_outcome",
-                  attemptCount: currentAttempts,
-                  lastAttemptAt: new Date(),
-                  nextAttemptAt,
-                  errorMessage: `Ambiguous outcome (Attempt ${currentAttempts}): ${errorMsg}`,
-                  updatedAt: new Date(),
-                })
-                .where(
-                  and(
-                    eq(campaignRecipients.id, item.recipientId),
-                    eq(campaignRecipients.status, "processing")
-                  )
+              if (currentAttempts >= MAX_RECIPIENT_ATTEMPTS) {
+                console.error(
+                  `[Worker Ambiguous Threshold Exceeded] Recipient ${item.recipientId} reached max attempts (${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}) with ambiguous outcome: '${errorMsg}'. Halting automated resend; marking for manual webhook/provider reconciliation.`
                 );
+                await db
+                  .update(campaignRecipients)
+                  .set({
+                    status: "failed",
+                    attemptCount: currentAttempts,
+                    lastAttemptAt: new Date(),
+                    nextAttemptAt: null, // Clear nextAttemptAt to halt automated retries
+                    errorMessage: `Ambiguous dispatch outcome exceeded max attempts (${MAX_RECIPIENT_ATTEMPTS}). Requires manual reconciliation: ${errorMsg}`,
+                    updatedAt: new Date(),
+                  })
+                  .where(
+                    and(
+                      eq(campaignRecipients.id, item.recipientId),
+                      eq(campaignRecipients.status, "processing")
+                    )
+                  );
+                failCount++;
+              } else {
+                // Hold in 'unknown_outcome' for webhook reconciliation window (2 mins) before retrying
+                const reconciliationDelayMinutes = 2;
+                const nextAttemptAt = new Date(Date.now() + reconciliationDelayMinutes * 60 * 1000);
+
+                console.warn(
+                  `[Worker Ambiguous Outcome] Potential in-flight dispatch for recipient ${item.recipientId} (Attempt ${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}): '${errorMsg}'. Moving to 'unknown_outcome' until ${nextAttemptAt.toISOString()} for webhook reconciliation.`
+                );
+
+                await db
+                  .update(campaignRecipients)
+                  .set({
+                    status: "unknown_outcome",
+                    attemptCount: currentAttempts,
+                    lastAttemptAt: new Date(),
+                    nextAttemptAt,
+                    errorMessage: `Ambiguous outcome (Attempt ${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}): ${errorMsg}`,
+                    updatedAt: new Date(),
+                  })
+                  .where(
+                    and(
+                      eq(campaignRecipients.id, item.recipientId),
+                      eq(campaignRecipients.status, "processing")
+                    )
+                  );
+              }
             } else if (!isPermanent && currentAttempts < MAX_RECIPIENT_ATTEMPTS) {
               const backoffMinutes = currentAttempts === 1 ? 2 : 5;
               const nextAttemptAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
@@ -480,42 +534,73 @@ export async function handleProcessCampaignBatch(
           const currentAttempts = (claimed.attempt_count ?? item.attemptCount ?? 0) + 1;
           const errorMsg = sendErr.message || "Unexpected exception during dispatch";
 
-          // An unexpected exception during send execution is ambiguous (e.g. timeout, process interrupted)
-          const reconciliationDelayMinutes = 2;
-          const nextAttemptAt = new Date(Date.now() + reconciliationDelayMinutes * 60 * 1000);
-
-          console.warn(
-            `[Worker Exception] Ambiguous exception for recipient ${item.recipientId}: '${errorMsg}'. Moving to 'unknown_outcome' for webhook reconciliation.`
-          );
-
-          await db
-            .update(campaignRecipients)
-            .set({
-              status: "unknown_outcome",
-              attemptCount: currentAttempts,
-              lastAttemptAt: new Date(),
-              nextAttemptAt,
-              errorMessage: `Exception (Attempt ${currentAttempts}): ${errorMsg}`,
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(campaignRecipients.id, item.recipientId),
-                eq(campaignRecipients.status, "processing")
-              )
+          if (currentAttempts >= MAX_RECIPIENT_ATTEMPTS) {
+            console.error(
+              `[Worker Exception Limit Exceeded] Recipient ${item.recipientId} reached max attempts (${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}) with exception: '${errorMsg}'. Halting automated resend.`
             );
+            await db
+              .update(campaignRecipients)
+              .set({
+                status: "failed",
+                attemptCount: currentAttempts,
+                lastAttemptAt: new Date(),
+                nextAttemptAt: null,
+                errorMessage: `Exception exceeded max attempts (${MAX_RECIPIENT_ATTEMPTS}). Requires manual review: ${errorMsg}`,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(campaignRecipients.id, item.recipientId),
+                  eq(campaignRecipients.status, "processing")
+                )
+              );
+            failCount++;
+          } else {
+            const reconciliationDelayMinutes = 2;
+            const nextAttemptAt = new Date(Date.now() + reconciliationDelayMinutes * 60 * 1000);
+
+            console.warn(
+              `[Worker Exception] Ambiguous exception for recipient ${item.recipientId} (Attempt ${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}): '${errorMsg}'. Moving to 'unknown_outcome' for webhook reconciliation.`
+            );
+
+            await db
+              .update(campaignRecipients)
+              .set({
+                status: "unknown_outcome",
+                attemptCount: currentAttempts,
+                lastAttemptAt: new Date(),
+                nextAttemptAt,
+                errorMessage: `Exception (Attempt ${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}): ${errorMsg}`,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(campaignRecipients.id, item.recipientId),
+                  eq(campaignRecipients.status, "processing")
+                )
+              );
+          }
         }
       }
 
       // Refresh lease after completing each batch chunk
-      if (jobId) {
-        await renewJobLease(jobId);
+      if (jobId && leaseToken) {
+        const renewed = await renewJobLease(jobId, leaseToken);
+        if (!renewed) {
+          leaseLost = true;
+          break;
+        }
       }
     }
   } finally {
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
     }
+  }
+
+  if (leaseLost) {
+    console.warn(`[Worker Notice] Exiting campaign dispatch early for '${campaign.title}' because queue lease was lost.`);
+    return;
   }
 
   // 5. Check if any recipients are still pending or waiting for next retry attempt
