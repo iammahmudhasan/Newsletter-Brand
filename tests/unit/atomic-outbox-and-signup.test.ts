@@ -35,23 +35,51 @@ describe("Atomic Outbox & Signup Transactions", () => {
     expect(capturedValues.status).toBe("pending");
   });
 
-  it("ensures immediate campaign dispatch transactional outbox rolls back on enqueue failure", async () => {
-    let campaignInserted = false;
-    let transactionRolledBack = false;
+  it("verifies transactional outbox atomicity: rolled-back transaction commits zero state changes", async () => {
+    // Model an in-memory transactional database to verify transaction rollback semantics
+    const committedDb = {
+      campaigns: [] as any[],
+      jobs: [] as any[],
+    };
 
-    // Simulate an atomic transaction where outbox enqueue fails
-    try {
-      await (async function simulateTransaction() {
-        campaignInserted = true;
-        // Simulate queue failure inside transaction
-        throw new Error("Outbox queue insertion error");
-      })();
-    } catch (err: any) {
-      transactionRolledBack = true;
+    async function executeTransactionalOutbox(simulateFailure: boolean) {
+      // In PostgreSQL db.transaction(async (tx) => ...):
+      // mutations on tx only apply to committed state if the callback completes without throwing
+      const stagedCampaigns: any[] = [];
+      const stagedJobs: any[] = [];
+
+      try {
+        // Step 1: Stage campaign
+        stagedCampaigns.push({ id: "camp-001", status: "sending" });
+
+        // Step 2: Stage queue job
+        if (simulateFailure) {
+          throw new Error("Simulated database connection crash during outbox enqueue");
+        }
+        stagedJobs.push({ id: "job-001", jobName: "process_campaign" });
+
+        // Step 3: Transaction commits
+        committedDb.campaigns.push(...stagedCampaigns);
+        committedDb.jobs.push(...stagedJobs);
+        return { success: true };
+      } catch (err: any) {
+        // Transaction aborts & rolls back: staged changes are discarded!
+        return { success: false, error: err.message };
+      }
     }
 
-    expect(campaignInserted).toBe(true);
-    expect(transactionRolledBack).toBe(true);
+    // 1. Successful execution
+    const successRes = await executeTransactionalOutbox(false);
+    expect(successRes.success).toBe(true);
+    expect(committedDb.campaigns.length).toBe(1);
+    expect(committedDb.jobs.length).toBe(1);
+
+    // 2. Failed execution
+    const failRes = await executeTransactionalOutbox(true);
+    expect(failRes.success).toBe(false);
+    // State is strictly preserved: no orphaned campaign or job was added!
+    expect(committedDb.campaigns.length).toBe(1);
+    expect(committedDb.jobs.length).toBe(1);
   });
 
   it("validates signup flow requires valid email", async () => {

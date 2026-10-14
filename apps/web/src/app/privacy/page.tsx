@@ -27,7 +27,7 @@ export default function PrivacyPage() {
         <section>
           <h2 className="text-lg font-bold text-white mb-2">1. Overview</h2>
           <p>
-            AI Signal ("we", "our") is dedicated to protecting the privacy of our subscribers. We operate an
+            AI Signal (&ldquo;we&rdquo;, &ldquo;our&rdquo;) is dedicated to protecting the privacy of our subscribers. We operate an
             editorial newsletter platform focusing on artificial intelligence developments. We collect the
             minimum personal information required to deliver our publications.
           </p>

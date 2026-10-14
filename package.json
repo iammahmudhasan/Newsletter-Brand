@@ -20,7 +20,7 @@
     "validate:email": "bun run scripts/validate_email_content.ts",
     "backup:db": "bun run scripts/backup_db.ts",
     "typecheck": "tsc --noEmit",
-    "lint": "tsc --noEmit"
+    "lint": "bun run --cwd apps/web lint"
   },
   "devDependencies": {
     "@types/bun": "^1.4.3",

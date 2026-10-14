@@ -1,4 +1,4 @@
-CREATE TABLE "admin_users" (
+CREATE TABLE IF NOT EXISTS "admin_users" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"email" text NOT NULL,
 	"password_hash" text NOT NULL,
@@ -7,7 +7,7 @@ CREATE TABLE "admin_users" (
 	"created_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "automation_jobs" (
+CREATE TABLE IF NOT EXISTS "automation_jobs" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"job_name" text NOT NULL,
 	"payload" jsonb NOT NULL,
@@ -21,7 +21,7 @@ CREATE TABLE "automation_jobs" (
 	"created_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "campaign_recipients" (
+CREATE TABLE IF NOT EXISTS "campaign_recipients" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"campaign_id" uuid NOT NULL,
 	"subscriber_id" uuid NOT NULL,
@@ -32,7 +32,7 @@ CREATE TABLE "campaign_recipients" (
 	"created_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "campaigns" (
+CREATE TABLE IF NOT EXISTS "campaigns" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"title" text NOT NULL,
 	"subject" text NOT NULL,
@@ -50,7 +50,7 @@ CREATE TABLE "campaigns" (
 	"updated_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "consent_events" (
+CREATE TABLE IF NOT EXISTS "consent_events" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"subscriber_id" uuid NOT NULL,
 	"source" text DEFAULT 'web_form' NOT NULL,
@@ -60,7 +60,7 @@ CREATE TABLE "consent_events" (
 	"created_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "email_events" (
+CREATE TABLE IF NOT EXISTS "email_events" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"provider_message_id" text,
 	"recipient_email" text NOT NULL,
@@ -69,7 +69,7 @@ CREATE TABLE "email_events" (
 	"created_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "subscribers" (
+CREATE TABLE IF NOT EXISTS "subscribers" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"email" text NOT NULL,
 	"status" text DEFAULT 'pending_confirmation' NOT NULL,
@@ -83,7 +83,7 @@ CREATE TABLE "subscribers" (
 	"updated_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "suppressions" (
+CREATE TABLE IF NOT EXISTS "suppressions" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"email" text NOT NULL,
 	"reason" text NOT NULL,
@@ -91,20 +91,29 @@ CREATE TABLE "suppressions" (
 	"created_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-ALTER TABLE "campaign_recipients" ADD CONSTRAINT "campaign_recipients_campaign_id_campaigns_id_fk" FOREIGN KEY ("campaign_id") REFERENCES "public"."campaigns"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "campaign_recipients" ADD CONSTRAINT "campaign_recipients_subscriber_id_subscribers_id_fk" FOREIGN KEY ("subscriber_id") REFERENCES "public"."subscribers"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "consent_events" ADD CONSTRAINT "consent_events_subscriber_id_subscribers_id_fk" FOREIGN KEY ("subscriber_id") REFERENCES "public"."subscribers"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-CREATE UNIQUE INDEX "admin_email_idx" ON "admin_users" USING btree ("email");--> statement-breakpoint
-CREATE INDEX "jobs_status_scheduled_idx" ON "automation_jobs" USING btree ("status","scheduled_for");--> statement-breakpoint
-CREATE UNIQUE INDEX "campaign_recipient_unique_idx" ON "campaign_recipients" USING btree ("campaign_id","subscriber_id");--> statement-breakpoint
-CREATE INDEX "recipient_campaign_idx" ON "campaign_recipients" USING btree ("campaign_id");--> statement-breakpoint
-CREATE INDEX "recipient_provider_msg_idx" ON "campaign_recipients" USING btree ("provider_message_id");--> statement-breakpoint
-CREATE INDEX "campaigns_status_idx" ON "campaigns" USING btree ("status");--> statement-breakpoint
-CREATE INDEX "campaigns_scheduled_idx" ON "campaigns" USING btree ("scheduled_at");--> statement-breakpoint
-CREATE INDEX "consent_subscriber_idx" ON "consent_events" USING btree ("subscriber_id");--> statement-breakpoint
-CREATE INDEX "email_events_msg_idx" ON "email_events" USING btree ("provider_message_id");--> statement-breakpoint
-CREATE INDEX "email_events_recipient_idx" ON "email_events" USING btree ("recipient_email");--> statement-breakpoint
-CREATE INDEX "email_events_type_idx" ON "email_events" USING btree ("event_type");--> statement-breakpoint
-CREATE UNIQUE INDEX "subscribers_email_idx" ON "subscribers" USING btree ("email");--> statement-breakpoint
-CREATE INDEX "subscribers_status_idx" ON "subscribers" USING btree ("status");--> statement-breakpoint
-CREATE UNIQUE INDEX "suppressions_email_idx" ON "suppressions" USING btree ("email");
+DO $$ BEGIN
+  ALTER TABLE "campaign_recipients" ADD CONSTRAINT "campaign_recipients_campaign_id_campaigns_id_fk" FOREIGN KEY ("campaign_id") REFERENCES "public"."campaigns"("id") ON DELETE cascade ON UPDATE no action;
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;--> statement-breakpoint
+DO $$ BEGIN
+  ALTER TABLE "campaign_recipients" ADD CONSTRAINT "campaign_recipients_subscriber_id_subscribers_id_fk" FOREIGN KEY ("subscriber_id") REFERENCES "public"."subscribers"("id") ON DELETE cascade ON UPDATE no action;
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;--> statement-breakpoint
+DO $$ BEGIN
+  ALTER TABLE "consent_events" ADD CONSTRAINT "consent_events_subscriber_id_subscribers_id_fk" FOREIGN KEY ("subscriber_id") REFERENCES "public"."subscribers"("id") ON DELETE cascade ON UPDATE no action;
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "admin_email_idx" ON "admin_users" USING btree ("email");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "jobs_status_scheduled_idx" ON "automation_jobs" USING btree ("status","scheduled_for");--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "campaign_recipient_unique_idx" ON "campaign_recipients" USING btree ("campaign_id","subscriber_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "recipient_campaign_idx" ON "campaign_recipients" USING btree ("campaign_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "recipient_provider_msg_idx" ON "campaign_recipients" USING btree ("provider_message_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "campaigns_status_idx" ON "campaigns" USING btree ("status");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "campaigns_scheduled_idx" ON "campaigns" USING btree ("scheduled_at");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "consent_subscriber_idx" ON "consent_events" USING btree ("subscriber_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "email_events_msg_idx" ON "email_events" USING btree ("provider_message_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "email_events_recipient_idx" ON "email_events" USING btree ("recipient_email");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "email_events_type_idx" ON "email_events" USING btree ("event_type");--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "subscribers_email_idx" ON "subscribers" USING btree ("email");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "subscribers_status_idx" ON "subscribers" USING btree ("status");--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "suppressions_email_idx" ON "suppressions" USING btree ("email");

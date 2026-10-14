@@ -193,19 +193,24 @@ export async function POST(req: NextRequest) {
     let eventType = "unknown";
     let recipientEmail: string | null = null;
     let providerMessageId: string | null = null;
+    let providerEventId: string | null = null;
+    let campaignIdTag: string | null = null;
+    let recipientIdTag: string | null = null;
     let isHardBounce = false;
     let isSoftBounce = false;
-    let recipientIdTag: string | null = null;
 
     // 1. Resend structure
     if (eventData.type && typeof eventData.type === "string") {
       eventType = eventData.type;
       recipientEmail = eventData.data?.to?.[0] || eventData.data?.email || null;
       providerMessageId = eventData.data?.email_id || eventData.id || null;
+      providerEventId = eventData.id || eventData.data?.id || req.headers.get("svix-id") || null;
 
       if (Array.isArray(eventData.data?.tags)) {
-        const found = eventData.data.tags.find((t: any) => t.name === "recipient_id");
-        if (found) recipientIdTag = found.value;
+        const foundRecipient = eventData.data.tags.find((t: any) => t.name === "recipient_id");
+        if (foundRecipient) recipientIdTag = foundRecipient.value;
+        const foundCampaign = eventData.data.tags.find((t: any) => t.name === "campaign_id");
+        if (foundCampaign) campaignIdTag = foundCampaign.value;
       }
 
       if (eventType === "email.bounced") {
@@ -221,11 +226,16 @@ export async function POST(req: NextRequest) {
     else if (eventData.eventType || eventData.notificationType) {
       const sesType = eventData.eventType || eventData.notificationType;
       providerMessageId = eventData.mail?.messageId || null;
+      providerEventId = payload.MessageId || eventData.mail?.messageId || null;
 
       // Check SES message tags
       if (eventData.mail?.tags?.recipient_id) {
         const tagVal = eventData.mail.tags.recipient_id;
         recipientIdTag = Array.isArray(tagVal) ? tagVal[0] : tagVal;
+      }
+      if (eventData.mail?.tags?.campaign_id) {
+        const cTagVal = eventData.mail.tags.campaign_id;
+        campaignIdTag = Array.isArray(cTagVal) ? cTagVal[0] : cTagVal;
       }
 
       if (sesType === "Bounce") {
@@ -274,18 +284,21 @@ export async function POST(req: NextRequest) {
     // Wrapping in a single ACID transaction ensures that if suppression or status updates fail,
     // the event insert rolls back, allowing provider retries to re-attempt suppression processing!
     const txResult = await db.transaction(async (tx) => {
-      // Step A: Idempotency check with ON CONFLICT DO NOTHING
-      if (providerMessageId) {
+      // Step A: Idempotency check with ON CONFLICT DO NOTHING on providerEventId
+      if (providerEventId) {
         const inserted = await tx
           .insert(emailEvents)
           .values({
+            providerEventId,
             providerMessageId,
+            campaignId: campaignIdTag,
+            recipientId: recipientIdTag,
             recipientEmail: email,
             eventType: standardizedType,
             payload: eventData,
           })
           .onConflictDoNothing({
-            target: [emailEvents.providerMessageId, emailEvents.eventType],
+            target: emailEvents.providerEventId,
           })
           .returning({ id: emailEvents.id });
 
@@ -295,28 +308,63 @@ export async function POST(req: NextRequest) {
         }
       } else {
         await tx.insert(emailEvents).values({
-          providerMessageId: null,
+          providerEventId: null,
+          providerMessageId,
+          campaignId: campaignIdTag,
+          recipientId: recipientIdTag,
           recipientEmail: email,
           eventType: standardizedType,
           payload: eventData,
         });
       }
 
-      // Step B: Reconcile campaign recipient status if tag exists
-      if (recipientIdTag && providerMessageId) {
-        await tx
-          .update(campaignRecipients)
-          .set({
-            status: "sent",
-            providerMessageId,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(campaignRecipients.id, recipientIdTag),
-              sql`${campaignRecipients.status} != 'sent'`
-            )
-          );
+      // Step B: Reconcile campaign recipient status strictly based on event type
+      // CRITICAL: Never mark a recipient as 'sent' when receiving a bounce or complaint!
+      if (recipientIdTag) {
+        if (standardizedType === "delivered") {
+          await tx
+            .update(campaignRecipients)
+            .set({
+              status: "delivered",
+              providerMessageId: providerMessageId || undefined,
+              sentAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(campaignRecipients.id, recipientIdTag));
+        } else if (standardizedType === "bounce") {
+          await tx
+            .update(campaignRecipients)
+            .set({
+              status: "bounced",
+              errorMessage: isHardBounce ? "Permanent hard bounce" : "Soft bounce / mailbox full",
+              updatedAt: new Date(),
+            })
+            .where(eq(campaignRecipients.id, recipientIdTag));
+        } else if (standardizedType === "complaint") {
+          await tx
+            .update(campaignRecipients)
+            .set({
+              status: "failed",
+              errorMessage: "Spam complaint reported",
+              updatedAt: new Date(),
+            })
+            .where(eq(campaignRecipients.id, recipientIdTag));
+        } else if (standardizedType === "open" || standardizedType === "click") {
+          // Open or click confirms receipt without overriding terminal bounce/failed status
+          await tx
+            .update(campaignRecipients)
+            .set({
+              status: "delivered",
+              providerMessageId: providerMessageId || undefined,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(campaignRecipients.id, recipientIdTag),
+                sql`${campaignRecipients.status} IN ('queued', 'processing', 'sent')`
+              )
+            );
+        }
       }
 
       // Step C: Process Hard Bounce: suppress permanently

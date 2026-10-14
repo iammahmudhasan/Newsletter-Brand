@@ -167,7 +167,7 @@ export default function HomePage() {
           <div className="mt-6 space-y-4 text-sm text-slate-300">
             <div className="p-4 rounded-xl bg-surface-200 border border-border/60">
               <div className="font-bold text-white text-base mb-1">
-                🔍 Research Spotlight: "Scaling Inference-Time Compute vs Pretraining"
+                🔍 Research Spotlight: &ldquo;Scaling Inference-Time Compute vs Pretraining&rdquo;
               </div>
               <p className="text-slate-400 text-xs leading-relaxed">
                 Why adaptive search trajectories outperform 10x larger base models on code and mathematical reasoning, and how to replicate budget-aware sampling in production agents.

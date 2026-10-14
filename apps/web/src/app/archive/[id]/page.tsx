@@ -127,7 +127,7 @@ export default async function IssueDetailPage({
 
             <div className="p-6 rounded-2xl bg-surface-100 border border-purple-500/20 space-y-3">
               <h3 className="text-lg font-bold text-white">
-                "Quiet-STaR: Language Models Can Teach Themselves to Think Before Speaking"
+                &ldquo;Quiet-STaR: Language Models Can Teach Themselves to Think Before Speaking&rdquo;
               </h3>
               <p className="text-sm text-slate-300 leading-relaxed">
                 <strong>Core Hypothesis:</strong> Human thought happens quietly before every sentence. Can an LLM generate internal tokens to predict the future flow of dialogue without explicit human rationale annotations?
@@ -150,7 +150,7 @@ export default async function IssueDetailPage({
 
             <div className="p-5 rounded-xl bg-surface-100 border border-cyan-500/20">
               <h3 className="text-base font-bold text-white mb-2">
-                The Shift from "Retrieval-Augmented Generation" to "Deterministic Execution Sandboxes"
+                The Shift from &ldquo;Retrieval-Augmented Generation&rdquo; to &ldquo;Deterministic Execution Sandboxes&rdquo;
               </h3>
               <p className="text-sm text-slate-300 leading-relaxed">
                 Startups that simply wrapped Pinecone or LangChain are facing brutal churn. The fastest growing developer infrastructure startups in Q3 2026 are lightweight, sub-50ms execution sandbox providers (MicroVMs) that allow LLMs to run code, verify tests, and self-correct before presenting answers to users.

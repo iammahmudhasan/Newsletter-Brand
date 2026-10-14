@@ -105,10 +105,13 @@ export const campaignRecipients = pgTable(
       .notNull()
       .references(() => subscribers.id, { onDelete: "cascade" }),
     status: text("status", {
-      enum: ["queued", "processing", "sent", "failed", "bounced"],
+      enum: ["queued", "processing", "sent", "delivered", "failed", "bounced", "unknown_outcome"],
     })
       .notNull()
       .default("queued"),
+    attemptCount: integer("attempt_count").default(0).notNull(),
+    lastAttemptAt: timestamp("last_attempt_at"),
+    nextAttemptAt: timestamp("next_attempt_at"),
     providerMessageId: text("provider_message_id"),
     errorMessage: text("error_message"),
     sentAt: timestamp("sent_at"),
@@ -118,6 +121,7 @@ export const campaignRecipients = pgTable(
   (table) => [
     uniqueIndex("campaign_recipient_unique_idx").on(table.campaignId, table.subscriberId),
     index("recipient_campaign_idx").on(table.campaignId),
+    index("recipient_campaign_status_idx").on(table.campaignId, table.status),
     index("recipient_provider_msg_idx").on(table.providerMessageId),
   ]
 );
@@ -129,7 +133,10 @@ export const emailEvents = pgTable(
   "email_events",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    providerEventId: text("provider_event_id"),
     providerMessageId: text("provider_message_id"),
+    campaignId: uuid("campaign_id").references(() => campaigns.id, { onDelete: "set null" }),
+    recipientId: uuid("recipient_id").references(() => campaignRecipients.id, { onDelete: "set null" }),
     recipientEmail: text("recipient_email").notNull(),
     eventType: text("event_type", {
       enum: ["delivered", "bounce", "complaint", "click", "open", "unknown"],
@@ -138,10 +145,12 @@ export const emailEvents = pgTable(
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (table) => [
+    uniqueIndex("email_events_provider_event_idx").on(table.providerEventId),
     index("email_events_msg_idx").on(table.providerMessageId),
     index("email_events_recipient_idx").on(table.recipientEmail),
+    index("email_events_recipient_id_idx").on(table.recipientId),
+    index("email_events_campaign_id_idx").on(table.campaignId),
     index("email_events_type_idx").on(table.eventType),
-    uniqueIndex("email_events_msg_type_idx").on(table.providerMessageId, table.eventType),
   ]
 );
 

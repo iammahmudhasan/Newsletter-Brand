@@ -64,18 +64,26 @@ export async function runCampaignScheduler(): Promise<number> {
     }
 
     // 2. Recovery: Check for any campaigns stuck in 'sending' for > 15 minutes without progress
+    // AND verify that there is no active queue job currently executing this campaign with a valid lease!
     const stuckCampaigns = await db.execute<typeof campaigns.$inferSelect>(
       sql`
-        SELECT * FROM campaigns
-        WHERE status = 'sending'
-          AND updated_at < NOW() - INTERVAL '15 minutes'
+        SELECT c.* FROM campaigns c
+        WHERE c.status = 'sending'
+          AND c.updated_at < NOW() - INTERVAL '15 minutes'
+          AND NOT EXISTS (
+            SELECT 1 FROM automation_jobs j
+            WHERE j.job_name = 'process_campaign'
+              AND (j.payload->>'campaignId' = c.id::text)
+              AND j.status = 'processing'
+              AND j.locked_at > NOW() - INTERVAL '10 minutes'
+          )
         LIMIT 5;
       `
     );
 
     const stuckList = (stuckCampaigns as any) || [];
     for (const stuck of stuckList) {
-      console.warn(`[Scheduler Recovery] Re-enqueuing stuck campaign '${stuck.title}' (${stuck.id})`);
+      console.warn(`[Scheduler Recovery] Re-enqueuing stuck campaign '${stuck.title}' (${stuck.id}) without active worker lease.`);
       await enqueueJob(
         "process_campaign",
         { campaignId: stuck.id },
