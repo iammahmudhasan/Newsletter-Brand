@@ -1,4 +1,4 @@
-import { db, automationJobs, eq, sql } from "@ai-signal/db";
+import { db, automationJobs, eq, and, sql } from "@ai-signal/db";
 
 export interface EnqueueOptions {
   scheduledFor?: Date;
@@ -144,7 +144,7 @@ export async function renewJobLease(jobId: string): Promise<void> {
     await db
       .update(automationJobs)
       .set({ lockedAt: new Date() })
-      .where(eq(automationJobs.id, jobId));
+      .where(and(eq(automationJobs.id, jobId), eq(automationJobs.status, "processing")));
   } catch (err: any) {
     console.warn(`[Queue Lease Warning] Failed to renew lease for job ${jobId}:`, err.message);
   }
@@ -162,11 +162,11 @@ export async function completeJob(jobId: string): Promise<void> {
         completedAt: new Date(),
         lockedAt: null,
       })
-      .where(eq(automationJobs.id, jobId))
+      .where(and(eq(automationJobs.id, jobId), eq(automationJobs.status, "processing")))
       .returning({ id: automationJobs.id });
 
     if (result.length === 0) {
-      console.warn(`[Queue Warning] Attempted to complete job ${jobId}, but row was not found.`);
+      console.warn(`[Queue Warning] Attempted to complete job ${jobId}, but job is no longer in 'processing' state (lease likely reclaimed).`);
     }
   } catch (err: any) {
     console.error(`[Queue Error] Failed to complete job ${jobId}:`, err.message);

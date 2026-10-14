@@ -15,6 +15,7 @@ export interface SendEmailResult {
   messageId: string;
   provider: "console" | "resend" | "ses";
   error?: string;
+  isAmbiguous?: boolean;
 }
 
 export interface EmailProvider {

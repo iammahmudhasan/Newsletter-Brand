@@ -322,6 +322,8 @@ export async function POST(req: NextRequest) {
       // CRITICAL: Never mark a recipient as 'sent' when receiving a bounce or complaint!
       if (recipientIdTag) {
         if (standardizedType === "delivered") {
+          // Delivered transitions from queued/processing/sent/unknown_outcome -> delivered
+          // CRITICAL: NEVER overwrite terminal bounce or failed status!
           await tx
             .update(campaignRecipients)
             .set({
@@ -330,8 +332,14 @@ export async function POST(req: NextRequest) {
               sentAt: new Date(),
               updatedAt: new Date(),
             })
-            .where(eq(campaignRecipients.id, recipientIdTag));
+            .where(
+              and(
+                eq(campaignRecipients.id, recipientIdTag),
+                sql`${campaignRecipients.status} IN ('queued', 'processing', 'sent', 'unknown_outcome')`
+              )
+            );
         } else if (standardizedType === "bounce") {
+          // Bounce transitions any non-bounced state to bounced
           await tx
             .update(campaignRecipients)
             .set({
@@ -339,8 +347,14 @@ export async function POST(req: NextRequest) {
               errorMessage: isHardBounce ? "Permanent hard bounce" : "Soft bounce / mailbox full",
               updatedAt: new Date(),
             })
-            .where(eq(campaignRecipients.id, recipientIdTag));
+            .where(
+              and(
+                eq(campaignRecipients.id, recipientIdTag),
+                sql`${campaignRecipients.status} != 'bounced'`
+              )
+            );
         } else if (standardizedType === "complaint") {
+          // Complaint transitions to failed
           await tx
             .update(campaignRecipients)
             .set({
@@ -348,7 +362,12 @@ export async function POST(req: NextRequest) {
               errorMessage: "Spam complaint reported",
               updatedAt: new Date(),
             })
-            .where(eq(campaignRecipients.id, recipientIdTag));
+            .where(
+              and(
+                eq(campaignRecipients.id, recipientIdTag),
+                sql`${campaignRecipients.status} != 'failed'`
+              )
+            );
         } else if (standardizedType === "open" || standardizedType === "click") {
           // Open or click confirms receipt without overriding terminal bounce/failed status
           await tx
@@ -361,7 +380,7 @@ export async function POST(req: NextRequest) {
             .where(
               and(
                 eq(campaignRecipients.id, recipientIdTag),
-                sql`${campaignRecipients.status} IN ('queued', 'processing', 'sent')`
+                sql`${campaignRecipients.status} IN ('queued', 'processing', 'sent', 'unknown_outcome')`
               )
             );
         }

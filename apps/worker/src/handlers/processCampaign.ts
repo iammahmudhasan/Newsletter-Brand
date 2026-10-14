@@ -7,6 +7,7 @@ import {
   emailEvents,
   eq,
   and,
+  desc,
   sql,
 } from "@ai-signal/db";
 import { getEmailProvider, renderNewsletterEmail } from "@ai-signal/email";
@@ -109,290 +110,391 @@ export async function handleProcessCampaignBatch(
   const BATCH_SIZE = 50;
   const MAX_RECIPIENT_ATTEMPTS = 3;
 
-  for (let i = 0; i < pendingRecipients.length; i += BATCH_SIZE) {
-    const batch = pendingRecipients.slice(i, i + BATCH_SIZE);
+  // Background heartbeat interval while worker batch is active (every 10 seconds)
+  let heartbeatTimer: NodeJS.Timeout | null = null;
+  if (jobId) {
+    heartbeatTimer = setInterval(async () => {
+      try {
+        await renewJobLease(jobId);
+        await db
+          .update(campaigns)
+          .set({ updatedAt: new Date() })
+          .where(eq(campaigns.id, campaignId));
+      } catch (err: any) {
+        console.warn(`[Worker Heartbeat Warning] Failed to pulse lease for job ${jobId}:`, err.message);
+      }
+    }, 10000);
+  }
 
-    // Heartbeat: renew job lock lease in queue so long campaigns never get falsely reclaimed as stale
-    if (jobId) {
-      await renewJobLease(jobId);
-    }
+  try {
+    for (let i = 0; i < pendingRecipients.length; i += BATCH_SIZE) {
+      const batch = pendingRecipients.slice(i, i + BATCH_SIZE);
 
-    // Touch campaign updatedAt to record active progress
-    await db
-      .update(campaigns)
-      .set({ updatedAt: new Date() })
-      .where(eq(campaigns.id, campaignId));
-
-    for (const item of batch) {
-      // Periodic heartbeat on active worker lease
+      // Heartbeat: renew job lock lease in queue so long campaigns never get falsely reclaimed as stale
       if (jobId) {
         await renewJobLease(jobId);
       }
 
-      // Atomic Claim: Transition status to 'processing' with fresh lease timestamp
-      const claimResult = await db.execute<typeof campaignRecipients.$inferSelect>(
-        sql`
-          UPDATE campaign_recipients
-          SET status = 'processing', updated_at = NOW()
-          WHERE id = ${item.recipientId}
-            AND (
-              (status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()))
-              OR (status IN ('processing', 'unknown_outcome') AND updated_at < NOW() - INTERVAL '5 minutes')
-            )
-          RETURNING *;
-        `
-      );
+      // Touch campaign updatedAt to record active progress
+      await db
+        .update(campaigns)
+        .set({ updatedAt: new Date() })
+        .where(eq(campaigns.id, campaignId));
 
-      const claimed = (claimResult as any)?.[0];
-      if (!claimed) {
-        // Already claimed by another worker or already marked 'sent'/'delivered'
-        continue;
-      }
-
-      // Crash Recovery Check: If providerMessageId already exists on claimed record,
-      // the email was already accepted by SES/Resend before the worker crashed!
-      // Do NOT duplicate send!
-      if (claimed.provider_message_id) {
-        console.log(`[Worker Recovery] Recipient ${claimed.id} already has providerMessageId ${claimed.provider_message_id}. Marking sent.`);
-        await db
-          .update(campaignRecipients)
-          .set({
-            status: "sent",
-            sentAt: claimed.sent_at || new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(campaignRecipients.id, item.recipientId));
-        successCount++;
-        continue;
-      }
-
-      // Ambiguous Send Reconciliation: If this record was stuck in 'processing' or 'unknown_outcome',
-      // check if a webhook event (SES or Resend) already recorded delivery/bounce for this recipient
-      if (item.status === "processing" || item.status === "unknown_outcome") {
-        const [reconciledEvent] = await db
-          .select({
-            providerMessageId: emailEvents.providerMessageId,
-            eventType: emailEvents.eventType,
-          })
-          .from(emailEvents)
-          .where(eq(emailEvents.recipientId, item.recipientId))
-          .limit(1);
-
-        if (reconciledEvent) {
-          console.log(
-            `[Worker Ambiguous Recovery] Recipient ${item.recipientId} reconciled from webhook event '${reconciledEvent.eventType}' (${reconciledEvent.providerMessageId}). Bypassing duplicate dispatch.`
-          );
-
-          let newStatus: "sent" | "delivered" | "bounced" | "failed" = "sent";
-          if (reconciledEvent.eventType === "delivered") newStatus = "delivered";
-          else if (reconciledEvent.eventType === "bounce") newStatus = "bounced";
-          else if (reconciledEvent.eventType === "complaint") newStatus = "failed";
-
-          await db
-            .update(campaignRecipients)
-            .set({
-              status: newStatus,
-              providerMessageId: reconciledEvent.providerMessageId || undefined,
-              sentAt: new Date(),
-              updatedAt: new Date(),
-            })
-            .where(eq(campaignRecipients.id, item.recipientId));
-
-          if (newStatus === "sent" || newStatus === "delivered") successCount++;
-          else failCount++;
-          continue;
-        }
-      }
-
-      try {
-        // Fresh check of subscriber status and suppression list immediately prior to dispatch
-        const [freshSub] = await db
-          .select()
-          .from(subscribers)
-          .where(eq(subscribers.id, item.subscriberId));
-
-        if (!freshSub || freshSub.status !== "active") {
-          await db
-            .update(campaignRecipients)
-            .set({
-              status: "failed",
-              errorMessage: `Subscriber not in active state (currently: ${freshSub?.status || "deleted"})`,
-              updatedAt: new Date(),
-            })
-            .where(eq(campaignRecipients.id, item.recipientId));
-          failCount++;
-          continue;
+      for (const item of batch) {
+        if (jobId) {
+          await renewJobLease(jobId);
         }
 
-        const normalizedEmail = normalizeEmail(freshSub.email);
-        const [suppressed] = await db
-          .select({ id: suppressions.id })
-          .from(suppressions)
-          .where(eq(suppressions.email, normalizedEmail));
-
-        if (suppressed) {
-          await db
-            .update(campaignRecipients)
-            .set({
-              status: "failed",
-              errorMessage: "Recipient email is currently on the suppression list",
-              updatedAt: new Date(),
-            })
-            .where(eq(campaignRecipients.id, item.recipientId));
-          failCount++;
-          continue;
-        }
-
-        // Generate signed unsubscribe tokens with purpose: 'unsubscribe'
-        const unsubToken = generateSignedToken(
-          {
-            id: freshSub.id,
-            email: freshSub.email,
-            purpose: "unsubscribe",
-          },
-          365 * 86400
+        // Atomic Claim: Transition status to 'processing' with fresh lease timestamp
+        const claimResult = await db.execute<typeof campaignRecipients.$inferSelect>(
+          sql`
+            UPDATE campaign_recipients
+            SET status = 'processing', updated_at = NOW()
+            WHERE id = ${item.recipientId}
+              AND (
+                (status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()))
+                OR (status IN ('processing', 'unknown_outcome') AND updated_at < NOW() - INTERVAL '5 minutes')
+              )
+            RETURNING *;
+          `
         );
 
-        const unsubscribeWebUrl = `${config.appUrl}/unsubscribe?token=${unsubToken}`;
-        const unsubscribeApiUrl = `${config.appUrl}/api/unsubscribe?token=${unsubToken}`;
-        const archiveUrl = `${config.appUrl}/archive/${campaign.id}`;
+        const claimed = (claimResult as any)?.[0];
+        if (!claimed) {
+          // Already claimed by another worker or already marked 'sent'/'delivered'
+          continue;
+        }
 
-        const { html, text, headers } = renderNewsletterEmail({
-          issueNumber: 1,
-          issueDate: new Date().toLocaleDateString("en-US", {
-            month: "short",
-            day: "numeric",
-            year: "numeric",
-          }),
-          title: campaign.title,
-          previewText: campaign.previewText || "",
-          htmlContent: campaign.contentHtml,
-          recipientEmail: freshSub.email,
-          unsubscribeWebUrl,
-          unsubscribeApiUrl,
-          archiveUrl,
-        });
-
-        // Use recipient-specific idempotency key for provider-level duplicate dispatch protection
-        const idempotencyKey = `campaign:${campaign.id}:recipient:${item.recipientId}`;
-
-        const sendResult = await provider.sendEmail({
-          to: freshSub.email,
-          subject: campaign.subject,
-          html,
-          text,
-          headers,
-          tags: {
-            campaign_id: campaign.id,
-            recipient_id: item.recipientId,
-          },
-          idempotencyKey,
-        });
-
-        if (sendResult.success) {
-          successCount++;
+        // Crash Recovery Check: If providerMessageId already exists on claimed record,
+        // the email was already accepted by SES/Resend before the worker crashed!
+        // Do NOT duplicate send!
+        if (claimed.provider_message_id) {
+          console.log(`[Worker Recovery] Recipient ${claimed.id} already has providerMessageId ${claimed.provider_message_id}. Marking sent if still processing.`);
           await db
             .update(campaignRecipients)
             .set({
               status: "sent",
-              providerMessageId: sendResult.messageId,
-              sentAt: new Date(),
+              sentAt: claimed.sent_at || new Date(),
               updatedAt: new Date(),
-              errorMessage: null,
             })
-            .where(eq(campaignRecipients.id, item.recipientId));
-        } else {
-          // Failure handling with Exponential Backoff Retry Policy
-          const currentAttempts = (claimed.attempt_count ?? item.attemptCount ?? 0) + 1;
-          const errorMsg = sendResult.error || "Email provider dispatch failed";
-
-          const isPermanent =
-            errorMsg.toLowerCase().includes("suppress") ||
-            errorMsg.toLowerCase().includes("blacklisted") ||
-            errorMsg.toLowerCase().includes("invalid email") ||
-            errorMsg.toLowerCase().includes("does not exist");
-
-          if (!isPermanent && currentAttempts < MAX_RECIPIENT_ATTEMPTS) {
-            const backoffMinutes = currentAttempts === 1 ? 2 : 5;
-            const nextAttemptAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
-
-            console.warn(
-              `[Worker Retry Policy] Transient failure for recipient ${item.recipientId}: '${errorMsg}'. Scheduling attempt ${currentAttempts + 1}/${MAX_RECIPIENT_ATTEMPTS} for ${nextAttemptAt.toISOString()}`
+            .where(
+              and(
+                eq(campaignRecipients.id, item.recipientId),
+                eq(campaignRecipients.status, "processing")
+              )
             );
+          successCount++;
+          continue;
+        }
+
+        // Ambiguous Send Reconciliation: If this record was stuck in 'processing' or 'unknown_outcome',
+        // check if a webhook event (SES or Resend) already recorded delivery/bounce for this recipient
+        if (item.status === "processing" || item.status === "unknown_outcome") {
+          const [reconciledEvent] = await db
+            .select({
+              providerMessageId: emailEvents.providerMessageId,
+              eventType: emailEvents.eventType,
+            })
+            .from(emailEvents)
+            .where(
+              and(
+                eq(emailEvents.recipientId, item.recipientId),
+                sql`${emailEvents.eventType} IN ('delivered', 'bounce', 'complaint', 'open', 'click')`
+              )
+            )
+            .orderBy(desc(emailEvents.createdAt))
+            .limit(1);
+
+          if (reconciledEvent) {
+            console.log(
+              `[Worker Ambiguous Recovery] Recipient ${item.recipientId} reconciled from webhook event '${reconciledEvent.eventType}' (${reconciledEvent.providerMessageId}). Bypassing duplicate dispatch.`
+            );
+
+            let newStatus: "delivered" | "bounced" | "failed" = "delivered";
+            if (reconciledEvent.eventType === "bounce") newStatus = "bounced";
+            else if (reconciledEvent.eventType === "complaint") newStatus = "failed";
+            else newStatus = "delivered";
 
             await db
               .update(campaignRecipients)
               .set({
-                status: "queued",
-                attemptCount: currentAttempts,
-                lastAttemptAt: new Date(),
-                nextAttemptAt,
-                errorMessage: `Attempt ${currentAttempts} failed: ${errorMsg}`,
+                status: newStatus,
+                providerMessageId: reconciledEvent.providerMessageId || undefined,
+                sentAt: new Date(),
                 updatedAt: new Date(),
               })
-              .where(eq(campaignRecipients.id, item.recipientId));
-          } else {
-            console.error(
-              `[Worker Final Failure] Permanent or exhausted attempts (${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}) for recipient ${item.recipientId}: ${errorMsg}`
-            );
-            failCount++;
+              .where(
+                and(
+                  eq(campaignRecipients.id, item.recipientId),
+                  eq(campaignRecipients.status, "processing")
+                )
+              );
+
+            if (newStatus === "delivered") successCount++;
+            else failCount++;
+            continue;
+          }
+        }
+
+        try {
+          // Fresh check of subscriber status and suppression list immediately prior to dispatch
+          const [freshSub] = await db
+            .select()
+            .from(subscribers)
+            .where(eq(subscribers.id, item.subscriberId));
+
+          if (!freshSub || freshSub.status !== "active") {
             await db
               .update(campaignRecipients)
               .set({
                 status: "failed",
-                attemptCount: currentAttempts,
-                lastAttemptAt: new Date(),
-                nextAttemptAt: null,
-                errorMessage: errorMsg,
+                errorMessage: `Subscriber not in active state (currently: ${freshSub?.status || "deleted"})`,
                 updatedAt: new Date(),
               })
-              .where(eq(campaignRecipients.id, item.recipientId));
+              .where(
+                and(
+                  eq(campaignRecipients.id, item.recipientId),
+                  eq(campaignRecipients.status, "processing")
+                )
+              );
+            failCount++;
+            continue;
           }
-        }
-      } catch (sendErr: any) {
-        const currentAttempts = (claimed.attempt_count ?? item.attemptCount ?? 0) + 1;
-        const errorMsg = sendErr.message || "Unexpected exception during dispatch";
 
-        if (currentAttempts < MAX_RECIPIENT_ATTEMPTS) {
-          const backoffMinutes = currentAttempts === 1 ? 2 : 5;
-          const nextAttemptAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
+          const normalizedEmail = normalizeEmail(freshSub.email);
+          const [suppressed] = await db
+            .select({ id: suppressions.id })
+            .from(suppressions)
+            .where(eq(suppressions.email, normalizedEmail));
+
+          if (suppressed) {
+            await db
+              .update(campaignRecipients)
+              .set({
+                status: "failed",
+                errorMessage: "Recipient email is currently on the suppression list",
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(campaignRecipients.id, item.recipientId),
+                  eq(campaignRecipients.status, "processing")
+                )
+              );
+            failCount++;
+            continue;
+          }
+
+          // Generate signed unsubscribe tokens with purpose: 'unsubscribe'
+          const unsubToken = generateSignedToken(
+            {
+              id: freshSub.id,
+              email: freshSub.email,
+              purpose: "unsubscribe",
+            },
+            365 * 86400
+          );
+
+          const unsubscribeWebUrl = `${config.appUrl}/unsubscribe?token=${unsubToken}`;
+          const unsubscribeApiUrl = `${config.appUrl}/api/unsubscribe?token=${unsubToken}`;
+          const archiveUrl = `${config.appUrl}/archive/${campaign.id}`;
+
+          const { html, text, headers } = renderNewsletterEmail({
+            issueNumber: 1,
+            issueDate: new Date().toLocaleDateString("en-US", {
+              month: "short",
+              day: "numeric",
+              year: "numeric",
+            }),
+            title: campaign.title,
+            previewText: campaign.previewText || "",
+            htmlContent: campaign.contentHtml,
+            recipientEmail: freshSub.email,
+            unsubscribeWebUrl,
+            unsubscribeApiUrl,
+            archiveUrl,
+          });
+
+          // Use recipient-specific idempotency key for provider-level duplicate dispatch protection
+          const idempotencyKey = `campaign:${campaign.id}:recipient:${item.recipientId}`;
+
+          const sendResult = await provider.sendEmail({
+            to: freshSub.email,
+            subject: campaign.subject,
+            html,
+            text,
+            headers,
+            tags: {
+              campaign_id: campaign.id,
+              recipient_id: item.recipientId,
+            },
+            idempotencyKey,
+          });
+
+          if (sendResult.success) {
+            successCount++;
+            // Conditional state transition: Only set status = 'sent' if the recipient is still in 'processing'.
+            // If a fast webhook already marked it 'delivered' or 'bounced', do NOT overwrite/revert!
+            const updateRes = await db
+              .update(campaignRecipients)
+              .set({
+                status: "sent",
+                providerMessageId: sendResult.messageId,
+                sentAt: new Date(),
+                updatedAt: new Date(),
+                errorMessage: null,
+              })
+              .where(
+                and(
+                  eq(campaignRecipients.id, item.recipientId),
+                  eq(campaignRecipients.status, "processing")
+                )
+              )
+              .returning({ id: campaignRecipients.id });
+
+            if (updateRes.length === 0) {
+              // Recipient was already transitioned by concurrent webhook (e.g., delivered or bounced).
+              // Populate providerMessageId if missing without reverting the status:
+              await db
+                .update(campaignRecipients)
+                .set({
+                  providerMessageId: sendResult.messageId,
+                  sentAt: new Date(),
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(campaignRecipients.id, item.recipientId),
+                    sql`${campaignRecipients.providerMessageId} IS NULL`
+                  )
+                );
+              console.log(
+                `[Worker Concurrency] Recipient ${item.recipientId} was already updated by concurrent webhook. Preserving advanced status.`
+              );
+            }
+          } else {
+            const currentAttempts = (claimed.attempt_count ?? item.attemptCount ?? 0) + 1;
+            const errorMsg = sendResult.error || "Email provider dispatch failed";
+
+            const isPermanent =
+              errorMsg.toLowerCase().includes("suppress") ||
+              errorMsg.toLowerCase().includes("blacklisted") ||
+              errorMsg.toLowerCase().includes("invalid email") ||
+              errorMsg.toLowerCase().includes("does not exist");
+
+            if (sendResult.isAmbiguous) {
+              // AMBIGUOUS OUTCOME: Network timeout, 5xx server error, or connection reset
+              // Hold in 'unknown_outcome' for webhook reconciliation window (2 mins) before retrying
+              const reconciliationDelayMinutes = 2;
+              const nextAttemptAt = new Date(Date.now() + reconciliationDelayMinutes * 60 * 1000);
+
+              console.warn(
+                `[Worker Ambiguous Outcome] Potential in-flight dispatch for recipient ${item.recipientId}: '${errorMsg}'. Moving to 'unknown_outcome' until ${nextAttemptAt.toISOString()} for webhook reconciliation.`
+              );
+
+              await db
+                .update(campaignRecipients)
+                .set({
+                  status: "unknown_outcome",
+                  attemptCount: currentAttempts,
+                  lastAttemptAt: new Date(),
+                  nextAttemptAt,
+                  errorMessage: `Ambiguous outcome (Attempt ${currentAttempts}): ${errorMsg}`,
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(campaignRecipients.id, item.recipientId),
+                    eq(campaignRecipients.status, "processing")
+                  )
+                );
+            } else if (!isPermanent && currentAttempts < MAX_RECIPIENT_ATTEMPTS) {
+              const backoffMinutes = currentAttempts === 1 ? 2 : 5;
+              const nextAttemptAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
+
+              console.warn(
+                `[Worker Retry Policy] Transient failure for recipient ${item.recipientId}: '${errorMsg}'. Scheduling attempt ${currentAttempts + 1}/${MAX_RECIPIENT_ATTEMPTS} for ${nextAttemptAt.toISOString()}`
+              );
+
+              await db
+                .update(campaignRecipients)
+                .set({
+                  status: "queued",
+                  attemptCount: currentAttempts,
+                  lastAttemptAt: new Date(),
+                  nextAttemptAt,
+                  errorMessage: `Attempt ${currentAttempts} failed: ${errorMsg}`,
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(campaignRecipients.id, item.recipientId),
+                    eq(campaignRecipients.status, "processing")
+                  )
+                );
+            } else {
+              console.error(
+                `[Worker Final Failure] Permanent or exhausted attempts (${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}) for recipient ${item.recipientId}: ${errorMsg}`
+              );
+              failCount++;
+              await db
+                .update(campaignRecipients)
+                .set({
+                  status: "failed",
+                  attemptCount: currentAttempts,
+                  lastAttemptAt: new Date(),
+                  nextAttemptAt: null,
+                  errorMessage: errorMsg,
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(campaignRecipients.id, item.recipientId),
+                    eq(campaignRecipients.status, "processing")
+                  )
+                );
+            }
+          }
+        } catch (sendErr: any) {
+          const currentAttempts = (claimed.attempt_count ?? item.attemptCount ?? 0) + 1;
+          const errorMsg = sendErr.message || "Unexpected exception during dispatch";
+
+          // An unexpected exception during send execution is ambiguous (e.g. timeout, process interrupted)
+          const reconciliationDelayMinutes = 2;
+          const nextAttemptAt = new Date(Date.now() + reconciliationDelayMinutes * 60 * 1000);
 
           console.warn(
-            `[Worker Retry Policy] Network/timeout exception for recipient ${item.recipientId}: '${errorMsg}'. Scheduling retry ${currentAttempts + 1}/${MAX_RECIPIENT_ATTEMPTS} for ${nextAttemptAt.toISOString()}`
+            `[Worker Exception] Ambiguous exception for recipient ${item.recipientId}: '${errorMsg}'. Moving to 'unknown_outcome' for webhook reconciliation.`
           );
 
           await db
             .update(campaignRecipients)
             .set({
-              status: "queued",
+              status: "unknown_outcome",
               attemptCount: currentAttempts,
               lastAttemptAt: new Date(),
               nextAttemptAt,
-              errorMessage: `Attempt ${currentAttempts} exception: ${errorMsg}`,
+              errorMessage: `Exception (Attempt ${currentAttempts}): ${errorMsg}`,
               updatedAt: new Date(),
             })
-            .where(eq(campaignRecipients.id, item.recipientId));
-        } else {
-          failCount++;
-          console.error(`[Worker Final Failure] Max attempts reached after exception for subscriber ${item.subscriberId}:`, errorMsg);
-          await db
-            .update(campaignRecipients)
-            .set({
-              status: "failed",
-              attemptCount: currentAttempts,
-              lastAttemptAt: new Date(),
-              nextAttemptAt: null,
-              errorMessage: errorMsg,
-              updatedAt: new Date(),
-            })
-            .where(eq(campaignRecipients.id, item.recipientId));
+            .where(
+              and(
+                eq(campaignRecipients.id, item.recipientId),
+                eq(campaignRecipients.status, "processing")
+              )
+            );
         }
       }
-    }
 
-    // Refresh lease after completing each batch chunk
-    if (jobId) {
-      await renewJobLease(jobId);
+      // Refresh lease after completing each batch chunk
+      if (jobId) {
+        await renewJobLease(jobId);
+      }
+    }
+  } finally {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
     }
   }
 

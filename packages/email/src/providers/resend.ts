@@ -32,6 +32,7 @@ export class ResendEmailProvider implements EmailProvider {
       const response = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: fetchHeaders,
+        signal: AbortSignal.timeout(15000),
         body: JSON.stringify({
           from: options.from || `${config.email.fromName} <${config.email.fromAddress}>`,
           to: options.to,
@@ -49,11 +50,13 @@ export class ResendEmailProvider implements EmailProvider {
       const data = (await response.json()) as any;
 
       if (!response.ok) {
+        const isAmbiguous = response.status >= 500;
         return {
           success: false,
           messageId: "",
           provider: "resend",
           error: data?.message || `HTTP ${response.status}: Failed to send email`,
+          isAmbiguous,
         };
       }
 
@@ -68,6 +71,7 @@ export class ResendEmailProvider implements EmailProvider {
         messageId: "",
         provider: "resend",
         error: err?.message || "Network exception sending email via Resend",
+        isAmbiguous: true,
       };
     }
   }

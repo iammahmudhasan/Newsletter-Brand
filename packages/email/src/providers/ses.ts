@@ -106,11 +106,16 @@ export class SesEmailProvider implements EmailProvider {
         provider: "ses",
       };
     } catch (err: any) {
+      const httpStatus = err?.$metadata?.httpStatusCode;
+      const isDefinitive4xx = typeof httpStatus === "number" && httpStatus >= 400 && httpStatus < 500;
+      const isAmbiguous = !isDefinitive4xx;
+
       return {
         success: false,
         messageId: "",
         provider: "ses",
         error: err?.message || "Failed to dispatch via SES",
+        isAmbiguous,
       };
     }
   }
