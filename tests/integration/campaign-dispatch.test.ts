@@ -57,7 +57,7 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
       };
 
       // 1. Fast webhook arrives
-      const webhookDeliveredAllowedTransitions = ["queued", "processing", "sent", "unknown_outcome"];
+      const webhookDeliveredAllowedTransitions = ["queued", "processing", "sent", "unknown_outcome", "needs_review"];
       if (webhookDeliveredAllowedTransitions.includes(recipient.status)) {
         recipient.status = "delivered";
         recipient.providerMessageId = "msg_from_webhook_123";
@@ -111,7 +111,7 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
       };
 
       // Delayed or out-of-order 'delivered' webhook arrives
-      const allowedToDeliver = ["queued", "processing", "sent", "unknown_outcome"];
+      const allowedToDeliver = ["queued", "processing", "sent", "unknown_outcome", "needs_review"];
       if (allowedToDeliver.includes(recipient.status)) {
         recipient.status = "delivered";
       }
@@ -494,8 +494,8 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
     });
   });
 
-  describe("Unknown Outcome Max Attempt Capping & Infinite Loop Prevention", () => {
-    it("permanently marks recipient as failed when ambiguous outcome reaches MAX_RECIPIENT_ATTEMPTS (3)", () => {
+  describe("Unknown Outcome Max Attempt Capping & Reconciliation State", () => {
+    it("marks recipient as 'needs_review' (not terminal 'failed') when ambiguous outcome reaches MAX_RECIPIENT_ATTEMPTS (3)", () => {
       const MAX_RECIPIENT_ATTEMPTS = 3;
       let currentAttempts = 2; // Previous attempts: 2
       let recipient = {
@@ -516,20 +516,132 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
 
       if (sendResult.isAmbiguous) {
         if (currentAttempts >= MAX_RECIPIENT_ATTEMPTS) {
-          recipient.status = "failed";
+          // Holds in 'needs_review' rather than definitive 'failed', clearing nextAttemptAt
+          recipient.status = "needs_review";
           recipient.attemptCount = currentAttempts;
-          recipient.nextAttemptAt = null; // Cleared! No more automated retry!
-          recipient.errorMessage = `Ambiguous dispatch outcome exceeded max attempts (${MAX_RECIPIENT_ATTEMPTS}). Requires manual reconciliation: ${sendResult.error}`;
+          recipient.nextAttemptAt = null; // Cleared! Automated retry loop is terminated!
+          recipient.errorMessage = `Ambiguous dispatch outcome exceeded max attempts (${MAX_RECIPIENT_ATTEMPTS}). Held in needs_review awaiting webhook reconciliation: ${sendResult.error}`;
         } else {
           recipient.status = "unknown_outcome";
           recipient.nextAttemptAt = new Date(Date.now() + 2 * 60 * 1000);
         }
       }
 
-      expect(recipient.status).toBe("failed");
+      expect(recipient.status).toBe("needs_review");
       expect(recipient.attemptCount).toBe(3);
       expect(recipient.nextAttemptAt).toBeNull(); // Guarantees infinite loop is broken!
-      expect(recipient.errorMessage).toContain("Ambiguous dispatch outcome exceeded max attempts (3)");
+      expect(recipient.errorMessage).toContain("Held in needs_review awaiting webhook reconciliation");
+    });
+
+    it("reconciles 'needs_review' recipient when delayed 'delivered' webhook arrives and recovers campaign stats", () => {
+      // Recipient reached 3 ambiguous attempts and was held in 'needs_review'
+      let recipient = {
+        id: "recip-delayed-webhook-1",
+        campaignId: "campaign-test-1",
+        status: "needs_review",
+        providerMessageId: null as string | null,
+        errorMessage: "Ambiguous timeout on attempt 3",
+      };
+
+      // Initially, campaign reached terminal state with partially_failed
+      let campaign = {
+        id: "campaign-test-1",
+        status: "partially_failed" as "sent" | "partially_failed" | "failed",
+        totalRecipients: 2,
+        successfulSends: 1,
+        failedSends: 1, // Counted this needs_review recipient
+      };
+
+      // Now, delayed provider webhook arrives with 'delivered' event
+      const delayedWebhookType = "delivered";
+      const webhookProviderMsgId = "ses-msg-delayed-777";
+      const allowedToDeliver = ["queued", "processing", "sent", "unknown_outcome", "needs_review"];
+
+      let transitioned = false;
+      if (allowedToDeliver.includes(recipient.status) && delayedWebhookType === "delivered") {
+        recipient.status = "delivered";
+        recipient.providerMessageId = webhookProviderMsgId;
+        transitioned = true;
+      }
+
+      expect(transitioned).toBe(true);
+      expect(recipient.status).toBe("delivered");
+      expect(recipient.providerMessageId).toBe("ses-msg-delayed-777");
+
+      // Reconcile parent campaign aggregates
+      if (transitioned) {
+        const recipientsInCampaign = [
+          { status: "delivered" },
+          { status: recipient.status }, // delivered
+        ];
+        const sent = recipientsInCampaign.filter((r) => r.status === "sent" || r.status === "delivered").length;
+        const failed = recipientsInCampaign.filter(
+          (r) => r.status === "failed" || r.status === "bounced" || r.status === "needs_review"
+        ).length;
+
+        campaign.successfulSends = sent;
+        campaign.failedSends = failed;
+        if (failed === 0 && sent > 0) {
+          campaign.status = "sent";
+        }
+      }
+
+      // Verification: Campaign was successfully healed from 'partially_failed' to 'sent'!
+      expect(campaign.status).toBe("sent");
+      expect(campaign.successfulSends).toBe(2);
+      expect(campaign.failedSends).toBe(0);
+    });
+  });
+
+  describe("Atomic firstDispatchAt Initialization Under Concurrent Workers", () => {
+    it("preserves earliest timestamp atomically via COALESCE and prevents overwriting by concurrent workers", () => {
+      // Simulate Database State
+      let dbCampaign = {
+        id: "camp-race-1",
+        firstDispatchAt: null as Date | null,
+      };
+
+      // Helper simulating atomic UPDATE campaigns SET first_dispatch_at = COALESCE(first_dispatch_at, NOW()) RETURNING first_dispatch_at
+      function atomicSetFirstDispatchAt(incomingWorkerDate: Date): Date {
+        if (!dbCampaign.firstDispatchAt) {
+          dbCampaign.firstDispatchAt = incomingWorkerDate;
+        }
+        return dbCampaign.firstDispatchAt;
+      }
+
+      const worker1Timestamp = new Date("2026-10-14T08:00:00.000Z");
+      const worker2Timestamp = new Date("2026-10-14T08:00:05.000Z"); // Started 5s later
+
+      // Worker 1 runs first
+      const worker1Result = atomicSetFirstDispatchAt(worker1Timestamp);
+      expect(worker1Result.toISOString()).toBe("2026-10-14T08:00:00.000Z");
+
+      // Concurrent Worker 2 runs
+      const worker2Result = atomicSetFirstDispatchAt(worker2Timestamp);
+      expect(worker2Result.toISOString()).toBe("2026-10-14T08:00:00.000Z"); // Maintained Worker 1's timestamp!
+
+      // Both workers receive the exact same database-persisted timestamp
+      expect(worker1Result.getTime()).toBe(worker2Result.getTime());
+      expect(dbCampaign.firstDispatchAt?.toISOString()).toBe("2026-10-14T08:00:00.000Z");
+    });
+  });
+
+  describe("Worker completeJob Observability & Failure Handling", () => {
+    it("reports warning when completeJob returns false due to lost lease rather than false success", () => {
+      let loggedSuccess = false;
+      let loggedWarning = false;
+
+      // Mock completeJob returning false (lease was reclaimed by another worker)
+      const completeJobResult = false;
+
+      if (completeJobResult) {
+        loggedSuccess = true;
+      } else {
+        loggedWarning = true;
+      }
+
+      expect(loggedSuccess).toBe(false);
+      expect(loggedWarning).toBe(true);
     });
   });
 

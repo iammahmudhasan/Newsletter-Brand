@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, subscribers, suppressions, emailEvents, campaignRecipients, eq, and, sql } from "@ai-signal/db";
+import { db, subscribers, suppressions, emailEvents, campaignRecipients, campaigns, eq, and, sql } from "@ai-signal/db";
 import { normalizeEmail, config } from "@ai-signal/config";
 import crypto from "crypto";
 import { verifyAwsSnsSignature, confirmSnsSubscription } from "@/lib/sns";
@@ -319,12 +319,19 @@ export async function POST(req: NextRequest) {
       }
 
       // Step B: Reconcile campaign recipient status strictly based on event type
-      // CRITICAL: Never mark a recipient as 'sent' when receiving a bounce or complaint!
-      if (recipientIdTag) {
+      // Supports recipientIdTag or fallback to providerMessageId
+      // CRITICAL: Delayed webhooks can reconcile ambiguous outcomes held in 'needs_review'!
+      const targetCondition = recipientIdTag
+        ? eq(campaignRecipients.id, recipientIdTag)
+        : providerMessageId
+        ? eq(campaignRecipients.providerMessageId, providerMessageId)
+        : null;
+
+      if (targetCondition) {
         if (standardizedType === "delivered") {
-          // Delivered transitions from queued/processing/sent/unknown_outcome -> delivered
+          // Delivered transitions from queued/processing/sent/unknown_outcome/needs_review -> delivered
           // CRITICAL: NEVER overwrite terminal bounce or failed status!
-          await tx
+          const updatedRows = await tx
             .update(campaignRecipients)
             .set({
               status: "delivered",
@@ -334,10 +341,55 @@ export async function POST(req: NextRequest) {
             })
             .where(
               and(
-                eq(campaignRecipients.id, recipientIdTag),
-                sql`${campaignRecipients.status} IN ('queued', 'processing', 'sent', 'unknown_outcome')`
+                targetCondition,
+                sql`${campaignRecipients.status} IN ('queued', 'processing', 'sent', 'unknown_outcome', 'needs_review')`
               )
-            );
+            )
+            .returning({
+              id: campaignRecipients.id,
+              campaignId: campaignRecipients.campaignId,
+            });
+
+          // If a recipient transitioned to delivered, reconcile the parent campaign's final delivery metrics
+          if (updatedRows.length > 0) {
+            const targetCampaignId = campaignIdTag || updatedRows[0].campaignId;
+            if (targetCampaignId) {
+              const allRecipients = await tx
+                .select({ status: campaignRecipients.status })
+                .from(campaignRecipients)
+                .where(eq(campaignRecipients.campaignId, targetCampaignId));
+
+              if (allRecipients.length > 0) {
+                const total = allRecipients.length;
+                const sent = allRecipients.filter((r) => r.status === "sent" || r.status === "delivered").length;
+                const failed = allRecipients.filter(
+                  (r) => r.status === "failed" || r.status === "bounced" || r.status === "needs_review"
+                ).length;
+
+                let finalCampaignStatus: "sent" | "partially_failed" | "failed" = "sent";
+                if (failed > 0 && sent > 0) {
+                  finalCampaignStatus = "partially_failed";
+                } else if (failed > 0 && sent === 0) {
+                  finalCampaignStatus = "failed";
+                }
+
+                await tx
+                  .update(campaigns)
+                  .set({
+                    successfulSends: sent,
+                    failedSends: failed,
+                    status: finalCampaignStatus,
+                    updatedAt: new Date(),
+                  })
+                  .where(
+                    and(
+                      eq(campaigns.id, targetCampaignId),
+                      sql`${campaigns.status} IN ('sent', 'partially_failed', 'failed')`
+                    )
+                  );
+              }
+            }
+          }
         } else if (standardizedType === "bounce") {
           // Bounce transitions any non-bounced state to bounced
           await tx
@@ -349,7 +401,7 @@ export async function POST(req: NextRequest) {
             })
             .where(
               and(
-                eq(campaignRecipients.id, recipientIdTag),
+                targetCondition,
                 sql`${campaignRecipients.status} != 'bounced'`
               )
             );
@@ -364,7 +416,7 @@ export async function POST(req: NextRequest) {
             })
             .where(
               and(
-                eq(campaignRecipients.id, recipientIdTag),
+                targetCondition,
                 sql`${campaignRecipients.status} != 'failed'`
               )
             );
@@ -379,8 +431,8 @@ export async function POST(req: NextRequest) {
             })
             .where(
               and(
-                eq(campaignRecipients.id, recipientIdTag),
-                sql`${campaignRecipients.status} IN ('queued', 'processing', 'sent', 'unknown_outcome')`
+                targetCondition,
+                sql`${campaignRecipients.status} IN ('queued', 'processing', 'sent', 'unknown_outcome', 'needs_review')`
               )
             );
         }

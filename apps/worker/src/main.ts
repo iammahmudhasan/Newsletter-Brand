@@ -27,26 +27,29 @@ async function processNextJob(): Promise<boolean> {
     switch (job.jobName) {
       case "send_confirmation":
         await handleSendConfirmation(job.payload as any);
-        await completeJob(job.id, leaseToken);
-        console.log(`[Worker] Job ${job.id} completed successfully.`);
         break;
 
       case "send_welcome":
         await handleSendWelcome(job.payload as any);
-        await completeJob(job.id, leaseToken);
-        console.log(`[Worker] Job ${job.id} completed successfully.`);
         break;
 
       case "process_campaign":
         await handleProcessCampaignBatch(job.payload as any, job.id, leaseToken);
-        await completeJob(job.id, leaseToken);
-        console.log(`[Worker] Job ${job.id} completed successfully.`);
         break;
 
       default:
         console.error(`[Worker Security Alert] Unknown job name '${job.jobName}' for job ID ${job.id}. Marking as failed.`);
         await failJob(job.id, `Unrecognized job handler: ${job.jobName}`, leaseToken);
-        break;
+        return true;
+    }
+
+    const completed = await completeJob(job.id, leaseToken);
+    if (completed) {
+      console.log(`[Worker] Job ${job.id} completed successfully.`);
+    } else {
+      console.warn(
+        `[Worker Warning] Job ${job.id} ('${job.jobName}') handler execution finished, but completeJob failed (lease expired, stolen, or ownership lost).`
+      );
     }
 
     return true;

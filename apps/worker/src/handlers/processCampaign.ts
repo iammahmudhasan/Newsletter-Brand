@@ -37,18 +37,24 @@ export async function handleProcessCampaignBatch(
     return;
   }
 
-  // Ensure campaign status is 'sending' and persistent firstDispatchAt is established
-  const firstDispatchAt = campaign.firstDispatchAt || new Date();
-  if (campaign.status !== "sending" || !campaign.firstDispatchAt) {
-    await db
-      .update(campaigns)
-      .set({
-        status: "sending",
-        firstDispatchAt,
-        updatedAt: new Date(),
-      })
-      .where(eq(campaigns.id, campaignId));
-  }
+  // 1. Atomically ensure campaign status is 'sending' and persistent firstDispatchAt is established
+  // COALESCE(first_dispatch_at, NOW()) guarantees that if multiple workers attempt initialization concurrently,
+  // the first one sets the timestamp and any subsequent update preserves the exact existing value.
+  const [initializedCampaign] = await db
+    .update(campaigns)
+    .set({
+      status: "sending",
+      firstDispatchAt: sql`COALESCE(${campaigns.firstDispatchAt}, NOW())`,
+      updatedAt: new Date(),
+    })
+    .where(eq(campaigns.id, campaignId))
+    .returning({
+      id: campaigns.id,
+      firstDispatchAt: campaigns.firstDispatchAt,
+      status: campaigns.status,
+    });
+
+  const firstDispatchAt: Date = initializedCampaign?.firstDispatchAt || campaign.firstDispatchAt || new Date();
 
   // 2. Check if this campaign already has pre-existing recipients from a previous/interrupted dispatch
   const existingRecipients = await db
@@ -438,16 +444,16 @@ export async function handleProcessCampaignBatch(
             if (sendResult.isAmbiguous) {
               if (currentAttempts >= MAX_RECIPIENT_ATTEMPTS) {
                 console.error(
-                  `[Worker Ambiguous Threshold Exceeded] Recipient ${item.recipientId} reached max attempts (${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}) with ambiguous outcome: '${errorMsg}'. Halting automated resend; marking for manual webhook/provider reconciliation.`
+                  `[Worker Ambiguous Threshold Exceeded] Recipient ${item.recipientId} reached max attempts (${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}) with ambiguous outcome: '${errorMsg}'. Halting automated resend; setting status to 'needs_review' for webhook/manual reconciliation.`
                 );
                 await db
                   .update(campaignRecipients)
                   .set({
-                    status: "failed",
+                    status: "needs_review",
                     attemptCount: currentAttempts,
                     lastAttemptAt: new Date(),
                     nextAttemptAt: null, // Clear nextAttemptAt to halt automated retries
-                    errorMessage: `Ambiguous dispatch outcome exceeded max attempts (${MAX_RECIPIENT_ATTEMPTS}). Requires manual reconciliation: ${errorMsg}`,
+                    errorMessage: `Ambiguous dispatch outcome exceeded max attempts (${MAX_RECIPIENT_ATTEMPTS}). Held in needs_review awaiting webhook reconciliation: ${errorMsg}`,
                     updatedAt: new Date(),
                   })
                   .where(
@@ -536,16 +542,16 @@ export async function handleProcessCampaignBatch(
 
           if (currentAttempts >= MAX_RECIPIENT_ATTEMPTS) {
             console.error(
-              `[Worker Exception Limit Exceeded] Recipient ${item.recipientId} reached max attempts (${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}) with exception: '${errorMsg}'. Halting automated resend.`
+              `[Worker Exception Limit Exceeded] Recipient ${item.recipientId} reached max attempts (${currentAttempts}/${MAX_RECIPIENT_ATTEMPTS}) with exception: '${errorMsg}'. Halting automated resend; setting status to 'needs_review'.`
             );
             await db
               .update(campaignRecipients)
               .set({
-                status: "failed",
+                status: "needs_review",
                 attemptCount: currentAttempts,
                 lastAttemptAt: new Date(),
                 nextAttemptAt: null,
-                errorMessage: `Exception exceeded max attempts (${MAX_RECIPIENT_ATTEMPTS}). Requires manual review: ${errorMsg}`,
+                errorMessage: `Exception exceeded max attempts (${MAX_RECIPIENT_ATTEMPTS}). Held in needs_review awaiting reconciliation: ${errorMsg}`,
                 updatedAt: new Date(),
               })
               .where(
@@ -657,7 +663,7 @@ export async function handleProcessCampaignBatch(
 
   const total = allRecipients.length;
   const sent = allRecipients.filter((r) => r.status === "sent" || r.status === "delivered").length;
-  const failed = allRecipients.filter((r) => r.status === "failed" || r.status === "bounced").length;
+  const failed = allRecipients.filter((r) => r.status === "failed" || r.status === "bounced" || r.status === "needs_review").length;
 
   let finalCampaignStatus: "sent" | "partially_failed" | "failed" = "sent";
   if (failed > 0 && sent > 0) {
