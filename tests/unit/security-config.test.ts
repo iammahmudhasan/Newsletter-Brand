@@ -56,6 +56,7 @@ describe("Production Security Baseline & Configuration Guardrails", () => {
   it("passes validation when production environment is properly hardened", () => {
     const validProdEnv: NodeJS.ProcessEnv = {
       NODE_ENV: "production",
+      APP_URL: "https://aisignal.dev",
       AUTH_SECRET: "super-secure-production-secret-must-be-very-long-32-chars",
       ADMIN_PASSWORD: "StrongAdminPassword2026!#",
       DATABASE_URL: "postgres://prod_user:secret@aws-rds.internal:5432/ai_signal",
@@ -65,6 +66,31 @@ describe("Production Security Baseline & Configuration Guardrails", () => {
     };
 
     expect(() => validateProductionConfig(validProdEnv)).not.toThrow();
+  });
+
+  it("fails closed in production if APP_URL is missing, insecure HTTP, or points to localhost", () => {
+    const base: NodeJS.ProcessEnv = {
+      NODE_ENV: "production",
+      AUTH_SECRET: "super-secure-production-secret-must-be-very-long-32-chars",
+      ADMIN_PASSWORD: "StrongAdminPassword2026!#",
+      DATABASE_URL: "postgres://prod_user:secret@aws-rds.internal:5432/ai_signal",
+      EMAIL_PROVIDER: "resend",
+      RESEND_API_KEY: "re_valid_api_key_production_01",
+      EMAIL_WEBHOOK_SECRET: "whsec_valid_webhook_secret_production_01",
+    };
+
+    // Missing APP_URL
+    expect(() => validateProductionConfig({ ...base })).toThrow(/APP_URL is required in production/);
+
+    // Insecure HTTP APP_URL
+    expect(() => validateProductionConfig({ ...base, APP_URL: "http://aisignal.dev" })).toThrow(
+      /APP_URL must use https:\/\/ in production/
+    );
+
+    // Localhost APP_URL
+    expect(() => validateProductionConfig({ ...base, APP_URL: "https://localhost:3000" })).toThrow(
+      /APP_URL cannot point to localhost or private domains/
+    );
   });
 
   it("verifies admin session token validity and expiration", () => {

@@ -50,6 +50,13 @@
       "when": 1791945000000,
       "tag": "0006_flawless_dispatch_timestamp",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1791950000000,
+      "tag": "0007_sturdy_delivery_and_fencing",
+      "breakpoints": true
     }
   ]
 }

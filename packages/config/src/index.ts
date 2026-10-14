@@ -82,10 +82,26 @@ export function validateProductionConfig(env: NodeJS.ProcessEnv = process.env): 
     }
   }
 
-  // 5. EMAIL_WEBHOOK_SECRET
-  const webhookSecret = env.EMAIL_WEBHOOK_SECRET;
-  if (!webhookSecret || webhookSecret === "dev-webhook-secret") {
-    errors.push("A secure EMAIL_WEBHOOK_SECRET is required in production");
+  // 6. APP_URL
+  const appUrl = env.APP_URL;
+  if (!appUrl) {
+    errors.push("APP_URL is required in production");
+  } else {
+    try {
+      const parsedUrl = new URL(appUrl);
+      if (parsedUrl.protocol !== "https:") {
+        errors.push("APP_URL must use https:// in production");
+      }
+      if (
+        parsedUrl.hostname === "localhost" ||
+        parsedUrl.hostname === "127.0.0.1" ||
+        parsedUrl.hostname.endsWith(".local")
+      ) {
+        errors.push("APP_URL cannot point to localhost or private domains in production");
+      }
+    } catch {
+      errors.push("APP_URL must be a valid absolute HTTPS URL");
+    }
   }
 
   if (errors.length > 0) {
@@ -116,6 +132,7 @@ export const config = {
       accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
       snsTopicArn: process.env.AWS_SNS_TOPIC_ARN || "",
+      configurationSetName: process.env.AWS_SES_CONFIGURATION_SET || "",
     },
     webhookSecret: process.env.EMAIL_WEBHOOK_SECRET || "dev-webhook-secret",
   },

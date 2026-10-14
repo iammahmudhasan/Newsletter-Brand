@@ -4,8 +4,15 @@ import { normalizeEmail, config } from "@ai-signal/config";
 import crypto from "crypto";
 import { verifyAwsSnsSignature, confirmSnsSubscription } from "@/lib/sns";
 
+import {
+  WebhookNormalizedType,
+  normalizeWebhookEventType,
+  reconcileCampaignMetrics,
+} from "@/lib/webhookHelpers";
+
 /**
  * Verifies Resend / Svix webhook signature
+ * In production, strictly enforces svix-id, svix-timestamp, and signature with 5-min tolerance
  */
 function verifyResendSvixSignature(
   rawBody: string,
@@ -19,6 +26,12 @@ function verifyResendSvixSignature(
 
     if (!svixSignature) return false;
 
+    // Production security guardrail: Fail closed if svix-id or svix-timestamp are missing
+    if (process.env.NODE_ENV === "production" && (!svixId || !svixTimestamp)) {
+      console.error("[Webhook Security Alert] Missing required svix-id or svix-timestamp headers in production.");
+      return false;
+    }
+
     // Secret can be base64-encoded if prefixed with whsec_
     const secretKey = secret.startsWith("whsec_")
       ? Buffer.from(secret.slice(6), "base64")
@@ -31,6 +44,8 @@ function verifyResendSvixSignature(
       if (Math.abs(nowSec - timestampSec) > 300) {
         return false; // Replay attack prevention
       }
+    } else if (process.env.NODE_ENV === "production") {
+      return false;
     }
 
     const toSign = svixId && svixTimestamp ? `${svixId}.${svixTimestamp}.${rawBody}` : rawBody;
@@ -190,7 +205,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Parse event details accurately
-    let eventType = "unknown";
+    let rawEventType = "unknown";
     let recipientEmail: string | null = null;
     let providerMessageId: string | null = null;
     let providerEventId: string | null = null;
@@ -201,7 +216,7 @@ export async function POST(req: NextRequest) {
 
     // 1. Resend structure
     if (eventData.type && typeof eventData.type === "string") {
-      eventType = eventData.type;
+      rawEventType = eventData.type;
       recipientEmail = eventData.data?.to?.[0] || eventData.data?.email || null;
       providerMessageId = eventData.data?.email_id || eventData.id || null;
       providerEventId = eventData.id || eventData.data?.id || req.headers.get("svix-id") || null;
@@ -213,18 +228,22 @@ export async function POST(req: NextRequest) {
         if (foundCampaign) campaignIdTag = foundCampaign.value;
       }
 
-      if (eventType === "email.bounced") {
-        const bounceType = eventData.data?.bounce?.type || "";
-        if (bounceType.toLowerCase() === "permanent" || bounceType.toLowerCase() === "hard") {
-          isHardBounce = true;
-        } else {
+      if (rawEventType === "email.bounced") {
+        const bounceType = (eventData.data?.bounce?.type || "").toLowerCase();
+        // Resend documented semantics: email.bounced is permanent rejection unless explicitly soft/transient
+        if (bounceType === "transient" || bounceType === "soft") {
           isSoftBounce = true;
+          isHardBounce = false;
+        } else {
+          isHardBounce = true;
+          isSoftBounce = false;
         }
       }
     }
     // 2. AWS SES structure
     else if (eventData.eventType || eventData.notificationType) {
       const sesType = eventData.eventType || eventData.notificationType;
+      rawEventType = sesType;
       providerMessageId = eventData.mail?.messageId || null;
       providerEventId = payload.MessageId || eventData.mail?.messageId || null;
 
@@ -239,22 +258,22 @@ export async function POST(req: NextRequest) {
       }
 
       if (sesType === "Bounce") {
-        eventType = "email.bounced";
         recipientEmail = eventData.bounce?.bouncedRecipients?.[0]?.emailAddress || null;
-        const sesBounceType = eventData.bounce?.bounceType || "";
-        if (sesBounceType === "Permanent") {
-          isHardBounce = true;
+        const sesBounceType = (eventData.bounce?.bounceType || "").toLowerCase();
+        if (sesBounceType === "transient") {
+          isSoftBounce = true;
+          isHardBounce = false;
         } else {
-          isSoftBounce = true; // Transient bounce
+          isHardBounce = true;
+          isSoftBounce = false;
         }
       } else if (sesType === "Complaint") {
-        eventType = "email.complained";
         recipientEmail = eventData.complaint?.complainedRecipients?.[0]?.emailAddress || null;
       } else if (sesType === "Delivery") {
-        eventType = "email.delivered";
         recipientEmail = eventData.delivery?.recipients?.[0] || null;
+      } else if (sesType === "DeliveryDelay") {
+        recipientEmail = eventData.deliveryDelay?.delayedRecipients?.[0]?.emailAddress || eventData.mail?.destination?.[0] || null;
       } else {
-        eventType = sesType.toLowerCase();
         recipientEmail = eventData.mail?.destination?.[0] || null;
       }
     }
@@ -264,21 +283,7 @@ export async function POST(req: NextRequest) {
     }
 
     const email = normalizeEmail(recipientEmail);
-
-    // Standardize event type with explicit allowlist (never default to "delivered"!)
-    const lowerEventType = eventType.toLowerCase();
-    const standardizedType: "delivered" | "bounce" | "complaint" | "click" | "open" | "unknown" =
-      lowerEventType.includes("bounce")
-        ? "bounce"
-        : lowerEventType.includes("complain")
-        ? "complaint"
-        : lowerEventType.includes("click")
-        ? "click"
-        : lowerEventType.includes("open")
-        ? "open"
-        : lowerEventType.includes("deliver")
-        ? "delivered"
-        : "unknown";
+    const standardizedType = normalizeWebhookEventType(rawEventType);
 
     // 4. ATOMIC TRANSACTION: Event logging, suppression updates, and campaign recipient reconciliation
     // Wrapping in a single ACID transaction ensures that if suppression or status updates fail,
@@ -350,49 +355,15 @@ export async function POST(req: NextRequest) {
               campaignId: campaignRecipients.campaignId,
             });
 
-          // If a recipient transitioned to delivered, reconcile the parent campaign's final delivery metrics
           if (updatedRows.length > 0) {
-            const targetCampaignId = campaignIdTag || updatedRows[0].campaignId;
+            const targetCampaignId = updatedRows[0].campaignId || campaignIdTag;
             if (targetCampaignId) {
-              const allRecipients = await tx
-                .select({ status: campaignRecipients.status })
-                .from(campaignRecipients)
-                .where(eq(campaignRecipients.campaignId, targetCampaignId));
-
-              if (allRecipients.length > 0) {
-                const total = allRecipients.length;
-                const sent = allRecipients.filter((r) => r.status === "sent" || r.status === "delivered").length;
-                const failed = allRecipients.filter(
-                  (r) => r.status === "failed" || r.status === "bounced" || r.status === "needs_review"
-                ).length;
-
-                let finalCampaignStatus: "sent" | "partially_failed" | "failed" = "sent";
-                if (failed > 0 && sent > 0) {
-                  finalCampaignStatus = "partially_failed";
-                } else if (failed > 0 && sent === 0) {
-                  finalCampaignStatus = "failed";
-                }
-
-                await tx
-                  .update(campaigns)
-                  .set({
-                    successfulSends: sent,
-                    failedSends: failed,
-                    status: finalCampaignStatus,
-                    updatedAt: new Date(),
-                  })
-                  .where(
-                    and(
-                      eq(campaigns.id, targetCampaignId),
-                      sql`${campaigns.status} IN ('sent', 'partially_failed', 'failed')`
-                    )
-                  );
-              }
+              await reconcileCampaignMetrics(tx, targetCampaignId);
             }
           }
         } else if (standardizedType === "bounce") {
           // Bounce transitions any non-bounced state to bounced
-          await tx
+          const updatedRows = await tx
             .update(campaignRecipients)
             .set({
               status: "bounced",
@@ -404,10 +375,21 @@ export async function POST(req: NextRequest) {
                 targetCondition,
                 sql`${campaignRecipients.status} != 'bounced'`
               )
-            );
+            )
+            .returning({
+              id: campaignRecipients.id,
+              campaignId: campaignRecipients.campaignId,
+            });
+
+          if (updatedRows.length > 0) {
+            const targetCampaignId = updatedRows[0].campaignId || campaignIdTag;
+            if (targetCampaignId) {
+              await reconcileCampaignMetrics(tx, targetCampaignId);
+            }
+          }
         } else if (standardizedType === "complaint") {
           // Complaint transitions to failed
-          await tx
+          const updatedRows = await tx
             .update(campaignRecipients)
             .set({
               status: "failed",
@@ -419,10 +401,50 @@ export async function POST(req: NextRequest) {
                 targetCondition,
                 sql`${campaignRecipients.status} != 'failed'`
               )
-            );
+            )
+            .returning({
+              id: campaignRecipients.id,
+              campaignId: campaignRecipients.campaignId,
+            });
+
+          if (updatedRows.length > 0) {
+            const targetCampaignId = updatedRows[0].campaignId || campaignIdTag;
+            if (targetCampaignId) {
+              await reconcileCampaignMetrics(tx, targetCampaignId);
+            }
+          }
+        } else if (standardizedType === "failed") {
+          // Terminal provider failure (e.g. Reject, Rendering Failure, email.failed, email.suppressed)
+          const updatedRows = await tx
+            .update(campaignRecipients)
+            .set({
+              status: "failed",
+              errorMessage: `Provider terminal failure (${rawEventType})`,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                targetCondition,
+                sql`${campaignRecipients.status} != 'failed'`
+              )
+            )
+            .returning({
+              id: campaignRecipients.id,
+              campaignId: campaignRecipients.campaignId,
+            });
+
+          if (updatedRows.length > 0) {
+            const targetCampaignId = updatedRows[0].campaignId || campaignIdTag;
+            if (targetCampaignId) {
+              await reconcileCampaignMetrics(tx, targetCampaignId);
+            }
+          }
+        } else if (standardizedType === "delivery_delayed") {
+          // Non-terminal telemetry event: Do NOT mark delivered or terminal!
+          console.log(`[Webhook Telemetry] Recorded delivery delay for ${email} (MessageId: ${providerMessageId})`);
         } else if (standardizedType === "open" || standardizedType === "click") {
           // Open or click confirms receipt without overriding terminal bounce/failed status
-          await tx
+          const updatedRows = await tx
             .update(campaignRecipients)
             .set({
               status: "delivered",
@@ -434,7 +456,18 @@ export async function POST(req: NextRequest) {
                 targetCondition,
                 sql`${campaignRecipients.status} IN ('queued', 'processing', 'sent', 'unknown_outcome', 'needs_review')`
               )
-            );
+            )
+            .returning({
+              id: campaignRecipients.id,
+              campaignId: campaignRecipients.campaignId,
+            });
+
+          if (updatedRows.length > 0) {
+            const targetCampaignId = updatedRows[0].campaignId || campaignIdTag;
+            if (targetCampaignId) {
+              await reconcileCampaignMetrics(tx, targetCampaignId);
+            }
+          }
         }
       }
 
@@ -489,9 +522,9 @@ export async function POST(req: NextRequest) {
     }
 
     if (standardizedType === "unknown") {
-      console.warn(`[Webhook] Recorded unclassified or unknown event type '${eventType}' for ${email}`);
+      console.warn(`[Webhook] Recorded unclassified or unknown event type '${rawEventType}' for ${email}`);
       return NextResponse.json(
-        { received: true, unhandledType: eventType, note: "Unknown event type recorded without state modification" },
+        { received: true, unhandledType: rawEventType, note: "Unknown event type recorded without state modification" },
         { status: 200 }
       );
     }
@@ -502,3 +535,4 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Webhook processing failure" }, { status: 500 });
   }
 }
+

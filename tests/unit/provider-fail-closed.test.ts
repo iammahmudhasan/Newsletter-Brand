@@ -5,6 +5,7 @@ import { getEmailProvider } from "@ai-signal/email";
 describe("Email Provider Fail-Closed Security Rules", () => {
   const baseValidProductionEnv: NodeJS.ProcessEnv = {
     NODE_ENV: "production",
+    APP_URL: "https://aisignal.dev",
     AUTH_SECRET: "a-valid-production-auth-secret-with-over-32-chars-long!",
     ADMIN_PASSWORD: "SuperSecureProductionAdminPassword2026!#",
     DATABASE_URL: "postgres://user:pass@remote-rds-cluster.amazonaws.com:5432/ai_signal",

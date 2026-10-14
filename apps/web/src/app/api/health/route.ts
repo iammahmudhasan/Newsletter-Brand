@@ -52,19 +52,28 @@ export async function GET(req: NextRequest) {
         delivered: sql<number>`count(*) filter (where event_type = 'delivered')`,
         bounces: sql<number>`count(*) filter (where event_type = 'bounce')`,
         complaints: sql<number>`count(*) filter (where event_type = 'complaint')`,
+        failed: sql<number>`count(*) filter (where event_type = 'failed')`,
       })
       .from(emailEvents);
 
-    const totalSends = Number(telemetry?.delivered || 0) + Number(telemetry?.bounces || 0);
-    const bounceRate = totalSends > 0 ? (Number(telemetry?.bounces || 0) / totalSends) * 100 : 0;
-    const complaintRate = totalSends > 0 ? (Number(telemetry?.complaints || 0) / totalSends) * 100 : 0;
+    const deliveredCount = Number(telemetry?.delivered || 0);
+    const bounceCount = Number(telemetry?.bounces || 0);
+    const complaintCount = Number(telemetry?.complaints || 0);
+    const failedCount = Number(telemetry?.failed || 0);
 
-    // Evaluate deliverability health thresholds
-    if (bounceRate > 0.3) {
-      alerts.push(`High bounce rate warning: ${bounceRate.toFixed(2)}% (Target: <0.2%)`);
+    // Total delivery outcome events represent the denominator for rates
+    const totalOutcomes = deliveredCount + bounceCount + complaintCount + failedCount;
+    const bounceRatio = totalOutcomes > 0 ? bounceCount / totalOutcomes : 0;
+    const complaintRatio = totalOutcomes > 0 ? complaintCount / totalOutcomes : 0;
+
+    // Evaluate deliverability health thresholds:
+    // Industry target for bounces: < 0.2% (decimal ratio: 0.002)
+    // Google / Yahoo mailbox complaint limit: < 0.1% (decimal ratio: 0.001)
+    if (bounceRatio > 0.002) {
+      alerts.push(`High bounce rate warning: ${(bounceRatio * 100).toFixed(2)}% (Target: <0.20%)`);
     }
-    if (complaintRate > 0.05) {
-      alerts.push(`Critical spam complaint warning: ${complaintRate.toFixed(3)}% (Google limit: <0.1%)`);
+    if (complaintRatio > 0.001) {
+      alerts.push(`Critical spam complaint warning: ${(complaintRatio * 100).toFixed(3)}% (Google limit: <0.10%)`);
     }
     if (Number(queueStats?.failed || 0) > 5) {
       alerts.push(`Queue warning: ${queueStats?.failed} failed jobs in queue`);
@@ -86,9 +95,9 @@ export async function GET(req: NextRequest) {
         failedJobs: Number(queueStats?.failed || 0),
       },
       deliverability: {
-        deliveredCount: Number(telemetry?.delivered || 0),
-        bounceRate: `${bounceRate.toFixed(2)}%`,
-        complaintRate: `${complaintRate.toFixed(3)}%`,
+        deliveredCount,
+        bounceRate: `${(bounceRatio * 100).toFixed(2)}%`,
+        complaintRate: `${(complaintRatio * 100).toFixed(3)}%`,
       },
       alerts,
     });

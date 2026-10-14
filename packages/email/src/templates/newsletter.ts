@@ -4,11 +4,38 @@ export interface NewsletterIssueProps {
   title: string;
   previewText: string;
   htmlContent: string;
+  contentPlain?: string;
   recipientEmail: string;
   unsubscribeWebUrl?: string;
   unsubscribeApiUrl?: string;
   unsubscribeUrl?: string; // fallback
   archiveUrl: string;
+}
+
+/**
+ * Strips HTML formatting into clean, accessible plain-text
+ */
+function htmlToPlainText(html: string): string {
+  if (!html) return "";
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<a\s+(?:[^>]*?\s+)?href="([^"]*)"[^>]*>(.*?)<\/a>/gi, "$2 ($1)")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<\/h[1-6]>/gi, "\n\n")
+    .replace(/<li>/gi, "• ")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 export function renderNewsletterEmail(props: NewsletterIssueProps): {
@@ -22,6 +49,7 @@ export function renderNewsletterEmail(props: NewsletterIssueProps): {
     title,
     previewText,
     htmlContent,
+    contentPlain,
     recipientEmail,
     unsubscribeWebUrl,
     unsubscribeApiUrl,
@@ -41,6 +69,8 @@ export function renderNewsletterEmail(props: NewsletterIssueProps): {
     "X-Auto-Response-Suppress": "OOF, AutoReply",
   };
 
+  const plainBody = contentPlain?.trim() || htmlToPlainText(htmlContent);
+
   const text = `
 AI SIGNAL · Issue #${issueNumber}
 ${title}
@@ -48,6 +78,9 @@ Date: ${issueDate}
 Archive: ${archiveUrl}
 
 ${previewText}
+
+------------------------------------------------------------
+${plainBody}
 
 ------------------------------------------------------------
 Read the full interactive issue with code samples and graphics:

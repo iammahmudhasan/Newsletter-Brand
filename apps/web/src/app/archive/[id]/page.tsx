@@ -12,25 +12,25 @@ export default async function IssueDetailPage({
 }) {
   const { id } = await params;
 
-  let issueTitle = "Frontier Reasoning, Test-Time Compute & Synthetic Data Loops";
-  let issueDate = "October 10, 2026";
-  let issueNumber = 1;
-  let htmlContent = "";
-
+  let campaign: any = null;
   try {
-    const [campaign] = await db
+    const [found] = await db
       .select()
       .from(campaigns)
       .where(eq(campaigns.id, id));
-
-    if (campaign) {
-      issueTitle = campaign.title;
-      issueDate = campaign.sentAt ? new Date(campaign.sentAt).toLocaleDateString() : "Recent";
-      htmlContent = campaign.contentHtml;
-    }
+    campaign = found;
   } catch {
-    // Dev fallback
+    notFound();
   }
+
+  if (!campaign) {
+    notFound();
+  }
+
+  const issueTitle = campaign.title;
+  const issueDate = campaign.sentAt ? new Date(campaign.sentAt).toLocaleDateString() : "Recent";
+  const issueNumber = campaign.issueNumber || 1;
+  const htmlContent = campaign.contentHtml;
 
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-6 py-14">

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, subscribers, consentEvents, suppressions, eq, and } from "@ai-signal/db";
+import { db, subscribers, consentEvents, suppressions, emailEvents, automationJobs, eq, and, sql } from "@ai-signal/db";
 import { verifySignedToken, normalizeEmail } from "@ai-signal/config";
 
 // GDPR Data Export (Right of Access) - strictly requires 'data_export' purpose token
@@ -97,18 +97,37 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1. Delete subscriber record (cascades to campaign_recipients & consent_events)
-    await db.delete(subscribers).where(eq(subscribers.id, subscriberId));
+    // ATOMIC GDPR DELETION TRANSACTION:
+    // 1. Purge all telemetry and webhook event payloads containing personal email
+    // 2. Cancel/purge any pending or completed automation jobs in queue table
+    // 3. Delete subscriber (cascades to campaign_recipients & consent_events)
+    // 4. Record suppression entry in same transaction to prevent future re-signup/bombing
+    await db.transaction(async (tx) => {
+      // 1. Purge webhook event logs and payloads containing recipient email
+      await tx
+        .delete(emailEvents)
+        .where(eq(emailEvents.recipientEmail, normalizedEmail));
 
-    // 2. Add email to suppressions to guarantee they are never contacted again
-    await db
-      .insert(suppressions)
-      .values({
-        email: normalizedEmail,
-        reason: "manual_unsubscribe",
-        details: "GDPR Right to Be Forgotten validated deletion request",
-      })
-      .onConflictDoNothing();
+      // 2. Cancel and scrub queued automation jobs (confirmation, welcome)
+      await tx
+        .delete(automationJobs)
+        .where(
+          sql`payload->>'subscriberId' = ${subscriberId} OR payload->>'email' = ${normalizedEmail}`
+        );
+
+      // 3. Delete subscriber record (cascades to campaign_recipients & consent_events)
+      await tx.delete(subscribers).where(eq(subscribers.id, subscriberId));
+
+      // 4. Add email to suppressions to guarantee they are never contacted again
+      await tx
+        .insert(suppressions)
+        .values({
+          email: normalizedEmail,
+          reason: "manual_unsubscribe",
+          details: "GDPR Right to Be Forgotten validated deletion request",
+        })
+        .onConflictDoNothing();
+    });
 
     return NextResponse.json({
       success: true,
@@ -118,3 +137,4 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Failed to process deletion" }, { status: 500 });
   }
 }
+

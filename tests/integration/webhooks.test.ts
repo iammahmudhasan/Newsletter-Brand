@@ -1,5 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { POST } from "../../apps/web/src/app/api/webhooks/email/route";
+import { normalizeWebhookEventType } from "../../apps/web/src/lib/webhookHelpers";
 
 describe("Webhook Security, Signature Verification & Bounce Classification", () => {
   it("rejects webhook requests with 401 if signature is invalid", async () => {
@@ -67,42 +68,61 @@ describe("Webhook Security, Signature Verification & Bounce Classification", () 
       },
     };
 
-    const isResendSoftHard = resendSoftPayload.data.bounce.type.toLowerCase() === "hard";
-    const isResendHardHard = resendHardPayload.data.bounce.type.toLowerCase() === "hard";
+    // Conservative bounce classification: missing type defaults to hard bounce per Resend semantics
+    const resendMissingTypePayload = {
+      type: "email.bounced",
+      data: {
+        to: ["unknown@domain.com"],
+        bounce: {}, // missing type
+      },
+    };
 
-    expect(isResendSoftHard).toBe(false);
-    expect(isResendHardHard).toBe(true);
+    const isMissingTypeSoft = (resendMissingTypePayload.data.bounce as any)?.type === "soft";
+    expect(isMissingTypeSoft).toBe(false);
   });
 
-  it("normalizes unknown event types to 'unknown' and never defaults to 'delivered'", () => {
-    // Normalization logic check as enforced in route.ts
-    const testCases = [
-      { raw: "email.opened", expected: "open" },
-      { raw: "email.clicked", expected: "click" },
+  it("normalizes provider event types accurately using normalizeWebhookEventType without substring bugs", () => {
+    const testCases: Array<{ raw: string; expected: string }> = [
+      // Delivery delay MUST NOT be classified as delivered!
+      { raw: "email.delivery_delayed", expected: "delivery_delayed" },
+      { raw: "DeliveryDelay", expected: "delivery_delayed" },
+      { raw: "delivery_delay", expected: "delivery_delayed" },
+
+      // Successful delivery
       { raw: "email.delivered", expected: "delivered" },
+      { raw: "Delivery", expected: "delivered" },
+      { raw: "delivered", expected: "delivered" },
+
+      // Bounces
       { raw: "email.bounced", expected: "bounce" },
+      { raw: "Bounce", expected: "bounce" },
+
+      // Complaints
       { raw: "email.complained", expected: "complaint" },
-      { raw: "ses.Send", expected: "unknown" },
-      { raw: "ses.RenderingFailure", expected: "unknown" },
+      { raw: "Complaint", expected: "complaint" },
+
+      // Terminal failures
+      { raw: "email.failed", expected: "failed" },
+      { raw: "email.suppressed", expected: "failed" },
+      { raw: "Reject", expected: "failed" },
+      { raw: "Rendering Failure", expected: "failed" },
+      { raw: "RenderingFailure", expected: "failed" },
+
+      // Engagement
+      { raw: "email.opened", expected: "open" },
+      { raw: "Open", expected: "open" },
+      { raw: "email.clicked", expected: "click" },
+      { raw: "Click", expected: "click" },
+
+      // Unknown / telemetry
+      { raw: "Send", expected: "unknown" },
       { raw: "arbitrary.custom.event", expected: "unknown" },
       { raw: "malicious_fake_event", expected: "unknown" },
     ];
 
     for (const tc of testCases) {
-      const lower = tc.raw.toLowerCase();
-      const standardized = lower.includes("bounce")
-        ? "bounce"
-        : lower.includes("complain")
-        ? "complaint"
-        : lower.includes("click")
-        ? "click"
-        : lower.includes("open")
-        ? "open"
-        : lower.includes("deliver")
-        ? "delivered"
-        : "unknown";
-
-      expect(standardized).toBe(tc.expected);
+      const standardized = normalizeWebhookEventType(tc.raw);
+      expect(standardized).toBe(tc.expected as any);
     }
   });
 

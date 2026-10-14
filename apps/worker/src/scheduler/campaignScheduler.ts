@@ -74,8 +74,10 @@ export async function runCampaignScheduler(): Promise<number> {
             SELECT 1 FROM automation_jobs j
             WHERE j.job_name = 'process_campaign'
               AND (j.payload->>'campaignId' = c.id::text)
-              AND j.status = 'processing'
-              AND j.locked_at > NOW() - INTERVAL '10 minutes'
+              AND (
+                (j.status = 'processing' AND j.locked_at > NOW() - INTERVAL '10 minutes')
+                OR (j.status = 'pending')
+              )
           )
         LIMIT 5;
       `

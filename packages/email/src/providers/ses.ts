@@ -65,6 +65,7 @@ export class SesEmailProvider implements EmailProvider {
 
       const command = new SendEmailCommand({
         FromEmailAddress: from,
+        ConfigurationSetName: config.email.aws.configurationSetName || undefined,
         Destination: {
           ToAddresses: Array.isArray(options.to) ? options.to : [options.to],
         },

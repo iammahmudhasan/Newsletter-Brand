@@ -1,5 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { POST } from "../../apps/web/src/app/api/webhooks/email/route";
+import { normalizeWebhookEventType } from "../../apps/web/src/lib/webhookHelpers";
 
 describe("Webhook Atomic Transaction & Delivery State Machine", () => {
   it("rejects malformed JSON payloads gracefully with HTTP 400", async () => {
@@ -33,40 +34,41 @@ describe("Webhook Atomic Transaction & Delivery State Machine", () => {
     expect(data.note).toContain("No recipient detected");
   });
 
-  it("handles Resend and SES event normalization accurately", () => {
+  it("handles Resend and SES event normalization accurately without false deliver matches", () => {
     const types = [
       "email.delivered",
       "Delivery",
+      "email.delivery_delayed",
+      "DeliveryDelay",
       "email.bounced",
       "Bounce",
       "email.complained",
       "Complaint",
+      "email.failed",
+      "email.suppressed",
+      "Reject",
+      "Rendering Failure",
+      "RenderingFailure",
       "email.clicked",
       "email.opened",
       "custom.other",
     ];
-    const normalized = types.map((t) => {
-      const lower = t.toLowerCase();
-      return lower.includes("bounce")
-        ? "bounce"
-        : lower.includes("complain")
-        ? "complaint"
-        : lower.includes("click")
-        ? "click"
-        : lower.includes("open")
-        ? "open"
-        : lower.includes("deliver")
-        ? "delivered"
-        : "unknown";
-    });
+    const normalized = types.map((t) => normalizeWebhookEventType(t));
 
     expect(normalized).toEqual([
       "delivered",
       "delivered",
+      "delivery_delayed",
+      "delivery_delayed",
       "bounce",
       "bounce",
       "complaint",
       "complaint",
+      "failed",
+      "failed",
+      "failed",
+      "failed",
+      "failed",
       "click",
       "open",
       "unknown",

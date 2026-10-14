@@ -76,33 +76,38 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Atomic update to prevent race conditions
-    const updated = await db
-      .update(subscribers)
-      .set({
-        status: "active",
-        confirmedAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(subscribers.id, subscriberId),
-          eq(subscribers.status, "pending_confirmation")
+    // Transactional Outbox: Both subscriber activation and welcome job enqueue occur in the exact same transaction
+    await db.transaction(async (tx) => {
+      const updated = await tx
+        .update(subscribers)
+        .set({
+          status: "active",
+          confirmedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(subscribers.id, subscriberId),
+            eq(subscribers.status, "pending_confirmation")
+          )
         )
-      )
-      .returning({ id: subscribers.id });
+        .returning({ id: subscribers.id });
 
-    if (updated.length > 0) {
-      // Queue welcome email sequence
-      try {
-        await enqueueJob("send_welcome", {
-          subscriberId,
-          email: normalizedEmail,
-        });
-      } catch (queueErr: any) {
-        console.warn("[Confirm API] Warning: welcome job enqueue failed:", queueErr.message);
+      if (updated.length > 0) {
+        // Atomically queue welcome email sequence inside tx using Transactional Outbox
+        await enqueueJob(
+          "send_welcome",
+          {
+            subscriberId,
+            email: normalizedEmail,
+          },
+          {
+            idempotencyKey: `welcome:${subscriberId}`,
+          },
+          tx
+        );
       }
-    }
+    });
 
     return NextResponse.json({
       success: true,

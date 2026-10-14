@@ -80,6 +80,8 @@ export const campaigns = pgTable(
     scheduledAt: timestamp("scheduled_at"),
     firstDispatchAt: timestamp("first_dispatch_at"),
     sentAt: timestamp("sent_at"),
+    issueNumber: integer("issue_number"),
+    idempotencyKey: text("idempotency_key"),
     totalRecipients: integer("total_recipients").default(0),
     successfulSends: integer("successful_sends").default(0),
     failedSends: integer("failed_sends").default(0),
@@ -87,6 +89,7 @@ export const campaigns = pgTable(
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
   (table) => [
+    uniqueIndex("campaigns_idempotency_key_idx").on(table.idempotencyKey),
     index("campaigns_status_idx").on(table.status),
     index("campaigns_scheduled_idx").on(table.scheduledAt),
   ]
@@ -110,6 +113,7 @@ export const campaignRecipients = pgTable(
     })
       .notNull()
       .default("queued"),
+    claimToken: text("claim_token"),
     attemptCount: integer("attempt_count").default(0).notNull(),
     lastAttemptAt: timestamp("last_attempt_at"),
     nextAttemptAt: timestamp("next_attempt_at"),
@@ -140,7 +144,7 @@ export const emailEvents = pgTable(
     recipientId: uuid("recipient_id").references(() => campaignRecipients.id, { onDelete: "set null" }),
     recipientEmail: text("recipient_email").notNull(),
     eventType: text("event_type", {
-      enum: ["delivered", "bounce", "complaint", "click", "open", "unknown"],
+      enum: ["delivered", "delivery_delayed", "bounce", "complaint", "failed", "click", "open", "unknown"],
     }).notNull(),
     payload: jsonb("payload").$type<Record<string, any>>(),
     createdAt: timestamp("created_at").notNull().defaultNow(),

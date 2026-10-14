@@ -2,10 +2,30 @@ import { NextRequest, NextResponse } from "next/server";
 import { db, subscribers, eq } from "@ai-signal/db";
 import { normalizeEmail, generateSignedToken, config, TokenPurpose } from "@ai-signal/config";
 import { getEmailProvider } from "@ai-signal/email";
+import { checkRateLimit, checkEmailCooldown, getClientIp } from "@/lib/rateLimit";
+
+const MAX_BODY_BYTES = 16384; // 16KB
 
 export async function POST(req: NextRequest) {
   try {
-    const { email, purpose } = await req.json();
+    let body: any;
+    if (typeof req.text === "function") {
+      const rawBody = await req.text();
+      if (rawBody.length > MAX_BODY_BYTES) {
+        return NextResponse.json({ error: "Payload too large. Maximum size is 16KB." }, { status: 413 });
+      }
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        return NextResponse.json({ error: "Malformed JSON payload" }, { status: 400 });
+      }
+    } else if (typeof req.json === "function") {
+      body = await req.json();
+    } else {
+      return NextResponse.json({ error: "Invalid request payload" }, { status: 400 });
+    }
+
+    const { email, purpose } = body;
 
     if (!email || typeof email !== "string") {
       return NextResponse.json({ error: "A valid email address is required" }, { status: 400 });
@@ -18,7 +38,28 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const clientIp = getClientIp(req);
     const normalized = normalizeEmail(email);
+
+    // 1. Rate limiting by IP (max 5 privacy requests per 15 minutes per IP)
+    const ipRateLimit = checkRateLimit(`gdpr:ip:${clientIp}`, 5, 900);
+    if (!ipRateLimit.allowed) {
+      return NextResponse.json(
+        { error: "Too many privacy requests. Please wait a few minutes before trying again." },
+        { status: 429, headers: { "Retry-After": String(ipRateLimit.retryAfterSeconds || 60) } }
+      );
+    }
+
+    // 2. Cooldown per email address (max 1 request per 10 minutes per email to avoid email bombing)
+    const emailCooldown = checkEmailCooldown(`gdpr:email:${normalized}`, 600);
+    if (!emailCooldown.allowed) {
+      // Privacy-preserving response: Do not leak whether the account exists or failed cooldown
+      return NextResponse.json({
+        success: true,
+        message:
+          "If an account is associated with this email, a verification link has been sent to your inbox.",
+      });
+    }
 
     // Look up subscriber
     const [sub] = await db

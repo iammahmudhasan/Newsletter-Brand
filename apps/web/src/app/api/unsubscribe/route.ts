@@ -60,24 +60,27 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1. Update subscriber status
-    await db
-      .update(subscribers)
-      .set({
-        status: "unsubscribed",
-        updatedAt: new Date(),
-      })
-      .where(eq(subscribers.id, subscriberId));
+    // ATOMIC TRANSACTION: Both subscriber status and suppression row must succeed or rollback together
+    await db.transaction(async (tx) => {
+      // 1. Update subscriber status
+      await tx
+        .update(subscribers)
+        .set({
+          status: "unsubscribed",
+          updatedAt: new Date(),
+        })
+        .where(eq(subscribers.id, subscriberId));
 
-    // 2. Add to suppressions
-    await db
-      .insert(suppressions)
-      .values({
-        email: normalizedTokenEmail,
-        reason: "manual_unsubscribe",
-        details: "Validated POST unsubscribe request (RFC 8058 or web form)",
-      })
-      .onConflictDoNothing();
+      // 2. Add to suppressions
+      await tx
+        .insert(suppressions)
+        .values({
+          email: normalizedTokenEmail,
+          reason: "manual_unsubscribe",
+          details: "Validated POST unsubscribe request (RFC 8058 or web form)",
+        })
+        .onConflictDoNothing();
+    });
 
     return NextResponse.json(
       {

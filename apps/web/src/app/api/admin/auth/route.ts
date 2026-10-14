@@ -7,6 +7,7 @@ import {
   SESSION_COOKIE_NAME,
   SESSION_MAX_AGE_SECONDS,
 } from "@/lib/auth";
+import { getClientIp } from "@/lib/rateLimit";
 
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOCKOUT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
@@ -19,54 +20,43 @@ interface FallbackRecord {
 const fallbackRateLimits = new Map<string, FallbackRecord>();
 
 /**
- * Extracts verified client IP address from trusted headers or fallback
+ * Atomically checks and reserves a login attempt in a single database transaction / query.
+ * Eliminates race conditions where concurrent requests could bypass the lockout threshold.
  */
-function getClientIp(req: NextRequest): string {
-  // 1. Next.js / Edge runtime trusted client IP
-  const nextIp = (req as any).ip;
-  if (nextIp && typeof nextIp === "string") return nextIp.trim();
-
-  // 2. Cloudflare trusted client IP
-  const cfIp = req.headers.get("cf-connecting-ip");
-  if (cfIp) return cfIp.trim();
-
-  // 3. X-Real-IP from trusted reverse proxy
-  const realIp = req.headers.get("x-real-ip");
-  if (realIp) return realIp.trim();
-
-  // 4. Standard X-Forwarded-For (client is leftmost entry)
-  const forwarded = req.headers.get("x-forwarded-for");
-  if (forwarded) return forwarded.split(",")[0].trim();
-
-  return "127.0.0.1";
-}
-
-/**
- * Checks login rate limit using PostgreSQL for distributed environments with fail-closed production policy
- */
-async function checkDistributedRateLimit(
+async function reserveLoginAttempt(
   ipHash: string
 ): Promise<{ allowed: boolean; retryAfterSeconds?: number }> {
   const now = Date.now();
 
   try {
-    const [record] = await db
-      .select()
-      .from(adminLoginAttempts)
-      .where(eq(adminLoginAttempts.ipHash, ipHash));
+    const result = await db.execute<typeof adminLoginAttempts.$inferSelect>(sql`
+      INSERT INTO admin_login_attempts (ip_hash, attempts, locked_until, updated_at)
+      VALUES (${ipHash}, 1, NULL, NOW())
+      ON CONFLICT (ip_hash) DO UPDATE
+      SET
+        attempts = CASE
+          WHEN admin_login_attempts.locked_until > NOW() THEN admin_login_attempts.attempts
+          WHEN admin_login_attempts.updated_at < NOW() - INTERVAL '15 minutes' THEN 1
+          ELSE admin_login_attempts.attempts + 1
+        END,
+        locked_until = CASE
+          WHEN admin_login_attempts.locked_until > NOW() THEN admin_login_attempts.locked_until
+          WHEN (CASE WHEN admin_login_attempts.updated_at < NOW() - INTERVAL '15 minutes' THEN 1 ELSE admin_login_attempts.attempts + 1 END) >= ${MAX_LOGIN_ATTEMPTS}
+          THEN NOW() + INTERVAL '15 minutes'
+          ELSE NULL
+        END,
+        updated_at = NOW()
+      RETURNING attempts, locked_until;
+    `);
 
+    const record = (result as any)?.[0];
     if (record) {
-      if (record.lockedUntil && record.lockedUntil.getTime() > now) {
-        const retryAfter = Math.ceil((record.lockedUntil.getTime() - now) / 1000);
-        return { allowed: false, retryAfterSeconds: retryAfter };
+      if (record.locked_until && new Date(record.locked_until).getTime() > now) {
+        const retryAfter = Math.ceil((new Date(record.locked_until).getTime() - now) / 1000);
+        return { allowed: false, retryAfterSeconds: Math.max(1, retryAfter) };
       }
-
-      if (record.attempts >= MAX_LOGIN_ATTEMPTS) {
-        const windowExpires = record.updatedAt.getTime() + LOCKOUT_WINDOW_MS;
-        if (now < windowExpires) {
-          const retryAfter = Math.ceil((windowExpires - now) / 1000);
-          return { allowed: false, retryAfterSeconds: retryAfter };
-        }
+      if (record.attempts > MAX_LOGIN_ATTEMPTS) {
+        return { allowed: false, retryAfterSeconds: 900 };
       }
     }
 
@@ -74,52 +64,21 @@ async function checkDistributedRateLimit(
   } catch (err: any) {
     if (process.env.NODE_ENV === "production") {
       console.error("[RateLimit Production Fail-Closed]: Database error checking rate limits:", err.message);
-      // In production, fail-closed to prevent brute force bypass during database outage
       return { allowed: false, retryAfterSeconds: 60 };
     }
 
     console.warn("[RateLimit DB Error] Falling back to memory limiter in non-production:", err.message);
     const rec = fallbackRateLimits.get(ipHash);
-    if (rec && now < rec.resetAt && rec.attempts >= MAX_LOGIN_ATTEMPTS) {
+    if (!rec || now > rec.resetAt) {
+      fallbackRateLimits.set(ipHash, { attempts: 1, resetAt: now + LOCKOUT_WINDOW_MS });
+      return { allowed: true };
+    }
+
+    rec.attempts += 1;
+    if (rec.attempts > MAX_LOGIN_ATTEMPTS) {
       return { allowed: false, retryAfterSeconds: Math.ceil((rec.resetAt - now) / 1000) };
     }
     return { allowed: true };
-  }
-}
-
-/**
- * Records a failed login attempt in PostgreSQL atomically using ON CONFLICT DO UPDATE
- * Completely prevents race conditions across concurrent requests.
- */
-async function recordFailedAttempt(ipHash: string): Promise<void> {
-  try {
-    await db.execute(sql`
-      INSERT INTO admin_login_attempts (ip_hash, attempts, locked_until, updated_at)
-      VALUES (${ipHash}, 1, NULL, NOW())
-      ON CONFLICT (ip_hash) DO UPDATE
-      SET
-        attempts = CASE
-          WHEN admin_login_attempts.updated_at < NOW() - INTERVAL '15 minutes' THEN 1
-          ELSE admin_login_attempts.attempts + 1
-        END,
-        locked_until = CASE
-          WHEN (CASE WHEN admin_login_attempts.updated_at < NOW() - INTERVAL '15 minutes' THEN 1 ELSE admin_login_attempts.attempts + 1 END) >= ${MAX_LOGIN_ATTEMPTS}
-          THEN NOW() + INTERVAL '15 minutes'
-          ELSE NULL
-        END,
-        updated_at = NOW();
-    `);
-  } catch (err: any) {
-    if (process.env.NODE_ENV === "production") {
-      console.error("[RateLimit Production Error] Failed to atomically record failed attempt in database:", err.message);
-    }
-    const rec = fallbackRateLimits.get(ipHash);
-    const nowMs = Date.now();
-    if (!rec || nowMs > rec.resetAt) {
-      fallbackRateLimits.set(ipHash, { attempts: 1, resetAt: nowMs + LOCKOUT_WINDOW_MS });
-    } else {
-      rec.attempts += 1;
-    }
   }
 }
 
@@ -167,8 +126,8 @@ export async function POST(req: NextRequest) {
     const rawIp = getClientIp(req);
     const ipHash = hashIp(rawIp);
 
-    // 4. Distributed rate limiting check
-    const rateLimit = await checkDistributedRateLimit(ipHash);
+    // 4. Atomic check & reservation of login attempt
+    const rateLimit = await reserveLoginAttempt(ipHash);
     if (!rateLimit.allowed) {
       return NextResponse.json(
         {
@@ -187,7 +146,6 @@ export async function POST(req: NextRequest) {
     const { password } = body;
 
     if (!password || typeof password !== "string" || !verifyAdminPassword(password)) {
-      await recordFailedAttempt(ipHash);
       return NextResponse.json({ error: "Invalid admin credentials" }, { status: 401 });
     }
 

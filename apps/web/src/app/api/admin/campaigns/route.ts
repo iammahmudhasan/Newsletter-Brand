@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, campaigns, eq } from "@ai-signal/db";
+import { db, campaigns, eq, sql } from "@ai-signal/db";
 import { enqueueJob } from "@ai-signal/queue";
 import { sanitizeNewsletterHtml } from "@ai-signal/email";
 import { isAuthorizedAdmin } from "@/lib/auth";
@@ -23,6 +23,28 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // 1. Request-level idempotency protection: Return existing campaign if key matches
+    const clientKey = req.headers.get("idempotency-key") || body.idempotencyKey || null;
+    if (clientKey) {
+      const [existing] = await db
+        .select()
+        .from(campaigns)
+        .where(eq(campaigns.idempotencyKey, clientKey));
+
+      if (existing) {
+        return NextResponse.json(
+          {
+            success: true,
+            campaignId: existing.id,
+            status: existing.status,
+            duplicate: true,
+            message: "Campaign already created with this idempotency key",
+          },
+          { status: 200 }
+        );
+      }
+    }
+
     // Server-side allowlist HTML sanitization to prevent persistent stored XSS
     const sanitizedHtml = sanitizeNewsletterHtml(contentHtml);
 
@@ -30,7 +52,13 @@ export async function POST(req: NextRequest) {
     const scheduleDate = scheduledAt ? new Date(scheduledAt) : new Date();
 
     // Transactional Outbox: Atomically persist campaign and outbox job in a single database transaction
-    const { campaignId, jobId } = await db.transaction(async (tx) => {
+    const { campaignId, jobId, issueNumber } = await db.transaction(async (tx) => {
+      // Dynamically sequence the issue number
+      const [maxIssue] = await tx
+        .select({ max: sql<number>`COALESCE(MAX(${campaigns.issueNumber}), 0)` })
+        .from(campaigns);
+      const nextIssueNumber = Number(maxIssue?.max || 0) + 1;
+
       const [inserted] = await tx
         .insert(campaigns)
         .values({
@@ -41,6 +69,8 @@ export async function POST(req: NextRequest) {
           contentPlain: contentPlain?.trim() || "",
           status: isImmediateSend ? "sending" : "scheduled",
           scheduledAt: scheduleDate,
+          issueNumber: nextIssueNumber,
+          idempotencyKey: clientKey || undefined,
         })
         .returning({ id: campaigns.id });
 
@@ -54,7 +84,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      return { campaignId: inserted.id, jobId: enqueuedJobId };
+      return { campaignId: inserted.id, jobId: enqueuedJobId, issueNumber: nextIssueNumber };
     });
 
     return NextResponse.json(

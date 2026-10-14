@@ -13,6 +13,7 @@ import {
 import { getEmailProvider, renderNewsletterEmail } from "@ai-signal/email";
 import { config, generateSignedToken, normalizeEmail } from "@ai-signal/config";
 import { enqueueJob, renewJobLease } from "@ai-signal/queue";
+import crypto from "crypto";
 
 export async function handleProcessCampaignBatch(
   payload: { campaignId: string },
@@ -193,11 +194,12 @@ export async function handleProcessCampaignBatch(
           }
         }
 
-        // Atomic Claim: Transition status to 'processing' with fresh lease timestamp
+        // Atomic Claim: Transition status to 'processing' with fresh lease timestamp and unique claimToken
+        const claimToken = crypto.randomUUID();
         const claimResult = await db.execute<typeof campaignRecipients.$inferSelect>(
           sql`
             UPDATE campaign_recipients
-            SET status = 'processing', updated_at = NOW()
+            SET status = 'processing', claim_token = ${claimToken}, updated_at = NOW()
             WHERE id = ${item.recipientId}
               AND (
                 (status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()))
@@ -229,7 +231,8 @@ export async function handleProcessCampaignBatch(
             .where(
               and(
                 eq(campaignRecipients.id, item.recipientId),
-                eq(campaignRecipients.status, "processing")
+                eq(campaignRecipients.status, "processing"),
+                eq(campaignRecipients.claimToken, claimToken)
               )
             );
           successCount++;
@@ -275,7 +278,8 @@ export async function handleProcessCampaignBatch(
               .where(
                 and(
                   eq(campaignRecipients.id, item.recipientId),
-                  eq(campaignRecipients.status, "processing")
+                  eq(campaignRecipients.status, "processing"),
+                  eq(campaignRecipients.claimToken, claimToken)
                 )
               );
 
@@ -307,7 +311,8 @@ export async function handleProcessCampaignBatch(
               .where(
                 and(
                   eq(campaignRecipients.id, item.recipientId),
-                  eq(campaignRecipients.status, "processing")
+                  eq(campaignRecipients.status, "processing"),
+                  eq(campaignRecipients.claimToken, claimToken)
                 )
               );
             failCount++;
@@ -331,7 +336,8 @@ export async function handleProcessCampaignBatch(
               .where(
                 and(
                   eq(campaignRecipients.id, item.recipientId),
-                  eq(campaignRecipients.status, "processing")
+                  eq(campaignRecipients.status, "processing"),
+                  eq(campaignRecipients.claimToken, claimToken)
                 )
               );
             failCount++;
@@ -363,11 +369,12 @@ export async function handleProcessCampaignBatch(
           });
 
           const { html, text, headers } = renderNewsletterEmail({
-            issueNumber: 1,
+            issueNumber: campaign.issueNumber || 1,
             issueDate,
             title: campaign.title,
             previewText: campaign.previewText || "",
             htmlContent: campaign.contentHtml,
+            contentPlain: campaign.contentPlain || undefined,
             recipientEmail: freshSub.email,
             unsubscribeWebUrl,
             unsubscribeApiUrl,
@@ -392,8 +399,8 @@ export async function handleProcessCampaignBatch(
 
           if (sendResult.success) {
             successCount++;
-            // Conditional state transition: Only set status = 'sent' if the recipient is still in 'processing'.
-            // If a fast webhook already marked it 'delivered' or 'bounced', do NOT overwrite/revert!
+            // Conditional state transition: Only set status = 'sent' if the recipient still matches this worker's claimToken!
+            // If lease expired or concurrent worker claimed, fail-closed without overwriting!
             const updateRes = await db
               .update(campaignRecipients)
               .set({
@@ -406,29 +413,15 @@ export async function handleProcessCampaignBatch(
               .where(
                 and(
                   eq(campaignRecipients.id, item.recipientId),
-                  eq(campaignRecipients.status, "processing")
+                  eq(campaignRecipients.status, "processing"),
+                  eq(campaignRecipients.claimToken, claimToken)
                 )
               )
               .returning({ id: campaignRecipients.id });
 
             if (updateRes.length === 0) {
-              // Recipient was already transitioned by concurrent webhook (e.g., delivered or bounced).
-              // Populate providerMessageId if missing without reverting the status:
-              await db
-                .update(campaignRecipients)
-                .set({
-                  providerMessageId: sendResult.messageId,
-                  sentAt: new Date(),
-                  updatedAt: new Date(),
-                })
-                .where(
-                  and(
-                    eq(campaignRecipients.id, item.recipientId),
-                    sql`${campaignRecipients.providerMessageId} IS NULL`
-                  )
-                );
-              console.log(
-                `[Worker Concurrency] Recipient ${item.recipientId} was already updated by concurrent webhook. Preserving advanced status.`
+              console.warn(
+                `[Worker Fencing] Recipient ${item.recipientId} claim token mismatch or lease expired. Discarding update.`
               );
             }
           } else {
@@ -459,7 +452,8 @@ export async function handleProcessCampaignBatch(
                   .where(
                     and(
                       eq(campaignRecipients.id, item.recipientId),
-                      eq(campaignRecipients.status, "processing")
+                      eq(campaignRecipients.status, "processing"),
+                      eq(campaignRecipients.claimToken, claimToken)
                     )
                   );
                 failCount++;
@@ -485,7 +479,8 @@ export async function handleProcessCampaignBatch(
                   .where(
                     and(
                       eq(campaignRecipients.id, item.recipientId),
-                      eq(campaignRecipients.status, "processing")
+                      eq(campaignRecipients.status, "processing"),
+                      eq(campaignRecipients.claimToken, claimToken)
                     )
                   );
               }
@@ -510,7 +505,8 @@ export async function handleProcessCampaignBatch(
                 .where(
                   and(
                     eq(campaignRecipients.id, item.recipientId),
-                    eq(campaignRecipients.status, "processing")
+                    eq(campaignRecipients.status, "processing"),
+                    eq(campaignRecipients.claimToken, claimToken)
                   )
                 );
             } else {
@@ -531,7 +527,8 @@ export async function handleProcessCampaignBatch(
                 .where(
                   and(
                     eq(campaignRecipients.id, item.recipientId),
-                    eq(campaignRecipients.status, "processing")
+                    eq(campaignRecipients.status, "processing"),
+                    eq(campaignRecipients.claimToken, claimToken)
                   )
                 );
             }
@@ -557,7 +554,8 @@ export async function handleProcessCampaignBatch(
               .where(
                 and(
                   eq(campaignRecipients.id, item.recipientId),
-                  eq(campaignRecipients.status, "processing")
+                  eq(campaignRecipients.status, "processing"),
+                  eq(campaignRecipients.claimToken, claimToken)
                 )
               );
             failCount++;
@@ -582,7 +580,8 @@ export async function handleProcessCampaignBatch(
               .where(
                 and(
                   eq(campaignRecipients.id, item.recipientId),
-                  eq(campaignRecipients.status, "processing")
+                  eq(campaignRecipients.status, "processing"),
+                  eq(campaignRecipients.claimToken, claimToken)
                 )
               );
           }
