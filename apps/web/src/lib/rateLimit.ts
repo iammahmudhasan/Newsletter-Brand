@@ -99,35 +99,78 @@ export async function cleanupExpiredRateLimits(): Promise<number> {
 }
 
 /**
+ * Checks whether an IP address belongs to private, loopback, or link-local ranges.
+ */
+export function isPrivateOrLoopbackIp(ip: string): boolean {
+  if (!ip || typeof ip !== "string") return false;
+  const trimmed = ip.trim().toLowerCase();
+  if (trimmed === "127.0.0.1" || trimmed === "::1" || trimmed === "localhost") return true;
+
+  const parts = trimmed.split(".").map(Number);
+  if (parts.length === 4) {
+    if (parts[0] === 10) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    if (parts[0] === 127) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true; // Link-local
+    if (parts[0] === 0) return true;
+  }
+
+  if (trimmed.startsWith("fc00:") || trimmed.startsWith("fd00:") || trimmed.startsWith("fe80:")) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Extracts and sanitizes the client IP address from request headers.
  * Uses trusted proxy chain resolution with strict IPv4/IPv6 validation.
+ * Traverses X-Forwarded-For from right to left to prevent client-injected header spoofing.
  */
 export function getClientIp(req: NextRequest): string {
-  // 1. Next.js / Edge Runtime client IP (authoritative behind reverse proxies like Vercel/Cloudflare)
+  // 1. Next.js / Edge Runtime client IP (authoritative TCP socket connection address)
   const nextIp = (req as any).ip;
   if (nextIp && typeof nextIp === "string" && isValidIpAddress(nextIp)) {
     return nextIp.trim();
   }
 
-  // 2. Cloudflare trusted header
+  // 2. Cloudflare Edge authoritative header (sanitized and overwritten at Cloudflare edge)
   const cfIp = req.headers.get("cf-connecting-ip")?.trim();
   if (cfIp && isValidIpAddress(cfIp)) {
     return cfIp;
   }
 
-  // 3. X-Real-IP
+  // 3. AWS CloudFront authoritative client IP
+  const cloudFrontIp = req.headers.get("cloudfront-viewer-address")?.split(":")[0]?.trim();
+  if (cloudFrontIp && isValidIpAddress(cloudFrontIp)) {
+    return cloudFrontIp;
+  }
+
+  // 4. X-Real-IP (set by Nginx/Caddy via proxy_set_header X-Real-IP $remote_addr)
   const realIp = req.headers.get("x-real-ip")?.trim();
   if (realIp && isValidIpAddress(realIp)) {
     return realIp;
   }
 
-  // 4. Standard X-Forwarded-For: select leftmost valid IP
+  // 5. Standard X-Forwarded-For: traverse from RIGHT to LEFT to thwart client header spoofing.
+  // In standard reverse proxy chains (e.g. ALB, Nginx, GCP), each proxy appends the remote address
+  // to the right: "<untrusted-client-header>, <trusted-proxy-added-ip>".
+  // The leftmost entries can be freely spoofed by attackers, so the rightmost public IP is authoritative.
   const forwarded = req.headers.get("x-forwarded-for");
   if (forwarded) {
-    const parts = forwarded.split(",").map((s) => s.trim());
-    for (const part of parts) {
-      if (isValidIpAddress(part)) {
-        return part;
+    const parts = forwarded.split(",").map((s) => s.trim()).filter(Boolean);
+    // First attempt: rightmost valid public IP
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const candidate = parts[i];
+      if (isValidIpAddress(candidate) && !isPrivateOrLoopbackIp(candidate)) {
+        return candidate;
+      }
+    }
+    // Fallback: rightmost valid IP (including private in dev/test setups)
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const candidate = parts[i];
+      if (isValidIpAddress(candidate)) {
+        return candidate;
       }
     }
   }

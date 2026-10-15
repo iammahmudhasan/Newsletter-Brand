@@ -16,10 +16,14 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { title, subject, previewText, contentHtml, contentPlain, scheduledAt, sendNow } = body;
+    const { title, subject, previewText, contentHtml, contentPlain, scheduledAt, sendNow } = body || {};
 
     // 1. Request-level idempotency protection: Return existing campaign if key matches
-    resolvedIdempotencyKey = (req.headers.get("idempotency-key") || body?.idempotencyKey || null)?.trim() || null;
+    // Properly fall back to body idempotencyKey if header is empty or whitespace-only
+    const headerKey = req.headers.get("idempotency-key")?.trim() || "";
+    const bodyKey = (typeof body?.idempotencyKey === "string" ? body.idempotencyKey : "")?.trim() || "";
+    resolvedIdempotencyKey = (headerKey && headerKey.length > 0) ? headerKey : (bodyKey && bodyKey.length > 0) ? bodyKey : null;
+
     if (resolvedIdempotencyKey) {
       const [existing] = await db
         .select()
@@ -41,18 +45,71 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    if (!title || !subject || !contentHtml) {
+    // 2. Strict input type, presence, and size validation
+    if (typeof title !== "string" || !title.trim()) {
       return NextResponse.json(
-        { error: "Title, Subject, and Content HTML are required" },
+        { error: "Campaign title is required and must be text" },
         { status: 400 }
       );
+    }
+    if (title.trim().length > 255) {
+      return NextResponse.json(
+        { error: "Campaign title cannot exceed 255 characters" },
+        { status: 400 }
+      );
+    }
+
+    if (typeof subject !== "string" || !subject.trim()) {
+      return NextResponse.json(
+        { error: "Email subject is required and must be text" },
+        { status: 400 }
+      );
+    }
+    if (subject.trim().length > 255) {
+      return NextResponse.json(
+        { error: "Email subject cannot exceed 255 characters" },
+        { status: 400 }
+      );
+    }
+
+    if (typeof contentHtml !== "string" || !contentHtml.trim()) {
+      return NextResponse.json(
+        { error: "Content HTML is required and must be text" },
+        { status: 400 }
+      );
+    }
+    if (contentHtml.length > 500_000) {
+      return NextResponse.json(
+        { error: "Content HTML exceeds maximum size limit (500KB)" },
+        { status: 400 }
+      );
+    }
+
+    if (previewText !== undefined && previewText !== null) {
+      if (typeof previewText !== "string") {
+        return NextResponse.json({ error: "Preview text must be a string" }, { status: 400 });
+      }
+      if (previewText.length > 255) {
+        return NextResponse.json({ error: "Preview text cannot exceed 255 characters" }, { status: 400 });
+      }
+    }
+
+    if (contentPlain !== undefined && contentPlain !== null && typeof contentPlain !== "string") {
+      return NextResponse.json({ error: "Content plain must be a string" }, { status: 400 });
+    }
+
+    let scheduleDate = new Date();
+    if (scheduledAt !== undefined && scheduledAt !== null) {
+      scheduleDate = new Date(scheduledAt);
+      if (isNaN(scheduleDate.getTime())) {
+        return NextResponse.json({ error: "Invalid scheduledAt timestamp" }, { status: 400 });
+      }
     }
 
     // Server-side allowlist HTML sanitization to prevent persistent stored XSS
     const sanitizedHtml = sanitizeNewsletterHtml(contentHtml);
 
-    const isImmediateSend = sendNow === true || !scheduledAt || new Date(scheduledAt).getTime() <= Date.now();
-    const scheduleDate = scheduledAt ? new Date(scheduledAt) : new Date();
+    const isImmediateSend = sendNow === true || !scheduledAt || scheduleDate.getTime() <= Date.now();
 
     // Transactional Outbox: Atomically persist campaign and outbox job in a single database transaction
     const { campaignId, jobId, issueNumber } = await db.transaction(async (tx) => {

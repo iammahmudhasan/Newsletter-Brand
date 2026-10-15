@@ -33,8 +33,30 @@ export async function handleProcessCampaignBatch(
     throw new Error(`Campaign ${campaignId} not found`);
   }
 
-  if (campaign.status === "sent" || campaign.status === "cancelled") {
-    // Safety check: ensure no active, queued, or retryable unknown_outcome recipients remain
+  // CRITICAL: Strictly abort dispatch if campaign was cancelled.
+  // A cancelled campaign must NEVER be resumed, rescheduled, or have emails dispatched.
+  if (campaign.status === "cancelled") {
+    console.log(`[Worker] Campaign ${campaignId} is cancelled; aborting dispatch.`);
+    // Cancel any remaining in-flight, queued, or unknown_outcome recipients for this cancelled campaign
+    await db
+      .update(campaignRecipients)
+      .set({
+        status: "failed",
+        errorMessage: "Cancelled by campaign cancellation",
+        claimToken: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(campaignRecipients.campaignId, campaignId),
+          sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
+        )
+      );
+    return;
+  }
+
+  // Safety check for sent campaigns: ensure no active, queued, or retryable unknown_outcome recipients remain
+  if (campaign.status === "sent") {
     const [hasActive] = await db
       .select({ count: sql<number>`count(*)` })
       .from(campaignRecipients)
@@ -46,12 +68,12 @@ export async function handleProcessCampaignBatch(
       );
 
     if (Number(hasActive?.count || 0) === 0) {
-      console.log(`[Worker] Campaign ${campaignId} is ${campaign.status} with 0 pending recipients, skipping duplicate dispatch.`);
+      console.log(`[Worker] Campaign ${campaignId} is sent with 0 pending recipients, skipping duplicate dispatch.`);
       return;
     }
 
     console.warn(
-      `[Worker Safety Recovery] Campaign ${campaignId} was marked '${campaign.status}' but still has ${hasActive?.count} pending/unknown_outcome recipients. Resuming dispatch.`
+      `[Worker Safety Recovery] Campaign ${campaignId} was marked 'sent' but still has ${hasActive?.count} pending/unknown_outcome recipients. Resuming dispatch.`
     );
   }
 
@@ -188,6 +210,17 @@ export async function handleProcessCampaignBatch(
           leaseLost = true;
           break;
         }
+      }
+
+      // Check if campaign was cancelled concurrently by admin
+      const [currentCampaign] = await db
+        .select({ status: campaigns.status })
+        .from(campaigns)
+        .where(eq(campaigns.id, campaignId));
+
+      if (currentCampaign?.status === "cancelled") {
+        console.warn(`[Worker Cancellation Notice] Campaign ${campaignId} was marked 'cancelled' concurrently. Halting batch loop.`);
+        break;
       }
 
       // Touch campaign updatedAt to record active progress
@@ -409,9 +442,10 @@ export async function handleProcessCampaignBatch(
           // Use recipient-specific idempotency key for provider-level duplicate dispatch protection
           const idempotencyKey = `campaign:${campaign.id}:recipient:${item.recipientId}`;
 
-          // Ultra-tight pre-send fencing & GDPR shield: ensure recipient wasn't concurrently cancelled, deleted, or suppressed
+          // Ultra-tight pre-send fencing, cancellation barrier & GDPR shield:
+          // 1. Recipient claimToken verification: ensure claim wasn't revoked or reclaimed
           const [stillClaimed] = await db
-            .select({ id: campaignRecipients.id })
+            .select({ id: campaignRecipients.id, claimToken: campaignRecipients.claimToken })
             .from(campaignRecipients)
             .where(
               and(
@@ -421,14 +455,48 @@ export async function handleProcessCampaignBatch(
               )
             );
 
-          if (!stillClaimed) {
+          if (!stillClaimed || stillClaimed.claimToken !== claimToken) {
             console.warn(
-              `[Fencing/GDPR Pre-Send Shield] Recipient ${item.recipientId} claim was cancelled, deleted, or modified concurrently. Aborting dispatch.`
+              `[Fencing/GDPR Pre-Send Shield] Recipient ${item.recipientId} claim was cancelled, deleted, or revoked concurrently. Aborting dispatch.`
             );
             failCount++;
             continue;
           }
 
+          // 2. Campaign cancellation barrier: ensure campaign wasn't cancelled mid-flight
+          const [campaignState] = await db
+            .select({ status: campaigns.status })
+            .from(campaigns)
+            .where(eq(campaigns.id, campaign.id));
+
+          if (campaignState?.status === "cancelled") {
+            console.warn(
+              `[Campaign Cancellation Barrier] Campaign ${campaign.id} was marked 'cancelled'. Halting dispatch.`
+            );
+            failCount++;
+            break;
+          }
+
+          // 3. GDPR active subscriber barrier: ensure subscriber was not deleted or deactivated concurrently
+          const [stillActiveSub] = await db
+            .select({ id: subscribers.id })
+            .from(subscribers)
+            .where(
+              and(
+                eq(subscribers.id, freshSub.id),
+                eq(subscribers.status, "active")
+              )
+            );
+
+          if (!stillActiveSub) {
+            console.warn(
+              `[GDPR Pre-Send Barrier] Subscriber ${freshSub.id} was deleted or deactivated concurrently. Aborting dispatch.`
+            );
+            failCount++;
+            continue;
+          }
+
+          // 4. Suppression barrier: ensure email wasn't suppressed concurrently
           const [preSendSuppressed] = await db
             .select({ id: suppressions.id })
             .from(suppressions)
@@ -666,7 +734,18 @@ export async function handleProcessCampaignBatch(
     return;
   }
 
-  // 5. Check if any recipients are still pending or waiting for next retry attempt
+  // 5. Pre-finalization check: ensure campaign wasn't cancelled mid-dispatch
+  const [campaignPostCheck] = await db
+    .select({ status: campaigns.status })
+    .from(campaigns)
+    .where(eq(campaigns.id, campaignId));
+
+  if (campaignPostCheck?.status === "cancelled") {
+    console.log(`[Worker] Campaign ${campaignId} is cancelled; skipping retry rescheduling and finalization.`);
+    return;
+  }
+
+  // 6. Check if any recipients are still pending or waiting for next retry attempt
   const remainingActive = await db
     .select({
       id: campaignRecipients.id,

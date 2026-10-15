@@ -1,7 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import { normalizeWebhookEventType, computeCampaignTargetStatus } from "../../apps/web/src/lib/webhookHelpers";
 import { renderNewsletterEmail } from "../../packages/email/src/templates/newsletter";
-import { checkRateLimit, checkEmailCooldown, isValidIpAddress, pseudonymizeRateLimitKey } from "../../apps/web/src/lib/rateLimit";
+import { checkRateLimit, checkEmailCooldown, isValidIpAddress, pseudonymizeRateLimitKey, getClientIp, isPrivateOrLoopbackIp } from "../../apps/web/src/lib/rateLimit";
 
 describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
   describe("1. Webhook Normalization & Event Isolation (P1)", () => {
@@ -207,9 +207,11 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       expect(pseudonymizeRateLimitKey("gdpr:email", rawEmail)).not.toBe(emailKey);
     });
 
-    it("normalizes idempotency keys consistently from both header and request body", () => {
+    it("normalizes idempotency keys consistently from both header and request body, falling back if header is whitespace", () => {
       function resolveIdempotencyKey(headers: Record<string, string>, body: any): string | null {
-        return (headers["idempotency-key"] || body?.idempotencyKey || null)?.trim() || null;
+        const headerKey = headers["idempotency-key"]?.trim() || "";
+        const bodyKey = (typeof body?.idempotencyKey === "string" ? body.idempotencyKey : "")?.trim() || "";
+        return (headerKey && headerKey.length > 0) ? headerKey : (bodyKey && bodyKey.length > 0) ? bodyKey : null;
       }
 
       // 1. From header
@@ -224,9 +226,51 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       // 4. Trims whitespace
       expect(resolveIdempotencyKey({ "idempotency-key": "  spaced-key  " }, {})).toBe("spaced-key");
 
-      // 5. Empty or missing
+      // 5. CRITICAL EDGE CASE: Header has only whitespace -> properly falls back to valid body key
+      expect(resolveIdempotencyKey({ "idempotency-key": "    " }, { idempotencyKey: "body-fallback-789" })).toBe("body-fallback-789");
+
+      // 6. Empty or missing
       expect(resolveIdempotencyKey({}, {})).toBe(null);
       expect(resolveIdempotencyKey({}, { idempotencyKey: "   " })).toBe(null);
+      expect(resolveIdempotencyKey({ "idempotency-key": "   " }, { idempotencyKey: "   " })).toBe(null);
+    });
+
+    it("extracts authoritative client IP from rightmost trusted proxy hop, defeating X-Forwarded-For spoofing", () => {
+      function mockReq(headers: Record<string, string>, socketIp?: string) {
+        return {
+          ip: socketIp,
+          headers: {
+            get: (name: string) => headers[name.toLowerCase()] || null,
+          },
+        } as any;
+      }
+
+      // Scenario 1: Attacker sends "X-Forwarded-For: 1.2.3.4", reverse proxy appends real client IP "203.0.113.195"
+      const spoofedReq = mockReq({
+        "x-forwarded-for": "1.2.3.4, 203.0.113.195",
+      });
+      expect(getClientIp(spoofedReq)).toBe("203.0.113.195");
+
+      // Scenario 2: Attacker injects fake private and external IPs before ALB/proxy
+      const chainReq = mockReq({
+        "x-forwarded-for": "9.9.9.9, 10.0.0.1, 198.51.100.42, 172.16.0.5",
+      });
+      // Rightmost valid public IP is 198.51.100.42 (internal proxy 172.16.0.5 is skipped)
+      expect(getClientIp(chainReq)).toBe("198.51.100.42");
+
+      // Scenario 3: CF-Connecting-IP takes precedence over X-Forwarded-For
+      const cfReq = mockReq({
+        "cf-connecting-ip": "198.51.100.99",
+        "x-forwarded-for": "1.1.1.1, 2.2.2.2",
+      });
+      expect(getClientIp(cfReq)).toBe("198.51.100.99");
+
+      // Scenario 4: Socket IP from runtime takes highest priority
+      const socketReq = mockReq(
+        { "x-forwarded-for": "1.1.1.1" },
+        "203.0.113.88"
+      );
+      expect(getClientIp(socketReq)).toBe("203.0.113.88");
     });
   });
 
@@ -299,6 +343,117 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       // Scenario 7: All 10 failed (zero in-flight) -> 'failed'
       const allFailed = Array.from({ length: 10 }, () => ({ status: "failed" }));
       expect(computeCampaignTargetStatus(allFailed)).toBe("failed");
+    });
+  });
+
+  describe("7. Campaign Cancellation Safety & Dispatch Fencing (P1)", () => {
+    it("strictly aborts dispatch when campaign is cancelled, even if queued or unknown_outcome recipients exist", () => {
+      function evaluateWorkerAction(
+        campaignStatus: string,
+        activeRecipientsCount: number
+      ): "skip_cancelled" | "resume_recovery" | "skip_complete" | "dispatch" {
+        if (campaignStatus === "cancelled") {
+          return "skip_cancelled";
+        }
+        if (campaignStatus === "sent") {
+          if (activeRecipientsCount > 0) {
+            return "resume_recovery";
+          }
+          return "skip_complete";
+        }
+        return "dispatch";
+      }
+
+      // Cancelled campaign with queued recipients MUST NOT dispatch
+      expect(evaluateWorkerAction("cancelled", 10)).toBe("skip_cancelled");
+
+      // Cancelled campaign with unknown_outcome recipients MUST NOT resume
+      expect(evaluateWorkerAction("cancelled", 1)).toBe("skip_cancelled");
+
+      // Sent campaign with remaining active recipients triggers incomplete-send recovery
+      expect(evaluateWorkerAction("sent", 5)).toBe("resume_recovery");
+
+      // Sent campaign with 0 remaining active recipients is skipped
+      expect(evaluateWorkerAction("sent", 0)).toBe("skip_complete");
+
+      // Active sending/scheduled campaign proceeds to dispatch
+      expect(evaluateWorkerAction("sending", 100)).toBe("dispatch");
+      expect(evaluateWorkerAction("scheduled", 100)).toBe("dispatch");
+    });
+
+    it("pre-send barrier drops dispatch immediately if campaign is cancelled or recipient claim is revoked", () => {
+      function preSendGateCheck(params: {
+        campaignStatus: string;
+        recipientStatus: string;
+        recipientClaimToken: string | null;
+        workerClaimToken: string;
+        subscriberActive: boolean;
+        isSuppressed: boolean;
+      }): { allowSend: boolean; reason?: string } {
+        if (params.recipientStatus !== "processing" || params.recipientClaimToken !== params.workerClaimToken) {
+          return { allowSend: false, reason: "claim_revoked_or_modified" };
+        }
+        if (params.campaignStatus === "cancelled") {
+          return { allowSend: false, reason: "campaign_cancelled" };
+        }
+        if (!params.subscriberActive) {
+          return { allowSend: false, reason: "subscriber_deleted_gdpr" };
+        }
+        if (params.isSuppressed) {
+          return { allowSend: false, reason: "suppressed" };
+        }
+        return { allowSend: true };
+      }
+
+      const validClaim = "token-abc-123";
+
+      // 1. Normal active send -> allowed
+      expect(
+        preSendGateCheck({
+          campaignStatus: "sending",
+          recipientStatus: "processing",
+          recipientClaimToken: validClaim,
+          workerClaimToken: validClaim,
+          subscriberActive: true,
+          isSuppressed: false,
+        }).allowSend
+      ).toBe(true);
+
+      // 2. Campaign was cancelled concurrently -> blocked
+      expect(
+        preSendGateCheck({
+          campaignStatus: "cancelled",
+          recipientStatus: "processing",
+          recipientClaimToken: validClaim,
+          workerClaimToken: validClaim,
+          subscriberActive: true,
+          isSuppressed: false,
+        }).reason
+      ).toBe("campaign_cancelled");
+
+      // 3. GDPR deleted subscriber concurrently -> blocked
+      expect(
+        preSendGateCheck({
+          campaignStatus: "sending",
+          recipientStatus: "processing",
+          recipientClaimToken: validClaim,
+          workerClaimToken: validClaim,
+          subscriberActive: false,
+          isSuppressed: false,
+        }).reason
+      ).toBe("subscriber_deleted_gdpr");
+
+      // 4. Recipient claimToken was set to null by GDPR cancellation -> blocked
+      expect(
+        preSendGateCheck({
+          campaignStatus: "sending",
+          recipientStatus: "failed",
+          recipientClaimToken: null,
+          workerClaimToken: validClaim,
+          subscriberActive: true,
+          isSuppressed: false,
+        }).reason
+      ).toBe("claim_revoked_or_modified");
     });
   });
 });

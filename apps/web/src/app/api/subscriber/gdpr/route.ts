@@ -122,6 +122,7 @@ export async function POST(req: NextRequest) {
         .set({
           status: "failed",
           errorMessage: "Cancelled by GDPR deletion request",
+          claimToken: null,
           updatedAt: new Date(),
         })
         .where(
