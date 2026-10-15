@@ -125,13 +125,16 @@ export async function reconcileCampaignMetrics(tx: any, campaignId: string): Pro
   ).length;
 
   const targetStatus = computeCampaignTargetStatus(allRecipients);
+  const total = allRecipients.length;
 
   await tx
     .update(campaigns)
     .set({
+      totalRecipients: total,
       successfulSends: sent,
       failedSends: failed,
       status: targetStatus,
+      sentAt: targetStatus !== "sending" ? sql`COALESCE(${campaigns.sentAt}, NOW())` : campaigns.sentAt,
       updatedAt: new Date(),
     })
     .where(

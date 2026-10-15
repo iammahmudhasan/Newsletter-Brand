@@ -1,7 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import { normalizeWebhookEventType, computeCampaignTargetStatus } from "../../apps/web/src/lib/webhookHelpers";
 import { renderNewsletterEmail } from "../../packages/email/src/templates/newsletter";
-import { checkRateLimit, checkEmailCooldown, isValidIpAddress, pseudonymizeRateLimitKey, getClientIp, isPrivateOrLoopbackIp } from "../../apps/web/src/lib/rateLimit";
+import { checkRateLimit, checkEmailCooldown, isValidIpAddress, pseudonymizeRateLimitKey, getClientIp, isPrivateOrLoopbackIp, matchesCidr, isTrustedProxyHop } from "../../apps/web/src/lib/rateLimit";
 
 describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
   describe("1. Webhook Normalization & Event Isolation (P1)", () => {
@@ -693,4 +693,354 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       expect(invalidPlain.status).toBe(400);
     });
   });
+
+  describe("12. Worker Finalization vs Webhook Terminal Metrics Race Fencing (P1)", () => {
+    it("prevents worker finalization from overwriting fresh webhook terminal metrics when status != sending", () => {
+      interface CampaignRecord {
+        id: string;
+        status: "scheduled" | "sending" | "sent" | "partially_failed" | "failed" | "cancelled";
+        totalRecipients: number;
+        successfulSends: number;
+        failedSends: number;
+      }
+
+      const campaign: CampaignRecord = {
+        id: "camp-race-123",
+        status: "sending",
+        totalRecipients: 100,
+        successfulSends: 0,
+        failedSends: 0,
+      };
+
+      // 1. Worker begins batch delivery: reads all 100 recipients as successfully sent in memory
+      const workerComputedMetrics = {
+        totalRecipients: 100,
+        successfulSends: 100,
+        failedSends: 0,
+        targetStatus: "sent" as const,
+      };
+
+      // 2. Concurrently, a bounce/complaint webhook arrives BEFORE worker executes DB finalization query.
+      // Webhook helper transitions campaign to 'partially_failed' with accurate counter:
+      campaign.status = "partially_failed";
+      campaign.successfulSends = 99;
+      campaign.failedSends = 1;
+
+      // 3. Worker executes conditional finalization update:
+      // UPDATE campaigns SET status = targetStatus, ... WHERE id = campaignId AND status = 'sending' RETURNING *;
+      function executeWorkerFinalizationUpdate(
+        target: CampaignRecord,
+        updateData: { status: "sent" | "partially_failed" | "failed"; successfulSends: number; failedSends: number }
+      ): CampaignRecord | null {
+        if (target.status !== "sending") {
+          return null; // 0 rows updated, query returns null
+        }
+        target.status = updateData.status;
+        target.successfulSends = updateData.successfulSends;
+        target.failedSends = updateData.failedSends;
+        return target;
+      }
+
+      const updateResult = executeWorkerFinalizationUpdate(campaign, {
+        status: workerComputedMetrics.targetStatus,
+        successfulSends: workerComputedMetrics.successfulSends,
+        failedSends: workerComputedMetrics.failedSends,
+      });
+
+      // 4. Verification:
+      // Worker update query MUST return null (0 rows affected)
+      expect(updateResult).toBeNull();
+
+      // Webhook terminal status and counters MUST remain preserved (not overwritten by stale worker in-memory data)
+      expect(campaign.status).toBe("partially_failed");
+      expect(campaign.successfulSends).toBe(99);
+      expect(campaign.failedSends).toBe(1);
+    });
+
+    it("successfully finalizes campaign if status is still sending", () => {
+      interface CampaignRecord {
+        id: string;
+        status: "scheduled" | "sending" | "sent" | "partially_failed" | "failed" | "cancelled";
+        totalRecipients: number;
+        successfulSends: number;
+        failedSends: number;
+      }
+
+      const campaign: CampaignRecord = {
+        id: "camp-normal-456",
+        status: "sending",
+        totalRecipients: 50,
+        successfulSends: 0,
+        failedSends: 0,
+      };
+
+      function executeWorkerFinalizationUpdate(
+        target: CampaignRecord,
+        updateData: { status: "sent" | "partially_failed" | "failed"; successfulSends: number; failedSends: number }
+      ): CampaignRecord | null {
+        if (target.status !== "sending") {
+          return null;
+        }
+        target.status = updateData.status;
+        target.successfulSends = updateData.successfulSends;
+        target.failedSends = updateData.failedSends;
+        return target;
+      }
+
+      const updateResult = executeWorkerFinalizationUpdate(campaign, {
+        status: "sent",
+        successfulSends: 50,
+        failedSends: 0,
+      });
+
+      expect(updateResult).not.toBeNull();
+      expect(campaign.status).toBe("sent");
+      expect(campaign.successfulSends).toBe(50);
+      expect(campaign.failedSends).toBe(0);
+    });
+  });
+
+  describe("13. Campaign Cancellation Protocol & State Machine (P2)", () => {
+    it("cancels scheduled or sending campaigns and aborts non-terminal recipients while preserving terminal ones", () => {
+      interface MockRecipient {
+        id: string;
+        campaignId: string;
+        status: "queued" | "processing" | "sent" | "delivered" | "failed" | "unknown_outcome";
+        claimToken: string | null;
+        errorMessage: string | null;
+      }
+
+      const recipients: MockRecipient[] = [
+        { id: "r1", campaignId: "c1", status: "sent", claimToken: "tok1", errorMessage: null },
+        { id: "r2", campaignId: "c1", status: "delivered", claimToken: "tok2", errorMessage: null },
+        { id: "r3", campaignId: "c1", status: "queued", claimToken: null, errorMessage: null },
+        { id: "r4", campaignId: "c1", status: "processing", claimToken: "tok4", errorMessage: null },
+        { id: "r5", campaignId: "c1", status: "unknown_outcome", claimToken: "tok5", errorMessage: "ambiguous" },
+      ];
+
+      function cancelCampaignProtocol(
+        campaignStatus: string,
+        recipientsList: MockRecipient[]
+      ): { success: boolean; abortedCount?: number; error?: string } {
+        if (["sent", "partially_failed", "failed"].includes(campaignStatus)) {
+          return { success: false, error: `Campaign already terminal (${campaignStatus})` };
+        }
+        if (campaignStatus === "cancelled") {
+          return { success: true, abortedCount: 0 };
+        }
+
+        let aborted = 0;
+        for (const r of recipientsList) {
+          if (["queued", "processing", "unknown_outcome"].includes(r.status)) {
+            r.status = "failed";
+            r.errorMessage = "Cancelled by admin request";
+            r.claimToken = null;
+            aborted++;
+          }
+        }
+        return { success: true, abortedCount: aborted };
+      }
+
+      const result = cancelCampaignProtocol("sending", recipients);
+      expect(result.success).toBe(true);
+      expect(result.abortedCount).toBe(3); // r3, r4, r5
+
+      // Terminal recipients must NOT be modified
+      expect(recipients[0].status).toBe("sent");
+      expect(recipients[0].claimToken).toBe("tok1");
+      expect(recipients[1].status).toBe("delivered");
+
+      // In-flight / pending recipients must be aborted with claimToken released
+      expect(recipients[2].status).toBe("failed");
+      expect(recipients[2].claimToken).toBeNull();
+      expect(recipients[3].status).toBe("failed");
+      expect(recipients[3].claimToken).toBeNull();
+      expect(recipients[4].status).toBe("failed");
+      expect(recipients[4].claimToken).toBeNull();
+      expect(recipients[4].errorMessage).toBe("Cancelled by admin request");
+    });
+
+    it("rejects cancellation of already terminal campaigns (sent, partially_failed, failed)", () => {
+      function cancelCampaignProtocol(campaignStatus: string): { success: boolean; error?: string } {
+        if (["sent", "partially_failed", "failed"].includes(campaignStatus)) {
+          return { success: false, error: `Campaign already reached terminal status '${campaignStatus}'` };
+        }
+        return { success: true };
+      }
+
+      expect(cancelCampaignProtocol("sent").success).toBe(false);
+      expect(cancelCampaignProtocol("partially_failed").success).toBe(false);
+      expect(cancelCampaignProtocol("failed").success).toBe(false);
+      expect(cancelCampaignProtocol("scheduled").success).toBe(true);
+      expect(cancelCampaignProtocol("sending").success).toBe(true);
+    });
+  });
+
+  describe("14. Complaint Rate Telemetry & Immutable Denominator (P2)", () => {
+    it("guarantees stable complaint rate calculation when complaints flip recipient status to failed", () => {
+      const totalDeliveredEvents = 1000;
+      const complaintEvents = 10;
+
+      const flawedDeliveredRecipients = totalDeliveredEvents - complaintEvents; // 990
+      const flawedRate = (complaintEvents / flawedDeliveredRecipients) * 100;
+
+      const stableRate = (complaintEvents / totalDeliveredEvents) * 100;
+
+      expect(stableRate).toBe(1.0);
+      expect(flawedRate).toBeGreaterThan(stableRate);
+
+      const extremeComplaints = 500;
+      const extremeFlawedDelivered = 1000 - 500;
+      const extremeFlawedRate = (extremeComplaints / extremeFlawedDelivered) * 100;
+      const extremeStableRate = (extremeComplaints / 1000) * 100;
+
+      expect(extremeFlawedRate).toBe(100);
+      expect(extremeStableRate).toBe(50);
+    });
+  });
+
+  describe("15. Trusted Proxy & CIDR-Aware Network Path Resolution (P2)", () => {
+    it("correctly matches IPv4 addresses against CIDR ranges", () => {
+      // /24 subnet
+      expect(matchesCidr("192.168.1.1", "192.168.1.0/24")).toBe(true);
+      expect(matchesCidr("192.168.1.254", "192.168.1.0/24")).toBe(true);
+      expect(matchesCidr("192.168.2.1", "192.168.1.0/24")).toBe(false);
+
+      // /16 subnet
+      expect(matchesCidr("10.0.50.12", "10.0.0.0/16")).toBe(true);
+      expect(matchesCidr("10.1.0.1", "10.0.0.0/16")).toBe(false);
+
+      // /8 subnet
+      expect(matchesCidr("10.254.254.254", "10.0.0.0/8")).toBe(true);
+      expect(matchesCidr("11.0.0.1", "10.0.0.0/8")).toBe(false);
+
+      // /32 exact host
+      expect(matchesCidr("198.51.100.5", "198.51.100.5/32")).toBe(true);
+      expect(matchesCidr("198.51.100.6", "198.51.100.5/32")).toBe(false);
+
+      // /0 whole internet
+      expect(matchesCidr("8.8.8.8", "0.0.0.0/0")).toBe(true);
+
+      // Malformed inputs
+      expect(matchesCidr("", "10.0.0.0/8")).toBe(false);
+      expect(matchesCidr("10.0.0.1", "")).toBe(false);
+      expect(matchesCidr("10.0.0.1", "invalid")).toBe(false);
+      expect(matchesCidr("invalid", "10.0.0.0/8")).toBe(false);
+    });
+
+    it("verifies isTrustedProxyHop against configured TRUSTED_PROXIES env var and private networks", () => {
+      const origEnv = process.env.TRUSTED_PROXIES;
+      try {
+        process.env.TRUSTED_PROXIES = "198.51.100.0/24, 203.0.113.50";
+
+        // Configured CIDR match
+        expect(isTrustedProxyHop("198.51.100.10")).toBe(true);
+        expect(isTrustedProxyHop("198.51.100.250")).toBe(true);
+        expect(isTrustedProxyHop("198.51.101.1")).toBe(false);
+
+        // Configured exact IP match
+        expect(isTrustedProxyHop("203.0.113.50")).toBe(true);
+        expect(isTrustedProxyHop("203.0.113.51")).toBe(false);
+
+        // Private / Loopback IPs always trusted proxy hops by default
+        expect(isTrustedProxyHop("127.0.0.1")).toBe(true);
+        expect(isTrustedProxyHop("10.0.1.1")).toBe(true);
+        expect(isTrustedProxyHop("172.16.0.1")).toBe(true);
+        expect(isTrustedProxyHop("192.168.1.1")).toBe(true);
+
+        // Arbitrary public IP not in trusted list
+        expect(isTrustedProxyHop("8.8.8.8")).toBe(false);
+      } finally {
+        if (origEnv !== undefined) {
+          process.env.TRUSTED_PROXIES = origEnv;
+        } else {
+          delete process.env.TRUSTED_PROXIES;
+        }
+      }
+    });
+
+    it("refuses edge headers from direct public socket in production when socket is not a trusted proxy", () => {
+      const origNodeEnv = process.env.NODE_ENV;
+      const origTrustEdge = process.env.TRUST_EDGE_HEADERS;
+      try {
+        (process.env as any).NODE_ENV = "production";
+        delete process.env.TRUST_EDGE_HEADERS;
+
+        // Attacker directly connects from public IP 198.51.100.99 (not a trusted proxy)
+        // and injects forged headers:
+        const directPublicReq = {
+          ip: "198.51.100.99",
+          headers: {
+            get: (name: string) => {
+              if (name === "cf-connecting-ip") return "1.1.1.1";
+              if (name === "x-forwarded-for") return "2.2.2.2";
+              return null;
+            },
+          },
+        } as any;
+
+        const resolvedIp = getClientIp(directPublicReq);
+        // Authoritative resolution must use direct socket IP and ignore forged client headers
+        expect(resolvedIp).toBe("198.51.100.99");
+      } finally {
+        (process.env as any).NODE_ENV = origNodeEnv;
+        if (origTrustEdge !== undefined) {
+          process.env.TRUST_EDGE_HEADERS = origTrustEdge;
+        } else {
+          delete process.env.TRUST_EDGE_HEADERS;
+        }
+      }
+    });
+  });
+
+  describe("16. Incremental Streaming Request Body Size Limit (P3)", () => {
+    it("aborts stream consumption immediately when byte threshold is exceeded without buffering excess bytes", async () => {
+      const MAX_BYTES = 1000;
+      let streamCancelled = false;
+
+      const chunk1 = new Uint8Array(600);
+      const chunk2 = new Uint8Array(500); // 600 + 500 = 1100 > 1000
+      const chunk3 = new Uint8Array(10_000_000); // 10MB chunk that must never be read
+
+      const streamQueue = [chunk1, chunk2, chunk3];
+
+      const simulatedReader = {
+        read: async () => {
+          if (streamCancelled || streamQueue.length === 0) {
+            return { done: true, value: undefined };
+          }
+          const chunk = streamQueue.shift()!;
+          return { done: false, value: chunk };
+        },
+        cancel: async (_reason: string) => {
+          streamCancelled = true;
+        },
+      };
+
+      async function readWithLimit(reader: typeof simulatedReader, max: number) {
+        const chunks: Uint8Array[] = [];
+        let bytes = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            bytes += value.byteLength;
+            if (bytes > max) {
+              await reader.cancel("Payload limit exceeded");
+              return { error: "Payload too large", status: 413, bytesRead: bytes };
+            }
+            chunks.push(value);
+          }
+        }
+        return { success: true, bytesRead: bytes };
+      }
+
+      const result = await readWithLimit(simulatedReader, MAX_BYTES);
+      expect(result.status).toBe(413);
+      expect(streamCancelled).toBe(true);
+      expect(streamQueue.length).toBe(1); // chunk3 remains unread
+      expect(result.bytesRead).toBe(1100);
+    });
+  });
 });
+

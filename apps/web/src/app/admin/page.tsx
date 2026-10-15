@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import {
   Users,
@@ -15,11 +15,14 @@ import {
   PlusCircle,
   RefreshCw,
   LogOut,
+  Ban,
+  Mail,
+  Calendar,
 } from "lucide-react";
 
 export default function AdminPage() {
   const router = useRouter();
-  const [activeTab, setActiveTab] = useState<"overview" | "compose" | "subscribers">("overview");
+  const [activeTab, setActiveTab] = useState<"overview" | "campaigns" | "compose">("overview");
 
   // Check authentication on mount
   useEffect(() => {
@@ -39,6 +42,74 @@ export default function AdminPage() {
   async function handleLogout() {
     await fetch("/api/admin/auth", { method: "DELETE" });
     router.push("/admin/login");
+  }
+
+  // Campaigns list state & cancellation
+  const [campaignList, setCampaignList] = useState<any[]>([]);
+  const [isLoadingCampaigns, setIsLoadingCampaigns] = useState(false);
+  const [cancellingCampaignId, setCancellingCampaignId] = useState<string | null>(null);
+  const [campaignActionMsg, setCampaignActionMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
+
+  const loadCampaigns = useCallback(async () => {
+    setIsLoadingCampaigns(true);
+    try {
+      const res = await fetch("/api/admin/campaigns");
+      if (res.status === 401) {
+        router.push("/admin/login");
+        return;
+      }
+      const data = await res.json();
+      if (res.ok && data.campaigns) {
+        setCampaignList(data.campaigns);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setIsLoadingCampaigns(false);
+    }
+  }, [router]);
+
+  useEffect(() => {
+    if (activeTab === "campaigns") {
+      loadCampaigns();
+    }
+  }, [activeTab, loadCampaigns]);
+
+  async function handleCancelCampaign(campaignId: string, campaignTitle: string) {
+    if (
+      !confirm(
+        `Are you sure you want to cancel campaign: "${campaignTitle}"? This will abort pending dispatches immediately.`
+      )
+    ) {
+      return;
+    }
+    setCancellingCampaignId(campaignId);
+    setCampaignActionMsg(null);
+    try {
+      const res = await fetch(`/api/admin/campaigns/${campaignId}/cancel`, {
+        method: "POST",
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setCampaignActionMsg({
+          type: "error",
+          text: data.error || data.message || "Failed to cancel campaign",
+        });
+      } else {
+        setCampaignActionMsg({
+          type: "success",
+          text: data.message || "Campaign cancelled successfully.",
+        });
+        await loadCampaigns();
+      }
+    } catch {
+      setCampaignActionMsg({
+        type: "error",
+        text: "Failed to reach server to cancel campaign",
+      });
+    } finally {
+      setCancellingCampaignId(null);
+    }
   }
 
   // Compose State
@@ -131,6 +202,16 @@ export default function AdminPage() {
               }`}
             >
               Overview &amp; Telemetry
+            </button>
+            <button
+              onClick={() => setActiveTab("campaigns")}
+              className={`px-4 py-2 rounded-lg transition-all ${
+                activeTab === "campaigns"
+                  ? "bg-brand text-white shadow-md shadow-brand/20"
+                  : "hover:text-white"
+              }`}
+            >
+              Campaigns
             </button>
             <button
               onClick={() => setActiveTab("compose")}
@@ -273,6 +354,155 @@ export default function AdminPage() {
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {activeTab === "campaigns" && (
+        <div className="glass-card p-6 sm:p-8 rounded-3xl space-y-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-border">
+            <div>
+              <h2 className="text-xl font-bold text-white">Dispatched &amp; Scheduled Campaigns</h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Monitor delivery lifecycles, real-time dispatch progress, and execute atomic cancellations.
+              </p>
+            </div>
+            <button
+              onClick={loadCampaigns}
+              disabled={isLoadingCampaigns}
+              className="px-4 py-2 rounded-xl bg-surface-200 border border-border text-slate-300 hover:text-white text-xs font-semibold flex items-center gap-2 transition-all self-start sm:self-auto disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isLoadingCampaigns ? "animate-spin" : ""}`} />
+              <span>Refresh</span>
+            </button>
+          </div>
+
+          {campaignActionMsg && (
+            <div
+              className={`p-4 rounded-xl text-xs flex items-start gap-2.5 ${
+                campaignActionMsg.type === "success"
+                  ? "bg-emerald-950/40 border border-emerald-500/30 text-emerald-300"
+                  : "bg-rose-950/40 border border-rose-500/30 text-rose-300"
+              }`}
+            >
+              {campaignActionMsg.type === "success" ? (
+                <CheckCircle className="w-4 h-4 shrink-0 text-emerald-400 mt-0.5" />
+              ) : (
+                <AlertCircle className="w-4 h-4 shrink-0 text-rose-400 mt-0.5" />
+              )}
+              <span className="leading-relaxed">{campaignActionMsg.text}</span>
+            </div>
+          )}
+
+          {campaignList.length === 0 && !isLoadingCampaigns ? (
+            <div className="text-center py-16 px-4">
+              <Mail className="w-12 h-12 text-slate-600 mx-auto mb-3" />
+              <h3 className="text-base font-bold text-white">No campaigns found</h3>
+              <p className="text-xs text-slate-400 max-w-sm mx-auto mt-1 mb-5">
+                You haven&apos;t scheduled or sent any newsletter issues yet.
+              </p>
+              <button
+                onClick={() => setActiveTab("compose")}
+                className="px-5 py-2.5 rounded-xl bg-brand hover:bg-brand-hover text-white text-xs font-semibold inline-flex items-center gap-2 transition-all shadow-md shadow-brand/20"
+              >
+                <PlusCircle className="w-4 h-4" />
+                <span>Create First Campaign</span>
+              </button>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs text-slate-300">
+                <thead>
+                  <tr className="border-b border-border text-slate-400 uppercase tracking-wider text-[10px]">
+                    <th className="pb-3 pr-4 font-semibold">Issue</th>
+                    <th className="pb-3 px-4 font-semibold">Title &amp; Subject</th>
+                    <th className="pb-3 px-4 font-semibold">Status</th>
+                    <th className="pb-3 px-4 font-semibold">Recipients</th>
+                    <th className="pb-3 px-4 font-semibold">Timeline</th>
+                    <th className="pb-3 pl-4 text-right font-semibold">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/60">
+                  {campaignList.map((c) => {
+                    const isCancellable = c.status === "scheduled" || c.status === "sending";
+                    const isCancelling = cancellingCampaignId === c.id;
+
+                    const statusBadgeColors: Record<string, string> = {
+                      sent: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+                      partially_failed: "bg-amber-500/10 text-amber-400 border-amber-500/20",
+                      failed: "bg-rose-500/10 text-rose-400 border-rose-500/20",
+                      sending: "bg-sky-500/10 text-sky-400 border-sky-500/20",
+                      scheduled: "bg-violet-500/10 text-violet-400 border-violet-500/20",
+                      cancelled: "bg-slate-500/10 text-slate-400 border-slate-500/20",
+                    };
+
+                    return (
+                      <tr key={c.id} className="hover:bg-surface-200/50 transition-colors">
+                        <td className="py-4 pr-4 font-mono font-bold text-white">
+                          #{c.issueNumber ?? "—"}
+                        </td>
+                        <td className="py-4 px-4 max-w-xs">
+                          <div className="font-semibold text-white truncate">{c.title}</div>
+                          <div className="text-[11px] text-slate-400 truncate">{c.subject}</div>
+                        </td>
+                        <td className="py-4 px-4">
+                          <span
+                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-semibold border ${
+                              statusBadgeColors[c.status] || "bg-surface-200 text-slate-300 border-border"
+                            }`}
+                          >
+                            {c.status === "sending" && <RefreshCw className="w-3 h-3 animate-spin" />}
+                            {c.status}
+                          </span>
+                        </td>
+                        <td className="py-4 px-4">
+                          <div className="font-medium text-white">
+                            {c.successfulSends ?? 0} / {c.totalRecipients ?? 0} sent
+                          </div>
+                          {(c.failedSends ?? 0) > 0 && (
+                            <div className="text-[11px] text-rose-400">
+                              {c.failedSends} failed
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-4 px-4 text-[11px] text-slate-400">
+                          {c.sentAt ? (
+                            <div>Sent {new Date(c.sentAt).toLocaleDateString()}</div>
+                          ) : c.scheduledAt ? (
+                            <div>Sched {new Date(c.scheduledAt).toLocaleDateString()}</div>
+                          ) : (
+                            <div>Created {new Date(c.createdAt).toLocaleDateString()}</div>
+                          )}
+                        </td>
+                        <td className="py-4 pl-4 text-right">
+                          {isCancellable ? (
+                            <button
+                              onClick={() => handleCancelCampaign(c.id, c.title)}
+                              disabled={isCancelling}
+                              className="px-3 py-1.5 rounded-lg bg-rose-950/40 border border-rose-500/30 hover:bg-rose-900/50 hover:border-rose-500 text-rose-300 text-[11px] font-semibold inline-flex items-center gap-1.5 transition-all disabled:opacity-50"
+                            >
+                              {isCancelling ? (
+                                <>
+                                  <RefreshCw className="w-3 h-3 animate-spin" />
+                                  <span>Cancelling...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Ban className="w-3 h-3" />
+                                  <span>Cancel</span>
+                                </>
+                              )}
+                            </button>
+                          ) : (
+                            <span className="text-slate-500 text-[11px]">Finalized</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
 

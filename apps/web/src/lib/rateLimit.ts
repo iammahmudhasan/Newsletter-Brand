@@ -183,60 +183,107 @@ export function isPrivateOrLoopbackIp(ip: string): boolean {
 }
 
 /**
+ * Evaluates whether an IPv4 address falls within a CIDR subnet block (e.g. 10.0.0.0/8).
+ */
+export function matchesCidr(ip: string, cidr: string): boolean {
+  if (!ip || !cidr) return false;
+  const [range, bitsStr] = cidr.split("/");
+  const bits = parseInt(bitsStr, 10);
+  if (isNaN(bits) || bits < 0 || bits > 32) return false;
+
+  const ipParts = ip.split(".").map(Number);
+  const rangeParts = range.split(".").map(Number);
+  if (ipParts.length !== 4 || rangeParts.length !== 4) return false;
+  if (ipParts.some(isNaN) || rangeParts.some(isNaN)) return false;
+
+  const ipNum = ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
+  const rangeNum = ((rangeParts[0] << 24) | (rangeParts[1] << 16) | (rangeParts[2] << 8) | rangeParts[3]) >>> 0;
+  const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
+
+  return (ipNum & mask) === (rangeNum & mask);
+}
+
+/**
+ * Checks whether an IP matches any configured trusted proxy IP or CIDR block.
+ * Reads TRUSTED_PROXIES env var (comma-separated list of IPs or CIDR blocks).
+ * By default, private networks and loopback interfaces are treated as trusted proxy hops.
+ */
+export function isTrustedProxyHop(ip: string): boolean {
+  if (!ip || !isValidIpAddress(ip)) return false;
+  const trimmed = ip.trim().toLowerCase();
+
+  const configured = process.env.TRUSTED_PROXIES;
+  if (configured) {
+    const list = configured.split(",").map((s) => s.trim()).filter(Boolean);
+    for (const item of list) {
+      if (item.includes("/")) {
+        if (matchesCidr(trimmed, item)) return true;
+      } else if (item.toLowerCase() === trimmed) {
+        return true;
+      }
+    }
+  }
+
+  // Default to private/loopback/link-local networks as trusted reverse proxy infrastructure
+  return isPrivateOrLoopbackIp(trimmed);
+}
+
+/**
  * Extracts and sanitizes the client IP address from request headers.
  * Uses trusted proxy chain resolution with strict IPv4/IPv6 validation.
- * Traverses X-Forwarded-For from right to left to prevent client-injected header spoofing.
+ * Traverses X-Forwarded-For from right to left, peeling off trusted proxies
+ * to thwart client-injected header spoofing.
  */
 export function getClientIp(req: NextRequest): string {
   const trustEdge = process.env.TRUST_EDGE_HEADERS === "true" || process.env.TRUST_EDGE_HEADERS === "1";
+  const isProd = process.env.NODE_ENV === "production";
 
-  // 1. Next.js / Edge Runtime client IP (authoritative TCP socket connection address)
+  // 1. Next.js / Edge Runtime socket IP
   const nextIp = (req as any).ip;
   const hasValidNextIp = nextIp && typeof nextIp === "string" && isValidIpAddress(nextIp);
   const isDirectPublicSocket = hasValidNextIp && !isPrivateOrLoopbackIp(nextIp);
 
-  // If connected directly via a public socket (and edge trust is not explicitly forced),
-  // headers like cf-connecting-ip or x-forwarded-for sent by this direct client are untrusted.
-  if (isDirectPublicSocket && !trustEdge) {
+  // If connected directly via a public socket that is NOT in the trusted proxy list,
+  // edge headers sent by this client are untrusted (client header injection attack)
+  if (isDirectPublicSocket && !isTrustedProxyHop(nextIp) && !trustEdge) {
     return nextIp.trim();
   }
 
-  // 2. Cloudflare Edge authoritative header (sanitized and overwritten at Cloudflare edge)
-  const cfIp = req.headers.get("cf-connecting-ip")?.trim();
-  if (cfIp && isValidIpAddress(cfIp)) {
-    return cfIp;
+  // 2. Cloudflare Edge / CloudFront / Real-IP authoritative headers:
+  // Trusted when edge trust is forced, when in dev/test, or when connected via trusted proxy
+  const canTrustEdgeHeaders = trustEdge || !isProd || (hasValidNextIp && isTrustedProxyHop(nextIp));
+
+  if (canTrustEdgeHeaders) {
+    const cfIp = req.headers.get("cf-connecting-ip")?.trim();
+    if (cfIp && isValidIpAddress(cfIp)) {
+      return cfIp;
+    }
+
+    const cloudFrontIp = req.headers.get("cloudfront-viewer-address")?.split(":")[0]?.trim();
+    if (cloudFrontIp && isValidIpAddress(cloudFrontIp)) {
+      return cloudFrontIp;
+    }
+
+    const realIp = req.headers.get("x-real-ip")?.trim();
+    if (realIp && isValidIpAddress(realIp)) {
+      return realIp;
+    }
   }
 
-  // 3. AWS CloudFront authoritative client IP
-  const cloudFrontIp = req.headers.get("cloudfront-viewer-address")?.split(":")[0]?.trim();
-  if (cloudFrontIp && isValidIpAddress(cloudFrontIp)) {
-    return cloudFrontIp;
-  }
-
-  // 4. X-Real-IP (set by Nginx/Caddy via proxy_set_header X-Real-IP $remote_addr)
-  const realIp = req.headers.get("x-real-ip")?.trim();
-  if (realIp && isValidIpAddress(realIp)) {
-    return realIp;
-  }
-
-  // 5. Standard X-Forwarded-For: traverse from RIGHT to LEFT to thwart client header spoofing.
-  // In standard reverse proxy chains (e.g. ALB, Nginx, GCP), each proxy appends the remote address
-  // to the right: "<untrusted-client-header>, <trusted-proxy-added-ip>".
-  // The leftmost entries can be freely spoofed by attackers, so the rightmost public IP is authoritative.
+  // 3. X-Forwarded-For: Canonical reverse proxy traversal (right-to-left)
+  // Walk backwards from the nearest proxy to peel off known trusted proxies.
+  // The first untrusted IP encountered is the authoritative client IP.
   const forwarded = req.headers.get("x-forwarded-for");
   if (forwarded) {
     const parts = forwarded.split(",").map((s) => s.trim()).filter(Boolean);
-    // First attempt: rightmost valid public IP
-    for (let i = parts.length - 1; i >= 0; i--) {
-      const candidate = parts[i];
-      if (isValidIpAddress(candidate) && !isPrivateOrLoopbackIp(candidate)) {
-        return candidate;
-      }
-    }
-    // Fallback: rightmost valid IP (including private in dev/test setups)
+    // Walk from right to left, peeling off trusted proxies
     for (let i = parts.length - 1; i >= 0; i--) {
       const candidate = parts[i];
       if (isValidIpAddress(candidate)) {
+        // If candidate is a trusted proxy and not the leftmost hop, keep walking left
+        if (isTrustedProxyHop(candidate) && i > 0) {
+          continue;
+        }
         return candidate;
       }
     }

@@ -867,7 +867,12 @@ export async function handleProcessCampaignBatch(
     finalCampaignStatus = "failed";
   }
 
-  await db
+  // ATOMIC FINALIZATION FENCING:
+  // We strictly require campaigns.status = 'sending'.
+  // If a concurrent webhook has already reconciled the campaign into a terminal state ('partially_failed', 'failed', 'sent')
+  // or if an admin cancelled it, this conditional update returns 0 rows.
+  // The worker MUST NOT overwrite the webhook's fresh, accurate metrics with stale in-memory counters!
+  const [updatedCampaign] = await db
     .update(campaigns)
     .set({
       status: finalCampaignStatus,
@@ -880,9 +885,20 @@ export async function handleProcessCampaignBatch(
     .where(
       and(
         eq(campaigns.id, campaignId),
-        sql`${campaigns.status} <> 'cancelled'`
+        eq(campaigns.status, "sending")
       )
+    )
+    .returning({
+      id: campaigns.id,
+      status: campaigns.status,
+    });
+
+  if (!updatedCampaign) {
+    console.log(
+      `[Worker Finalization Notice] Campaign '${campaign.title}' was already transitioned away from 'sending' (e.g. by concurrent webhook reconciliation or admin cancellation). Skipping stale finalization write.`
     );
+    return;
+  }
 
   console.log(
     `[Worker] Campaign '${campaign.title}' dispatch finalized with status '${finalCampaignStatus}'. Sent: ${sent}, Failed: ${failed}, Total: ${total}.`

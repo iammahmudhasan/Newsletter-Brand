@@ -58,9 +58,10 @@ export async function GET(req: NextRequest) {
       })
       .from(campaignRecipients);
 
-    const [complaintTelemetry] = await db
+    const [eventTelemetry] = await db
       .select({
         uniqueComplaints: sql<number>`count(distinct coalesce(recipient_id::text, provider_message_id)) filter (where event_type = 'complaint')`,
+        uniqueDelivered: sql<number>`count(distinct coalesce(recipient_id::text, provider_message_id)) filter (where event_type = 'delivered')`,
       })
       .from(emailEvents);
 
@@ -68,7 +69,8 @@ export async function GET(req: NextRequest) {
     const deliveredCount = Number(recipientStats?.delivered || 0);
     const sentCount = Number(recipientStats?.sent || 0);
     const bounceCount = Number(recipientStats?.bounced || 0);
-    const complaintCount = Number(complaintTelemetry?.uniqueComplaints || 0);
+    const complaintCount = Number(eventTelemetry?.uniqueComplaints || 0);
+    const deliveredTelemetryCount = Number(eventTelemetry?.uniqueDelivered || 0);
 
     // Primary denominator for bounce rate: total attempted recipient dispatches (including unknown_outcome).
     let bounceDenominator = totalAttemptedSends;
@@ -81,9 +83,15 @@ export async function GET(req: NextRequest) {
       bounceDenominator = Number(fallbackEvents?.distinctMessages || 0);
     }
 
-    // Primary denominator for spam complaints: mailbox providers (Google/Yahoo) compute complaint rate
-    // strictly against successfully delivered messages. If delivered telemetry is pending, fall back to sent/attempted.
-    let complaintDenominator = deliveredCount > 0 ? deliveredCount : sentCount + deliveredCount;
+    // Stable denominator for spam complaints:
+    // Mailbox providers (Google/Yahoo) compute complaint rate strictly against successfully delivered messages.
+    // CRITICAL: We prioritize the immutable audit events (uniqueDelivered from email_events) over
+    // current recipient status, because when a complaint arrives, the recipient's status changes to 'failed',
+    // which would otherwise shrink deliveredCount and artificially inflate the complaint ratio!
+    let complaintDenominator = deliveredTelemetryCount > 0 ? deliveredTelemetryCount : deliveredCount;
+    if (complaintDenominator === 0) {
+      complaintDenominator = sentCount > 0 ? sentCount : totalAttemptedSends;
+    }
     if (complaintDenominator === 0) {
       complaintDenominator = bounceDenominator;
     }

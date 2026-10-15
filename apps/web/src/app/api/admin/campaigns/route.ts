@@ -4,6 +4,98 @@ import { enqueueJob } from "@ai-signal/queue";
 import { sanitizeNewsletterHtml } from "@ai-signal/email";
 import { isAuthorizedAdmin } from "@/lib/auth";
 
+async function readBodyWithIncrementalLimit(
+  req: NextRequest,
+  maxBytes: number
+): Promise<{ text: string } | { error: string; status: number }> {
+  const contentLength = req.headers.get("content-length");
+  if (contentLength && parseInt(contentLength, 10) > maxBytes) {
+    return {
+      error: `Payload too large: Content-Length exceeds ${maxBytes} bytes limit`,
+      status: 413,
+    };
+  }
+
+  if (!req.body) {
+    const raw = await req.text();
+    if (Buffer.byteLength(raw, "utf8") > maxBytes) {
+      return {
+        error: `Payload too large: request body exceeds ${maxBytes} bytes limit`,
+        status: 413,
+      };
+    }
+    return { text: raw };
+  }
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          await reader.cancel("Payload size limit exceeded");
+          return {
+            error: `Payload too large: request body exceeds ${maxBytes} bytes limit`,
+            status: 413,
+          };
+        }
+        chunks.push(value);
+      }
+    }
+  } catch (err: any) {
+    if (totalBytes > maxBytes) {
+      return {
+        error: `Payload too large: request body exceeds ${maxBytes} bytes limit`,
+        status: 413,
+      };
+    }
+    throw err;
+  }
+
+  const concatenated = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    concatenated.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return { text: new TextDecoder("utf-8").decode(concatenated) };
+}
+
+export async function GET(req: NextRequest) {
+  if (!isAuthorizedAdmin(req)) {
+    return NextResponse.json(
+      { error: "Unauthorized: Valid admin session required" },
+      { status: 401 }
+    );
+  }
+
+  const list = await db
+    .select({
+      id: campaigns.id,
+      issueNumber: campaigns.issueNumber,
+      title: campaigns.title,
+      subject: campaigns.subject,
+      status: campaigns.status,
+      scheduledAt: campaigns.scheduledAt,
+      sentAt: campaigns.sentAt,
+      totalRecipients: campaigns.totalRecipients,
+      successfulSends: campaigns.successfulSends,
+      failedSends: campaigns.failedSends,
+      createdAt: campaigns.createdAt,
+      updatedAt: campaigns.updatedAt,
+    })
+    .from(campaigns)
+    .orderBy(sql`${campaigns.issueNumber} DESC`);
+
+  return NextResponse.json({ campaigns: list });
+}
+
 export async function POST(req: NextRequest) {
   let resolvedIdempotencyKey: string | null = null;
 
@@ -15,27 +107,19 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1. Enforce strict stream size and Content-Length limits (1MB maximum payload)
+    // 1. Enforce strict stream size and incremental byte limits (1MB maximum payload)
     const MAX_PAYLOAD_BYTES = 1024 * 1024; // 1MB payload limit
-    const contentLength = req.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > MAX_PAYLOAD_BYTES) {
+    const streamResult = await readBodyWithIncrementalLimit(req, MAX_PAYLOAD_BYTES);
+    if ("error" in streamResult) {
       return NextResponse.json(
-        { error: "Payload too large: request body exceeds 1MB limit" },
-        { status: 413 }
-      );
-    }
-
-    const rawBody = await req.text();
-    if (Buffer.byteLength(rawBody, "utf8") > MAX_PAYLOAD_BYTES) {
-      return NextResponse.json(
-        { error: "Payload too large: request body exceeds 1MB limit" },
-        { status: 413 }
+        { error: streamResult.error },
+        { status: streamResult.status }
       );
     }
 
     let body: any;
     try {
-      body = JSON.parse(rawBody);
+      body = JSON.parse(streamResult.text);
     } catch {
       return NextResponse.json(
         { error: "Invalid JSON request body" },
