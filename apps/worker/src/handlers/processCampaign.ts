@@ -56,10 +56,13 @@ export async function handleProcessCampaignBatch(
   }
 
   // Safety check for terminal campaigns (sent, partially_failed, failed):
-  // Ensure no active, queued, or retryable unknown_outcome recipients remain before skipping
+  // Check if any active, queued, processing, or unknown_outcome recipients remain.
   if (["sent", "partially_failed", "failed"].includes(campaign.status)) {
-    const [hasActive] = await db
-      .select({ count: sql<number>`count(*)` })
+    const activeRecipients = await db
+      .select({
+        id: campaignRecipients.id,
+        status: campaignRecipients.status,
+      })
       .from(campaignRecipients)
       .where(
         and(
@@ -68,16 +71,40 @@ export async function handleProcessCampaignBatch(
         )
       );
 
-    if (Number(hasActive?.count || 0) === 0) {
+    if (activeRecipients.length === 0) {
       console.log(
         `[Worker] Campaign ${campaignId} has already reached terminal status '${campaign.status}' with 0 pending recipients, skipping duplicate dispatch.`
       );
       return;
     }
 
-    console.warn(
-      `[Worker Safety Recovery] Campaign ${campaignId} was marked '${campaign.status}' but still has ${hasActive?.count} pending/unknown_outcome recipients. Resuming dispatch.`
+    // CRITICAL FIX: Terminal Campaign Recipient Reconciliation
+    // A campaign in a terminal status ('sent', 'partially_failed', 'failed') must NEVER be restarted back to 'sending'
+    // as that violates terminal state immutability and confuses operators and webhooks.
+    // Instead, execute transactional reconciliation: transition all stranded active recipients to 'needs_review'
+    // with an explicit audit errorMessage, release any claim tokens, and emit a structured operator alert.
+    console.error(
+      `[OPERATOR ALERT - Terminal Campaign Inconsistency] Campaign ${campaignId} is in terminal status '${campaign.status}' but has ${activeRecipients.length} stranded active recipient(s). Reconciling stranded recipients to 'needs_review'.`
     );
+
+    await db.transaction(async (tx) => {
+      await tx
+        .update(campaignRecipients)
+        .set({
+          status: "needs_review",
+          errorMessage: `Reconciled: campaign already reached terminal status '${campaign.status}' while recipient was stranded in active state`,
+          claimToken: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(campaignRecipients.campaignId, campaignId),
+            sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
+          )
+        );
+    });
+
+    return;
   }
 
   // 1. Atomically ensure campaign status is 'sending' and persistent firstDispatchAt is established.
@@ -519,15 +546,15 @@ export async function handleProcessCampaignBatch(
             continue;
           }
 
-          // 2. Campaign cancellation barrier: ensure campaign wasn't cancelled mid-flight
+          // 2. Campaign cancellation and status barrier: ensure campaign is still in 'sending' status
           const [campaignState] = await db
             .select({ status: campaigns.status })
             .from(campaigns)
             .where(eq(campaigns.id, campaign.id));
 
-          if (campaignState?.status === "cancelled") {
+          if (campaignState?.status !== "sending") {
             console.warn(
-              `[Campaign Cancellation Barrier] Campaign ${campaign.id} was marked 'cancelled'. Halting dispatch.`
+              `[Campaign Status Barrier] Campaign ${campaign.id} is in status '${campaignState?.status || "missing"}' (not 'sending'). Halting dispatch immediately.`
             );
             failCount++;
             break;

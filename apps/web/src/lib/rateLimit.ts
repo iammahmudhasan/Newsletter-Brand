@@ -266,23 +266,21 @@ export function matchesCidr(ip: string, cidr: string): boolean {
  * Reads TRUSTED_PROXIES env var (comma-separated list of IPs or CIDR blocks).
  *
  * SECURITY RULES:
- * 1. Loopback addresses (127.0.0.1, ::1) are always trusted local hops.
- * 2. When TRUSTED_PROXIES is configured, ONLY explicitly matched IPs/subnets are trusted.
- *    Arbitrary unlisted private network IPs are NOT trusted.
- * 3. In production, if TRUSTED_PROXIES is not configured, arbitrary private IPs in request
- *    headers are NOT trusted by default to prevent spoofed 'X-Forwarded-For: attacker, 10.0.0.1' bypasses.
- * 4. In development and test environments, private networks are allowed for local reverse proxy testing.
+ * 1. For direct network sockets (options.isHeaderHop = false), loopback interfaces (127.0.0.1, ::1)
+ *    represent legitimate local reverse proxies (Nginx, Envoy) running on the same host.
+ * 2. For hops extracted from request headers (options.isHeaderHop = true), in production loopback
+ *    addresses (127.0.0.1, ::1) are NOT automatically trusted unless explicitly declared in
+ *    TRUSTED_PROXIES. This prevents attackers from spoofing identities with "X-Forwarded-For: 9.9.9.9, 127.0.0.1".
+ * 3. When TRUSTED_PROXIES is configured, explicit list matching always takes precedence.
+ * 4. In development and test environments, loopback and private networks are allowed for convenience.
  */
-export function isTrustedProxyHop(ip: string): boolean {
+export function isTrustedProxyHop(ip: string, options: { isHeaderHop?: boolean } = {}): boolean {
   if (!ip || !isValidIpAddress(ip)) return false;
   const trimmed = ip.trim().toLowerCase();
   const isProd = process.env.NODE_ENV === "production";
+  const isLoopback = trimmed === "127.0.0.1" || trimmed === "::1";
 
-  // Loopback interfaces (127.0.0.1, ::1) are always valid local hops
-  if (trimmed === "127.0.0.1" || trimmed === "::1") {
-    return true;
-  }
-
+  // Check explicit TRUSTED_PROXIES configuration first:
   const configured = process.env.TRUSTED_PROXIES;
   if (configured) {
     const list = configured.split(",").map((s) => s.trim()).filter(Boolean);
@@ -293,19 +291,34 @@ export function isTrustedProxyHop(ip: string): boolean {
         return true;
       }
     }
-    // When TRUSTED_PROXIES is explicitly configured, ONLY listed IPs/subnets are trusted
+
+    // When TRUSTED_PROXIES is explicitly configured, ONLY listed IPs/subnets are trusted.
+    // Socket loopback (127.0.0.1, ::1) is still trusted for local reverse proxy sockets,
+    // but header loopback hops MUST NOT be trusted unless explicitly in the allowlist.
+    if (isLoopback && !options.isHeaderHop) {
+      return true;
+    }
+
     return false;
   }
 
-  // In production, when TRUSTED_PROXIES is NOT configured:
-  // Do NOT blindly trust arbitrary private IP addresses in request headers,
-  // as an attacker directly reaching origin can forge "X-Forwarded-For: 9.9.9.9, 10.0.0.1"
-  // to change their rate-limit identity.
+  // In production without TRUSTED_PROXIES, header hops (including loopback 127.0.0.1 and ::1)
+  // MUST NOT be automatically trusted.
+  if (isProd && options.isHeaderHop) {
+    return false;
+  }
+
+  // Socket loopback (127.0.0.1, ::1) or dev/test header hops without explicit TRUSTED_PROXIES
+  if (isLoopback) {
+    return true;
+  }
+
+  // In production without matching TRUSTED_PROXIES, unlisted IPs are not trusted
   if (isProd) {
     return false;
   }
 
-  // In development and test environments, allow private networks for convenience
+  // In development and test environments without explicit TRUSTED_PROXIES, allow private networks
   return isPrivateOrLoopbackIp(trimmed);
 }
 
@@ -326,7 +339,7 @@ export function getClientIp(req: NextRequest): string {
 
   // If connected directly via a public socket that is NOT in the trusted proxy list,
   // edge headers sent by this client are untrusted (client header injection attack)
-  if (isDirectPublicSocket && !isTrustedProxyHop(nextIp) && !trustEdge) {
+  if (isDirectPublicSocket && !isTrustedProxyHop(nextIp, { isHeaderHop: false }) && !trustEdge) {
     return nextIp.trim();
   }
 
@@ -342,7 +355,7 @@ export function getClientIp(req: NextRequest): string {
     trustEdge ||
     !isProd ||
     isServerlessEdge ||
-    (hasValidNextIp && isTrustedProxyHop(nextIp));
+    (hasValidNextIp && isTrustedProxyHop(nextIp, { isHeaderHop: false }));
 
   if (canTrustEdgeHeaders) {
     const cfIp = req.headers.get("cf-connecting-ip")?.trim();
@@ -374,7 +387,7 @@ export function getClientIp(req: NextRequest): string {
     // Reject untrusted proxy chains to prevent header spoofing.
     if (isProd && !canTrustEdgeHeaders) {
       const nearestHop = parts[parts.length - 1];
-      if (!nearestHop || !isValidIpAddress(nearestHop) || !isTrustedProxyHop(nearestHop)) {
+      if (!nearestHop || !isValidIpAddress(nearestHop) || !isTrustedProxyHop(nearestHop, { isHeaderHop: true })) {
         if (hasValidNextIp) {
           return nextIp.trim();
         }
@@ -390,7 +403,7 @@ export function getClientIp(req: NextRequest): string {
       const candidate = parts[i];
       if (isValidIpAddress(candidate)) {
         // If candidate is a trusted proxy and not the leftmost hop, keep walking left
-        if (isTrustedProxyHop(candidate) && i > 0) {
+        if (isTrustedProxyHop(candidate, { isHeaderHop: true }) && i > 0) {
           continue;
         }
         return candidate;

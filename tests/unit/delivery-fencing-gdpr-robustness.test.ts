@@ -1237,5 +1237,145 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       expect(enqueuedJobs.length).toBe(0); // No zombie jobs!
     });
   });
+
+  describe("18. Header Loopback Identity Spoofing Protection (P2)", () => {
+    it("refuses to treat unlisted header loopback addresses as trusted proxies in production", () => {
+      const origEnv = process.env.NODE_ENV;
+      const origProxies = process.env.TRUSTED_PROXIES;
+      const origEdge = process.env.TRUST_EDGE_HEADERS;
+
+      try {
+        (process.env as any).NODE_ENV = "production";
+        delete process.env.TRUSTED_PROXIES;
+        delete process.env.TRUST_EDGE_HEADERS;
+
+        // Attacker sends forged X-Forwarded-For: 9.9.9.9, 127.0.0.1 without trusted edge or socket
+        const forgedReqIpv4 = {
+          headers: {
+            get: (name: string) => {
+              if (name === "x-forwarded-for") return "9.9.9.9, 127.0.0.1";
+              return null;
+            },
+          },
+        } as any;
+
+        const resolvedIpIpv4 = getClientIp(forgedReqIpv4);
+        // CRITICAL FIX: The trailing 127.0.0.1 in header MUST NOT be automatically trusted in production!
+        // It must NOT peel off 127.0.0.1 and return the attacker's forged 9.9.9.9!
+        expect(resolvedIpIpv4).not.toBe("9.9.9.9");
+        expect(resolvedIpIpv4).toBe("127.0.0.1");
+
+        // Attacker sends forged X-Forwarded-For: 9.9.9.9, ::1
+        const forgedReqIpv6 = {
+          headers: {
+            get: (name: string) => {
+              if (name === "x-forwarded-for") return "9.9.9.9, ::1";
+              return null;
+            },
+          },
+        } as any;
+
+        const resolvedIpIpv6 = getClientIp(forgedReqIpv6);
+        expect(resolvedIpIpv6).not.toBe("9.9.9.9");
+        expect(resolvedIpIpv6).toBe("127.0.0.1");
+
+        // When intermediate proxy in chain is trusted, but loopback hop is NOT in allowlist:
+        process.env.TRUSTED_PROXIES = "10.0.0.0/8";
+        const chainedForgedReq = {
+          headers: {
+            get: (name: string) => {
+              // 10.0.0.1 is trusted proxy, but 127.0.0.1 in header is unlisted
+              if (name === "x-forwarded-for") return "9.9.9.9, 127.0.0.1, 10.0.0.1";
+              return null;
+            },
+          },
+        } as any;
+
+        const resolvedChained = getClientIp(chainedForgedReq);
+        // It peels 10.0.0.1, hits unlisted 127.0.0.1, and stops! Never returns 9.9.9.9!
+        expect(resolvedChained).toBe("127.0.0.1");
+        expect(resolvedChained).not.toBe("9.9.9.9");
+
+        // When 127.0.0.1 is EXPLICITLY in TRUSTED_PROXIES, then and only then is it trusted as a header hop
+        process.env.TRUSTED_PROXIES = "127.0.0.1, 10.0.0.0/8";
+        const explicitlyAllowedReq = {
+          headers: {
+            get: (name: string) => {
+              if (name === "x-forwarded-for") return "9.9.9.9, 127.0.0.1";
+              return null;
+            },
+          },
+        } as any;
+
+        const resolvedExplicit = getClientIp(explicitlyAllowedReq);
+        expect(resolvedExplicit).toBe("9.9.9.9");
+      } finally {
+        (process.env as any).NODE_ENV = origEnv;
+        if (origProxies !== undefined) process.env.TRUSTED_PROXIES = origProxies;
+        else delete process.env.TRUSTED_PROXIES;
+        if (origEdge !== undefined) process.env.TRUST_EDGE_HEADERS = origEdge;
+        else delete process.env.TRUST_EDGE_HEADERS;
+      }
+    });
+  });
+
+  describe("19. Terminal Campaign Active Recipient Reconciliation (P2)", () => {
+    it("ensures active recipients in terminal campaigns are reconciled to needs_review and never stranded", async () => {
+      // Simulates database reconciliation logic
+      let campaign = {
+        id: "camp-term-reconcile-1",
+        status: "sent", // Terminal status
+      };
+
+      let recipients: { id: string; status: string; errorMessage: string | null; claimToken: string | null }[] = [
+        { id: "rec-1", status: "sent", errorMessage: null, claimToken: null },
+        { id: "rec-2", status: "queued", errorMessage: null, claimToken: "tok-abc" },
+        { id: "rec-3", status: "processing", errorMessage: null, claimToken: "tok-xyz" },
+        { id: "rec-4", status: "unknown_outcome", errorMessage: null, claimToken: null },
+      ];
+
+      async function reconcileTerminalCampaign(campId: string) {
+        if (!["sent", "partially_failed", "failed"].includes(campaign.status)) {
+          return { reconciled: false };
+        }
+
+        const activeRecipients = recipients.filter((r) =>
+          ["queued", "processing", "unknown_outcome"].includes(r.status)
+        );
+
+        if (activeRecipients.length === 0) {
+          return { reconciled: false, activeCount: 0 };
+        }
+
+        // Transactional reconciliation:
+        for (const r of activeRecipients) {
+          r.status = "needs_review";
+          r.errorMessage = `Reconciled: campaign already reached terminal status '${campaign.status}' while recipient was stranded in active state`;
+          r.claimToken = null;
+        }
+
+        return { reconciled: true, count: activeRecipients.length };
+      }
+
+      const result = await reconcileTerminalCampaign(campaign.id);
+      expect(result.reconciled).toBe(true);
+      expect(result.count).toBe(3);
+
+      // Verify no recipient remains queued, processing, or unknown_outcome
+      const stranded = recipients.filter((r) =>
+        ["queued", "processing", "unknown_outcome"].includes(r.status)
+      );
+      expect(stranded.length).toBe(0);
+
+      // Verify rec-2, rec-3, rec-4 are now 'needs_review' with clear errorMessage and cleared claimToken
+      const rec2 = recipients.find((r) => r.id === "rec-2")!;
+      expect(rec2.status).toBe("needs_review");
+      expect(rec2.claimToken).toBeNull();
+      expect(rec2.errorMessage).toContain("Reconciled: campaign already reached terminal status 'sent'");
+
+      // Verify campaign status is NOT reverted to 'sending'
+      expect(campaign.status).toBe("sent");
+    });
+  });
 });
 

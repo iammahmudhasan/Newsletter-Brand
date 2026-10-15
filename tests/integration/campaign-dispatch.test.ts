@@ -1026,23 +1026,30 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
 
         testCampId = insertedCamp.id;
 
-        // Test Order 1: Cancellation transaction runs and commits
-        await db.transaction(async (tx) => {
+        // Concurrent Concurrency Test Order 1:
+        // Cancellation transaction holds FOR UPDATE lock; Recovery transaction executes concurrently,
+        // blocks on PostgreSQL row lock waiting for commit, then reads committed 'cancelled' state and aborts.
+        const cancelTx1 = db.transaction(async (tx) => {
           const [locked] = await tx.execute<typeof campaigns.$inferSelect>(sql`
             SELECT * FROM campaigns WHERE id = ${testCampId} FOR UPDATE;
           `);
           expect(locked).toBeDefined();
-          await tx.update(campaigns).set({ status: "cancelled" }).where(eq(campaigns.id, testCampId));
+          // Hold the PostgreSQL row lock for 50ms so recoveryTx1 is forced to wait on the lock
+          await new Promise((r) => setTimeout(r, 50));
+          await tx.update(campaigns).set({ status: "cancelled", updatedAt: new Date() }).where(eq(campaigns.id, testCampId));
           await tx.execute(sql`DELETE FROM automation_jobs WHERE (payload->>'campaignId' = ${testCampId});`);
+          return "cancelled";
         });
 
-        // Now worker/scheduler transaction attempts recovery on the same row:
-        const scheduledJobId = await db.transaction(async (tx) => {
+        const recoveryTx1 = db.transaction(async (tx) => {
+          // Allow cancelTx1 to acquire the FOR UPDATE row lock first
+          await new Promise((r) => setTimeout(r, 10));
+          // In real PostgreSQL, this query BLOCKS until cancelTx1 commits!
           const [locked] = await tx.execute<typeof campaigns.$inferSelect>(sql`
             SELECT * FROM campaigns WHERE id = ${testCampId} FOR UPDATE;
           `);
           if (!locked || locked.status !== "sending") {
-            return null; // Successfully refused!
+            return null; // Successfully refused after lock release!
           }
           await tx.insert(automationJobs).values({
             jobName: "process_campaign",
@@ -1050,51 +1057,73 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
             status: "pending",
             scheduledFor: new Date(),
             maxRetries: 3,
-            idempotencyKey: `test:job:${Date.now()}`,
+            idempotencyKey: `test:job:concurrent1:${Date.now()}`,
           });
           return "enqueued";
         });
 
-        expect(scheduledJobId).toBeNull();
+        const [c1Result, r1Result] = await Promise.all([cancelTx1, recoveryTx1]);
+        expect(c1Result).toBe("cancelled");
+        expect(r1Result).toBeNull();
 
-        // Verify in PostgreSQL: 0 jobs exist
-        const remainingJobs = await db.execute(sql`
+        // Verify in PostgreSQL: exactly 0 automation jobs exist
+        const remainingJobs1 = await db.execute(sql`
           SELECT count(*)::int as count FROM automation_jobs WHERE (payload->>'campaignId' = ${testCampId});
         `);
-        expect((remainingJobs as any)[0]?.count).toBe(0);
+        expect((remainingJobs1 as any)[0]?.count).toBe(0);
 
-        // Test Order 2: Re-test with scheduler recovery first, then cancellation
-        await db.update(campaigns).set({ status: "sending" }).where(eq(campaigns.id, testCampId));
+        // Concurrent Concurrency Test Order 2:
+        // Recovery transaction holds FOR UPDATE lock first and enqueues; Cancellation transaction executes
+        // concurrently, blocks on the lock, and upon commit purges the enqueued job from automation_jobs.
+        await db.update(campaigns).set({ status: "sending", updatedAt: new Date() }).where(eq(campaigns.id, testCampId));
 
-        await db.transaction(async (tx) => {
+        const recoveryTx2 = db.transaction(async (tx) => {
           const [locked] = await tx.execute<typeof campaigns.$inferSelect>(sql`
             SELECT * FROM campaigns WHERE id = ${testCampId} FOR UPDATE;
           `);
           expect(locked.status).toBe("sending");
+          // Hold row lock for 50ms so cancelTx2 blocks on the PostgreSQL lock
+          await new Promise((r) => setTimeout(r, 50));
           await tx.insert(automationJobs).values({
             jobName: "process_campaign",
             payload: { campaignId: testCampId },
             status: "pending",
             scheduledFor: new Date(),
             maxRetries: 3,
-            idempotencyKey: `test:job:order2:${Date.now()}`,
+            idempotencyKey: `test:job:concurrent2:${Date.now()}`,
           });
+          return "enqueued";
         });
 
-        // Now cancellation runs
-        await db.transaction(async (tx) => {
+        const cancelTx2 = db.transaction(async (tx) => {
+          // Allow recoveryTx2 to acquire the FOR UPDATE row lock first
+          await new Promise((r) => setTimeout(r, 10));
+          // In real PostgreSQL, this query BLOCKS until recoveryTx2 commits!
           const [locked] = await tx.execute<typeof campaigns.$inferSelect>(sql`
             SELECT * FROM campaigns WHERE id = ${testCampId} FOR UPDATE;
           `);
-          await tx.update(campaigns).set({ status: "cancelled" }).where(eq(campaigns.id, testCampId));
+          expect(locked).toBeDefined();
+          await tx.update(campaigns).set({ status: "cancelled", updatedAt: new Date() }).where(eq(campaigns.id, testCampId));
           await tx.execute(sql`DELETE FROM automation_jobs WHERE (payload->>'campaignId' = ${testCampId});`);
+          return "cancelled";
         });
 
-        // Verify in PostgreSQL: 0 jobs exist
-        const finalJobs = await db.execute(sql`
+        const [r2Result, c2Result] = await Promise.all([recoveryTx2, cancelTx2]);
+        expect(r2Result).toBe("enqueued");
+        expect(c2Result).toBe("cancelled");
+
+        // Verify in PostgreSQL: cancellation purged the enqueued job, leaving exactly 0 jobs
+        const remainingJobs2 = await db.execute(sql`
           SELECT count(*)::int as count FROM automation_jobs WHERE (payload->>'campaignId' = ${testCampId});
         `);
-        expect((finalJobs as any)[0]?.count).toBe(0);
+        expect((remainingJobs2 as any)[0]?.count).toBe(0);
+
+        // Verify final campaign state is 'cancelled'
+        const [finalState] = await db
+          .select({ status: campaigns.status })
+          .from(campaigns)
+          .where(eq(campaigns.id, testCampId));
+        expect(finalState?.status).toBe("cancelled");
       } finally {
         // Cleanup test data
         try {
