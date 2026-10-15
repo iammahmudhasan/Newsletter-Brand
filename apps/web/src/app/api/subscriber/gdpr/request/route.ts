@@ -56,7 +56,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 2. Cooldown per email address (max 1 request per 10 minutes per email to avoid email bombing) with failClosed policy
-    const emailCooldown = await checkEmailCooldown(normalized, 600, { failClosed: true });
+    const emailCooldown = await checkEmailCooldown(normalized, 600, { failClosed: true, actionScope: "gdpr" });
     if (!emailCooldown.allowed) {
       // Privacy-preserving response: Do not leak whether the account exists or failed cooldown
       return NextResponse.json({

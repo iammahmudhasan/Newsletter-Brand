@@ -16,6 +16,14 @@ export interface RateLimitOptions {
   failClosed?: boolean;
 }
 
+export interface EmailCooldownOptions extends RateLimitOptions {
+  /**
+   * Action scope prefix to isolate cooldowns across different domains
+   * (e.g. 'signup' -> 'signup:email_cooldown', 'gdpr' -> 'gdpr:email_cooldown').
+   */
+  actionScope?: string;
+}
+
 // In-memory fallback stores for unit test suites and offline environments
 const rateLimitStore = new Map<string, RateLimitEntry>();
 const emailCooldownStore = new Map<string, number>();
@@ -99,26 +107,78 @@ export async function cleanupExpiredRateLimits(): Promise<number> {
 }
 
 /**
- * Checks whether an IP address belongs to private, loopback, or link-local ranges.
+ * Checks whether an IP address belongs to private, loopback, link-local,
+ * Carrier-Grade NAT (RFC 6598), or reserved special-purpose ranges (IPv4 & IPv6).
  */
 export function isPrivateOrLoopbackIp(ip: string): boolean {
   if (!ip || typeof ip !== "string") return false;
   const trimmed = ip.trim().toLowerCase();
-  if (trimmed === "127.0.0.1" || trimmed === "::1" || trimmed === "localhost") return true;
-
-  const parts = trimmed.split(".").map(Number);
-  if (parts.length === 4) {
-    if (parts[0] === 10) return true;
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-    if (parts[0] === 192 && parts[1] === 168) return true;
-    if (parts[0] === 127) return true;
-    if (parts[0] === 169 && parts[1] === 254) return true; // Link-local
-    if (parts[0] === 0) return true;
-  }
-
-  if (trimmed.startsWith("fc00:") || trimmed.startsWith("fd00:") || trimmed.startsWith("fe80:")) {
+  if (
+    trimmed === "127.0.0.1" ||
+    trimmed === "::1" ||
+    trimmed === "::" ||
+    trimmed === "0.0.0.0" ||
+    trimmed === "localhost"
+  ) {
     return true;
   }
+
+  // Handle IPv4-mapped IPv6 (e.g., ::ffff:192.168.1.1 or 0:0:0:0:0:ffff:10.0.0.1)
+  if (trimmed.startsWith("::ffff:") || trimmed.startsWith("0:0:0:0:0:ffff:")) {
+    const lastColon = trimmed.lastIndexOf(":");
+    const mappedIpv4 = trimmed.slice(lastColon + 1);
+    if (mappedIpv4.includes(".")) {
+      return isPrivateOrLoopbackIp(mappedIpv4);
+    }
+  }
+
+  // IPv4 range checks
+  const parts = trimmed.split(".").map(Number);
+  if (parts.length === 4 && parts.every((p) => !isNaN(p) && p >= 0 && p <= 255)) {
+    // 0.0.0.0/8 - Current network (RFC 1122)
+    if (parts[0] === 0) return true;
+    // 10.0.0.0/8 - Private-use (RFC 1918)
+    if (parts[0] === 10) return true;
+    // 100.64.0.0/10 - Shared address space / Carrier-Grade NAT (RFC 6598)
+    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true;
+    // 127.0.0.0/8 - Loopback (RFC 1122)
+    if (parts[0] === 127) return true;
+    // 169.254.0.0/16 - Link-local (RFC 3927)
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    // 172.16.0.0/12 - Private-use (RFC 1918)
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    // 192.0.0.0/24 - IETF protocol assignments (RFC 6890)
+    if (parts[0] === 192 && parts[1] === 0 && parts[2] === 0) return true;
+    // 192.168.0.0/16 - Private-use (RFC 1918)
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    // 198.18.0.0/15 - Benchmarking (RFC 2544)
+    if (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19)) return true;
+    // 224.0.0.0/4 - Multicast (RFC 5771)
+    if (parts[0] >= 224 && parts[0] <= 239) return true;
+    // 240.0.0.0/4 - Reserved for future use / Broadcast (RFC 1112)
+    if (parts[0] >= 240) return true;
+
+    return false;
+  }
+
+  // IPv6 range checks
+  if (trimmed.includes(":")) {
+    const firstHextetStr = trimmed.split(":")[0];
+    if (firstHextetStr) {
+      const firstHextet = parseInt(firstHextetStr, 16);
+      if (!isNaN(firstHextet)) {
+        // fc00::/7 - Unique Local Addresses (RFC 4193: 0xfc00 through 0xfdff)
+        if (firstHextet >= 0xfc00 && firstHextet <= 0xfdff) return true;
+        // fe80::/10 - Link-local Unicast (RFC 4291: 0xfe80 through 0xfebf)
+        if (firstHextet >= 0xfe80 && firstHextet <= 0xfebf) return true;
+        // fec0::/10 - Deprecated Site-local (RFC 3879: 0xfec0 through 0xfeff)
+        if (firstHextet >= 0xfec0 && firstHextet <= 0xfeff) return true;
+        // ff00::/8 - Multicast (RFC 4291: 0xff00 through 0xffff)
+        if (firstHextet >= 0xff00 && firstHextet <= 0xffff) return true;
+      }
+    }
+  }
+
   return false;
 }
 
@@ -128,9 +188,16 @@ export function isPrivateOrLoopbackIp(ip: string): boolean {
  * Traverses X-Forwarded-For from right to left to prevent client-injected header spoofing.
  */
 export function getClientIp(req: NextRequest): string {
+  const trustEdge = process.env.TRUST_EDGE_HEADERS === "true" || process.env.TRUST_EDGE_HEADERS === "1";
+
   // 1. Next.js / Edge Runtime client IP (authoritative TCP socket connection address)
   const nextIp = (req as any).ip;
-  if (nextIp && typeof nextIp === "string" && isValidIpAddress(nextIp)) {
+  const hasValidNextIp = nextIp && typeof nextIp === "string" && isValidIpAddress(nextIp);
+  const isDirectPublicSocket = hasValidNextIp && !isPrivateOrLoopbackIp(nextIp);
+
+  // If connected directly via a public socket (and edge trust is not explicitly forced),
+  // headers like cf-connecting-ip or x-forwarded-for sent by this direct client are untrusted.
+  if (isDirectPublicSocket && !trustEdge) {
     return nextIp.trim();
   }
 
@@ -173,6 +240,10 @@ export function getClientIp(req: NextRequest): string {
         return candidate;
       }
     }
+  }
+
+  if (hasValidNextIp) {
+    return nextIp.trim();
   }
 
   return "127.0.0.1";
@@ -279,10 +350,11 @@ export async function checkRateLimit(
 export async function checkEmailCooldown(
   email: string,
   cooldownSeconds: number,
-  options?: RateLimitOptions
+  options?: EmailCooldownOptions
 ): Promise<{ allowed: boolean; retryAfterSeconds?: number }> {
   const normalized = email.toLowerCase().trim();
-  const cooldownKey = pseudonymizeRateLimitKey("email_cooldown", normalized);
+  const prefix = options?.actionScope ? `${options.actionScope}:email_cooldown` : "email_cooldown";
+  const cooldownKey = pseudonymizeRateLimitKey(prefix, normalized);
   const now = Date.now();
   let dbFailed = false;
 

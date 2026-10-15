@@ -146,12 +146,14 @@ export async function POST(req: NextRequest) {
         .onConflictDoNothing();
 
       // 6. Delete any rate limit or action cooldown entries associated with this email
-      const cooldownKey = pseudonymizeRateLimitKey("email_cooldown", normalizedEmail);
+      const legacyCooldownKey = pseudonymizeRateLimitKey("email_cooldown", normalizedEmail);
+      const signupCooldownKey = pseudonymizeRateLimitKey("signup:email_cooldown", normalizedEmail);
+      const gdprCooldownKey = pseudonymizeRateLimitKey("gdpr:email_cooldown", normalizedEmail);
       const signupEmailKey = pseudonymizeRateLimitKey("signup:email", normalizedEmail);
       const gdprEmailKey = pseudonymizeRateLimitKey("gdpr:email", normalizedEmail);
       await tx.execute(sql`
         DELETE FROM rate_limits
-        WHERE key IN (${cooldownKey}, ${signupEmailKey}, ${gdprEmailKey});
+        WHERE key IN (${legacyCooldownKey}, ${signupCooldownKey}, ${gdprCooldownKey}, ${signupEmailKey}, ${gdprEmailKey});
       `);
     });
 

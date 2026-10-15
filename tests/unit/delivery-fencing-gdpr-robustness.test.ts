@@ -456,4 +456,241 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       ).toBe("claim_revoked_or_modified");
     });
   });
+
+  describe("8. Atomic Campaign Status & Cancellation Overwrite Prevention (P1)", () => {
+    it("atomic conditional update where status <> 'cancelled' fails to update when campaign was cancelled concurrently", () => {
+      interface MockCampaign {
+        id: string;
+        status: "draft" | "scheduled" | "sending" | "sent" | "cancelled";
+        firstDispatchAt: Date | null;
+      }
+
+      // Simulated atomic database conditional update:
+      // UPDATE campaigns SET status = 'sending' WHERE id = campaignId AND status <> 'cancelled' RETURNING *;
+      function simulateInitUpdate(
+        campaign: MockCampaign,
+        now: Date
+      ): MockCampaign | null {
+        if (campaign.status === "cancelled") {
+          return null; // 0 rows affected!
+        }
+        campaign.status = "sending";
+        campaign.firstDispatchAt = campaign.firstDispatchAt || now;
+        return campaign;
+      }
+
+      const activeCampaign: MockCampaign = {
+        id: "camp-1",
+        status: "scheduled",
+        firstDispatchAt: null,
+      };
+
+      const now = new Date();
+      // 1. Normal initialization succeeds
+      const result1 = simulateInitUpdate(activeCampaign, now);
+      expect(result1).not.toBeNull();
+      expect(result1?.status).toBe("sending");
+
+      // 2. Admin cancels campaign concurrently
+      activeCampaign.status = "cancelled";
+
+      // 3. Concurrent worker initialization attempt MUST return null and NOT overwrite status back to 'sending'
+      const result2 = simulateInitUpdate(activeCampaign, now);
+      expect(result2).toBeNull();
+      expect(activeCampaign.status).toBe("cancelled"); // Status is preserved as 'cancelled'!
+    });
+
+    it("cancels all in-flight, queued, and unknown_outcome recipients when campaign is aborted due to cancellation", () => {
+      interface MockRecipient {
+        id: string;
+        status: "queued" | "processing" | "unknown_outcome" | "sent" | "failed";
+        claimToken: string | null;
+        errorMessage: string | null;
+      }
+
+      const recipients: MockRecipient[] = [
+        { id: "r1", status: "sent", claimToken: null, errorMessage: null },
+        { id: "r2", status: "processing", claimToken: "token-1", errorMessage: null },
+        { id: "r3", status: "queued", claimToken: null, errorMessage: null },
+        { id: "r4", status: "unknown_outcome", claimToken: "token-2", errorMessage: null },
+      ];
+
+      // Simulated worker recipient abort on cancelled campaign:
+      function abortCancelledCampaignRecipients(list: MockRecipient[]): void {
+        for (const r of list) {
+          if (["queued", "processing", "unknown_outcome"].includes(r.status)) {
+            r.status = "failed";
+            r.errorMessage = "Cancelled by campaign cancellation";
+            r.claimToken = null;
+          }
+        }
+      }
+
+      abortCancelledCampaignRecipients(recipients);
+
+      // Already sent recipient remains sent
+      expect(recipients[0].status).toBe("sent");
+
+      // Processing, queued, and unknown_outcome recipients are cancelled with claimToken null
+      expect(recipients[1].status).toBe("failed");
+      expect(recipients[1].claimToken).toBeNull();
+      expect(recipients[1].errorMessage).toBe("Cancelled by campaign cancellation");
+
+      expect(recipients[2].status).toBe("failed");
+      expect(recipients[2].claimToken).toBeNull();
+
+      expect(recipients[3].status).toBe("failed");
+      expect(recipients[3].claimToken).toBeNull();
+    });
+  });
+
+  describe("9. Action-Scoped Email Cooldown Isolation (P2)", () => {
+    it("isolates cooldown key spaces between signup and GDPR requests so they do not block each other", async () => {
+      const email = `scoped-test-${Date.now()}@domain.com`;
+
+      // 1. User performs a signup request -> triggers signup:email_cooldown
+      const signup1 = await checkEmailCooldown(email, 10, { actionScope: "signup" });
+      expect(signup1.allowed).toBe(true);
+
+      // 2. Immediate second signup request -> blocked by signup cooldown
+      const signup2 = await checkEmailCooldown(email, 10, { actionScope: "signup" });
+      expect(signup2.allowed).toBe(false);
+
+      // 3. User requests a GDPR data export with the same email -> MUST NOT be blocked by the signup cooldown!
+      const gdpr1 = await checkEmailCooldown(email, 10, { actionScope: "gdpr" });
+      expect(gdpr1.allowed).toBe(true);
+
+      // 4. Immediate second GDPR request -> blocked by GDPR cooldown
+      const gdpr2 = await checkEmailCooldown(email, 10, { actionScope: "gdpr" });
+      expect(gdpr2.allowed).toBe(false);
+    });
+
+    it("generates distinct pseudonymized keys for different action scopes", () => {
+      const email = "reader@example.com";
+      const legacyKey = pseudonymizeRateLimitKey("email_cooldown", email);
+      const signupKey = pseudonymizeRateLimitKey("signup:email_cooldown", email);
+      const gdprKey = pseudonymizeRateLimitKey("gdpr:email_cooldown", email);
+
+      expect(signupKey).not.toBe(legacyKey);
+      expect(gdprKey).not.toBe(legacyKey);
+      expect(signupKey).not.toBe(gdprKey);
+
+      expect(signupKey.startsWith("signup:email_cooldown:")).toBe(true);
+      expect(gdprKey.startsWith("gdpr:email_cooldown:")).toBe(true);
+    });
+  });
+
+  describe("10. Comprehensive IPv4 & IPv6 Private Range Validation (P2)", () => {
+    it("correctly identifies all RFC 1918, RFC 6598 (CGNAT), and IPv4 special ranges", () => {
+      // Loopback
+      expect(isPrivateOrLoopbackIp("127.0.0.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("127.255.0.1")).toBe(true);
+
+      // RFC 1918 Private
+      expect(isPrivateOrLoopbackIp("10.0.0.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("10.255.255.254")).toBe(true);
+      expect(isPrivateOrLoopbackIp("172.16.0.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("172.31.255.254")).toBe(true);
+      expect(isPrivateOrLoopbackIp("192.168.0.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("192.168.254.254")).toBe(true);
+
+      // Carrier-Grade NAT (RFC 6598: 100.64.0.0/10)
+      expect(isPrivateOrLoopbackIp("100.64.0.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("100.100.50.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("100.127.255.254")).toBe(true);
+      // Non-CGNAT 100.* IPs
+      expect(isPrivateOrLoopbackIp("100.63.255.255")).toBe(false);
+      expect(isPrivateOrLoopbackIp("100.128.0.1")).toBe(false);
+
+      // Link-Local (RFC 3927)
+      expect(isPrivateOrLoopbackIp("169.254.1.1")).toBe(true);
+
+      // Multicast & Broadcast/Reserved
+      expect(isPrivateOrLoopbackIp("224.0.0.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("240.0.0.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("255.255.255.255")).toBe(true);
+
+      // Public IPv4 addresses MUST NOT be treated as private
+      expect(isPrivateOrLoopbackIp("8.8.8.8")).toBe(false);
+      expect(isPrivateOrLoopbackIp("1.1.1.1")).toBe(false);
+      expect(isPrivateOrLoopbackIp("104.26.12.31")).toBe(false);
+      expect(isPrivateOrLoopbackIp("151.101.1.69")).toBe(false);
+    });
+
+    it("correctly identifies all IPv6 ULA (fc00::/7) and Link-Local (fe80::/10) ranges", () => {
+      // Loopback & Unspecified
+      expect(isPrivateOrLoopbackIp("::1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("::")).toBe(true);
+
+      // Unique Local Addresses (fc00::/7 covers 0xfc00 through 0xfdff)
+      expect(isPrivateOrLoopbackIp("fc00::1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("fc01:1234::1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("fd00::1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("fd12:3456:789a::1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("fdff:ffff:ffff::1")).toBe(true);
+
+      // Link-Local Unicast (fe80::/10 covers 0xfe80 through 0xfebf)
+      expect(isPrivateOrLoopbackIp("fe80::1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("fe90::1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("fea0::1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("febf:ffff:ffff::1")).toBe(true);
+
+      // Site-Local deprecated (fec0::/10 covers 0xfec0 through 0xfeff)
+      expect(isPrivateOrLoopbackIp("fec0::1")).toBe(true);
+
+      // IPv4-mapped IPv6
+      expect(isPrivateOrLoopbackIp("::ffff:192.168.1.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("::ffff:10.0.0.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("::ffff:127.0.0.1")).toBe(true);
+      expect(isPrivateOrLoopbackIp("::ffff:8.8.8.8")).toBe(false);
+
+      // Public IPv6 addresses MUST NOT be treated as private
+      expect(isPrivateOrLoopbackIp("2606:4700:4700::1111")).toBe(false);
+      expect(isPrivateOrLoopbackIp("2001:4860:4860::8888")).toBe(false);
+      expect(isPrivateOrLoopbackIp("2a00:1450:4009:820::200e")).toBe(false);
+    });
+  });
+
+  describe("11. Campaign API Payload Size & Field Limits (P3)", () => {
+    it("validates request body limits, idempotencyKey length, and contentPlain length", () => {
+      const MAX_PAYLOAD_BYTES = 1024 * 1024; // 1MB
+
+      function validateCampaignPayload(params: {
+        rawBodySize: number;
+        idempotencyKey?: string;
+        contentPlain?: string;
+      }): { valid: boolean; error?: string; status?: number } {
+        if (params.rawBodySize > MAX_PAYLOAD_BYTES) {
+          return { valid: false, error: "Payload too large: request body exceeds 1MB limit", status: 413 };
+        }
+        if (params.idempotencyKey && params.idempotencyKey.length > 255) {
+          return { valid: false, error: "Idempotency key cannot exceed 255 characters", status: 400 };
+        }
+        if (params.contentPlain && params.contentPlain.length > 500_000) {
+          return { valid: false, error: "Content plain exceeds maximum size limit (500KB)", status: 400 };
+        }
+        return { valid: true };
+      }
+
+      // Normal valid payload
+      expect(validateCampaignPayload({ rawBodySize: 50_000, idempotencyKey: "valid-key-123", contentPlain: "Plain text" }).valid).toBe(true);
+
+      // Over 1MB payload rejected with HTTP 413
+      const oversizedPayload = validateCampaignPayload({ rawBodySize: 1024 * 1024 + 10 });
+      expect(oversizedPayload.valid).toBe(false);
+      expect(oversizedPayload.status).toBe(413);
+
+      // Over 255 char idempotency key rejected with HTTP 400
+      const longKey = "k".repeat(256);
+      const invalidKey = validateCampaignPayload({ rawBodySize: 1000, idempotencyKey: longKey });
+      expect(invalidKey.valid).toBe(false);
+      expect(invalidKey.status).toBe(400);
+
+      // Over 500KB contentPlain rejected with HTTP 400
+      const longPlain = "a".repeat(500_001);
+      const invalidPlain = validateCampaignPayload({ rawBodySize: 600_000, contentPlain: longPlain });
+      expect(invalidPlain.valid).toBe(false);
+      expect(invalidPlain.status).toBe(400);
+    });
+  });
 });

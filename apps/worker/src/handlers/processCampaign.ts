@@ -77,9 +77,9 @@ export async function handleProcessCampaignBatch(
     );
   }
 
-  // 1. Atomically ensure campaign status is 'sending' and persistent firstDispatchAt is established
-  // COALESCE(first_dispatch_at, NOW()) guarantees that if multiple workers attempt initialization concurrently,
-  // the first one sets the timestamp and any subsequent update preserves the exact existing value.
+  // 1. Atomically ensure campaign status is 'sending' and persistent firstDispatchAt is established.
+  // CRITICAL: We enforce sql`${campaigns.status} <> 'cancelled'` so an admin's concurrent cancellation
+  // is NEVER overwritten back to 'sending'!
   const [initializedCampaign] = await db
     .update(campaigns)
     .set({
@@ -87,12 +87,37 @@ export async function handleProcessCampaignBatch(
       firstDispatchAt: sql`COALESCE(${campaigns.firstDispatchAt}, NOW())`,
       updatedAt: new Date(),
     })
-    .where(eq(campaigns.id, campaignId))
+    .where(
+      and(
+        eq(campaigns.id, campaignId),
+        sql`${campaigns.status} <> 'cancelled'`
+      )
+    )
     .returning({
       id: campaigns.id,
       firstDispatchAt: campaigns.firstDispatchAt,
       status: campaigns.status,
     });
+
+  if (!initializedCampaign) {
+    console.log(`[Worker] Campaign ${campaignId} initialization aborted: campaign was cancelled or removed concurrently.`);
+    // Cancel any remaining in-flight, queued, or unknown_outcome recipients
+    await db
+      .update(campaignRecipients)
+      .set({
+        status: "failed",
+        errorMessage: "Cancelled by campaign cancellation",
+        claimToken: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(campaignRecipients.campaignId, campaignId),
+          sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
+        )
+      );
+    return;
+  }
 
   const firstDispatchAt: Date = initializedCampaign?.firstDispatchAt || campaign.firstDispatchAt || new Date();
 
@@ -124,7 +149,12 @@ export async function handleProcessCampaignBatch(
         failedSends: 0,
         updatedAt: new Date(),
       })
-      .where(eq(campaigns.id, campaignId));
+      .where(
+        and(
+          eq(campaigns.id, campaignId),
+          sql`${campaigns.status} <> 'cancelled'`
+        )
+      );
     return;
   }
 
@@ -185,7 +215,12 @@ export async function handleProcessCampaignBatch(
           await db
             .update(campaigns)
             .set({ updatedAt: new Date() })
-            .where(eq(campaigns.id, campaignId));
+            .where(
+              and(
+                eq(campaigns.id, campaignId),
+                sql`${campaigns.status} <> 'cancelled'`
+              )
+            );
         }
       } catch (err: any) {
         console.warn(`[Worker Heartbeat Warning] Failed to pulse lease for job ${jobId}:`, err.message);
@@ -227,7 +262,12 @@ export async function handleProcessCampaignBatch(
       await db
         .update(campaigns)
         .set({ updatedAt: new Date() })
-        .where(eq(campaigns.id, campaignId));
+        .where(
+          and(
+            eq(campaigns.id, campaignId),
+            sql`${campaigns.status} <> 'cancelled'`
+          )
+        );
 
       for (const item of batch) {
         if (leaseLost) {
@@ -742,6 +782,20 @@ export async function handleProcessCampaignBatch(
 
   if (campaignPostCheck?.status === "cancelled") {
     console.log(`[Worker] Campaign ${campaignId} is cancelled; skipping retry rescheduling and finalization.`);
+    await db
+      .update(campaignRecipients)
+      .set({
+        status: "failed",
+        errorMessage: "Cancelled by campaign cancellation",
+        claimToken: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(campaignRecipients.campaignId, campaignId),
+          sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
+        )
+      );
     return;
   }
 
@@ -787,7 +841,12 @@ export async function handleProcessCampaignBatch(
         status: "sending",
         updatedAt: new Date(),
       })
-      .where(eq(campaigns.id, campaignId));
+      .where(
+        and(
+          eq(campaigns.id, campaignId),
+          sql`${campaigns.status} <> 'cancelled'`
+        )
+      );
     return;
   }
 
@@ -818,7 +877,12 @@ export async function handleProcessCampaignBatch(
       failedSends: failed,
       updatedAt: new Date(),
     })
-    .where(eq(campaigns.id, campaignId));
+    .where(
+      and(
+        eq(campaigns.id, campaignId),
+        sql`${campaigns.status} <> 'cancelled'`
+      )
+    );
 
   console.log(
     `[Worker] Campaign '${campaign.title}' dispatch finalized with status '${finalCampaignStatus}'. Sent: ${sent}, Failed: ${failed}, Total: ${total}.`

@@ -15,16 +15,50 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const body = await req.json();
+    // 1. Enforce strict stream size and Content-Length limits (1MB maximum payload)
+    const MAX_PAYLOAD_BYTES = 1024 * 1024; // 1MB payload limit
+    const contentLength = req.headers.get("content-length");
+    if (contentLength && parseInt(contentLength, 10) > MAX_PAYLOAD_BYTES) {
+      return NextResponse.json(
+        { error: "Payload too large: request body exceeds 1MB limit" },
+        { status: 413 }
+      );
+    }
+
+    const rawBody = await req.text();
+    if (Buffer.byteLength(rawBody, "utf8") > MAX_PAYLOAD_BYTES) {
+      return NextResponse.json(
+        { error: "Payload too large: request body exceeds 1MB limit" },
+        { status: 413 }
+      );
+    }
+
+    let body: any;
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      return NextResponse.json(
+        { error: "Invalid JSON request body" },
+        { status: 400 }
+      );
+    }
+
     const { title, subject, previewText, contentHtml, contentPlain, scheduledAt, sendNow } = body || {};
 
-    // 1. Request-level idempotency protection: Return existing campaign if key matches
+    // 2. Request-level idempotency protection: Return existing campaign if key matches
     // Properly fall back to body idempotencyKey if header is empty or whitespace-only
     const headerKey = req.headers.get("idempotency-key")?.trim() || "";
     const bodyKey = (typeof body?.idempotencyKey === "string" ? body.idempotencyKey : "")?.trim() || "";
     resolvedIdempotencyKey = (headerKey && headerKey.length > 0) ? headerKey : (bodyKey && bodyKey.length > 0) ? bodyKey : null;
 
     if (resolvedIdempotencyKey) {
+      if (resolvedIdempotencyKey.length > 255) {
+        return NextResponse.json(
+          { error: "Idempotency key cannot exceed 255 characters" },
+          { status: 400 }
+        );
+      }
+
       const [existing] = await db
         .select()
         .from(campaigns)
@@ -45,7 +79,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 2. Strict input type, presence, and size validation
+    // 3. Strict input type, presence, and size validation
     if (typeof title !== "string" || !title.trim()) {
       return NextResponse.json(
         { error: "Campaign title is required and must be text" },
@@ -94,8 +128,16 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    if (contentPlain !== undefined && contentPlain !== null && typeof contentPlain !== "string") {
-      return NextResponse.json({ error: "Content plain must be a string" }, { status: 400 });
+    if (contentPlain !== undefined && contentPlain !== null) {
+      if (typeof contentPlain !== "string") {
+        return NextResponse.json({ error: "Content plain must be a string" }, { status: 400 });
+      }
+      if (contentPlain.length > 500_000) {
+        return NextResponse.json(
+          { error: "Content plain exceeds maximum size limit (500KB)" },
+          { status: 400 }
+        );
+      }
     }
 
     let scheduleDate = new Date();

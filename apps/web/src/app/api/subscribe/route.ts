@@ -69,7 +69,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 3. Email Cooldown (max 1 confirmation request per 60 seconds per email) with failClosed policy
-    const emailCooldown = await checkEmailCooldown(email, 60, { failClosed: true });
+    const emailCooldown = await checkEmailCooldown(email, 60, { failClosed: true, actionScope: "signup" });
     if (!emailCooldown.allowed) {
       return NextResponse.json(
         {
