@@ -123,6 +123,8 @@ bun run worker
    Jobs use row-level locking (`FOR UPDATE SKIP LOCKED`) directly in PostgreSQL. If the server restarts, pending jobs are never lost.
 5. **Zero-Lockin Provider Abstraction**:
    Switch between `console`, `resend`, and `ses` with a single environment variable change without modifying any business logic.
+6. **Hardened Proxy Resolution & Bounded Streaming Limits**:
+   Rate-limiting defends against `X-Forwarded-For` spoofing by requiring explicit proxy allowlists (`TRUSTED_PROXIES`) and defaulting to fail-closed against unverified private IP hops in production. Public endpoints (`/api/subscribe`, `/api/subscriber/gdpr/*`) enforce true incremental byte stream limits (16 KB max) to prevent memory exhaustion.
 
 ---
 

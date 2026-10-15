@@ -3,31 +3,27 @@ import { db, subscribers, consentEvents, suppressions, eq } from "@ai-signal/db"
 import { enqueueJob } from "@ai-signal/queue";
 import { normalizeEmail, hashIp } from "@ai-signal/config";
 import { checkRateLimit, checkEmailCooldown, getClientIp, pseudonymizeRateLimitKey } from "@/lib/rateLimit";
+import { readBodyWithIncrementalLimit } from "@/lib/bodyLimit";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_BODY_BYTES = 16384; // 16KB max payload
 
 export async function POST(req: NextRequest) {
   try {
-    // 1. Guard against oversized payloads
+    // 1. Guard against oversized payloads using bounded streaming reader
+    const streamResult = await readBodyWithIncrementalLimit(req, MAX_BODY_BYTES);
+    if ("error" in streamResult) {
+      return NextResponse.json(
+        { error: streamResult.error },
+        { status: streamResult.status }
+      );
+    }
+
     let body: any;
-    if (typeof req.text === "function") {
-      const rawBody = await req.text();
-      if (rawBody.length > MAX_BODY_BYTES) {
-        return NextResponse.json(
-          { error: "Payload too large. Maximum size is 16KB." },
-          { status: 413 }
-        );
-      }
-      try {
-        body = JSON.parse(rawBody);
-      } catch {
-        return NextResponse.json({ error: "Malformed JSON payload" }, { status: 400 });
-      }
-    } else if (typeof req.json === "function") {
-      body = await req.json();
-    } else {
-      return NextResponse.json({ error: "Invalid request payload" }, { status: 400 });
+    try {
+      body = JSON.parse(streamResult.text);
+    } catch {
+      return NextResponse.json({ error: "Malformed JSON payload" }, { status: 400 });
     }
 
     const rawEmail = body.email;

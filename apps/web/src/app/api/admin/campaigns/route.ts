@@ -3,69 +3,7 @@ import { db, campaigns, eq, sql } from "@ai-signal/db";
 import { enqueueJob } from "@ai-signal/queue";
 import { sanitizeNewsletterHtml } from "@ai-signal/email";
 import { isAuthorizedAdmin } from "@/lib/auth";
-
-async function readBodyWithIncrementalLimit(
-  req: NextRequest,
-  maxBytes: number
-): Promise<{ text: string } | { error: string; status: number }> {
-  const contentLength = req.headers.get("content-length");
-  if (contentLength && parseInt(contentLength, 10) > maxBytes) {
-    return {
-      error: `Payload too large: Content-Length exceeds ${maxBytes} bytes limit`,
-      status: 413,
-    };
-  }
-
-  if (!req.body) {
-    const raw = await req.text();
-    if (Buffer.byteLength(raw, "utf8") > maxBytes) {
-      return {
-        error: `Payload too large: request body exceeds ${maxBytes} bytes limit`,
-        status: 413,
-      };
-    }
-    return { text: raw };
-  }
-
-  const reader = req.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) {
-        totalBytes += value.byteLength;
-        if (totalBytes > maxBytes) {
-          await reader.cancel("Payload size limit exceeded");
-          return {
-            error: `Payload too large: request body exceeds ${maxBytes} bytes limit`,
-            status: 413,
-          };
-        }
-        chunks.push(value);
-      }
-    }
-  } catch (err: any) {
-    if (totalBytes > maxBytes) {
-      return {
-        error: `Payload too large: request body exceeds ${maxBytes} bytes limit`,
-        status: 413,
-      };
-    }
-    throw err;
-  }
-
-  const concatenated = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    concatenated.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-
-  return { text: new TextDecoder("utf-8").decode(concatenated) };
-}
+import { readBodyWithIncrementalLimit } from "@/lib/bodyLimit";
 
 export async function GET(req: NextRequest) {
   if (!isAuthorizedAdmin(req)) {

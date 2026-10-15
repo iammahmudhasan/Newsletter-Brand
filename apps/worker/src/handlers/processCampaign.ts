@@ -580,9 +580,8 @@ export async function handleProcessCampaignBatch(
           });
 
           if (sendResult.success) {
-            successCount++;
             // Conditional state transition: Only set status = 'sent' if the recipient still matches this worker's claimToken!
-            // If lease expired or concurrent worker claimed, fail-closed without overwriting!
+            // If lease expired, cancelled concurrently, or claimed by another worker, fail-closed without overwriting!
             const updateRes = await db
               .update(campaignRecipients)
               .set({
@@ -601,9 +600,11 @@ export async function handleProcessCampaignBatch(
               )
               .returning({ id: campaignRecipients.id });
 
-            if (updateRes.length === 0) {
+            if (updateRes.length > 0) {
+              successCount++;
+            } else {
               console.warn(
-                `[Worker Fencing] Recipient ${item.recipientId} claim token mismatch or lease expired. Discarding update.`
+                `[Worker Fencing] Recipient ${item.recipientId} claim token mismatch, cancelled, or lease expired. Discarding update.`
               );
             }
           } else {
@@ -831,30 +832,6 @@ export async function handleProcessCampaignBatch(
     );
 
   if (remainingActive.length > 0) {
-    // Fencing guard: verify campaign is STILL in 'sending' state before rescheduling.
-    // If an admin cancelled it or a webhook/worker transitioned it to terminal ('sent', 'partially_failed', 'failed'),
-    // we MUST NOT overwrite status and MUST NOT enqueue a retry job.
-    const [stillSending] = await db
-      .update(campaigns)
-      .set({
-        status: "sending",
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(campaigns.id, campaignId),
-          eq(campaigns.status, "sending")
-        )
-      )
-      .returning({ id: campaigns.id });
-
-    if (!stillSending) {
-      console.warn(
-        `[Worker Retry Guard] Campaign ${campaignId} is no longer in 'sending' status (cancelled or reached terminal status). Skipping retry queue scheduling.`
-      );
-      return;
-    }
-
     const nextAttempts = remainingActive
       .map((r) => r.nextAttemptAt?.getTime())
       .filter((t): t is number => typeof t === "number" && t > Date.now());
@@ -862,18 +839,48 @@ export async function handleProcessCampaignBatch(
     const earliestWakeup =
       nextAttempts.length > 0 ? new Date(Math.min(...nextAttempts)) : new Date(Date.now() + 2 * 60 * 1000);
 
-    console.log(
-      `[Worker] Campaign '${campaign.title}' still has ${remainingActive.length} active/retryable recipients. Re-scheduling queue job for ${earliestWakeup.toISOString()}.`
-    );
+    // Atomic Outbox & Queue Coordination:
+    // Acquire a FOR UPDATE row lock on the campaign row inside a transaction to serialize with cancellation.
+    // If an admin cancels the campaign, cancel/route.ts holds FOR UPDATE, updates status to 'cancelled', and purges automation_jobs.
+    // By locking FOR UPDATE here and verifying status === 'sending' before calling enqueueJob(..., tx),
+    // no zombie retry job can ever be inserted after a cancellation purge.
+    const scheduled = await db.transaction(async (tx) => {
+      const [lockedCampaign] = await tx.execute<typeof campaigns.$inferSelect>(sql`
+        SELECT * FROM campaigns
+        WHERE id = ${campaignId}
+        FOR UPDATE;
+      `);
 
-    await enqueueJob(
-      "process_campaign",
-      { campaignId: campaign.id },
-      {
-        scheduledFor: earliestWakeup,
-        idempotencyKey: `campaign:${campaign.id}:retry:${earliestWakeup.getTime()}`,
+      if (!lockedCampaign || lockedCampaign.status !== "sending") {
+        console.warn(
+          `[Worker Retry Guard] Campaign ${campaignId} is in status '${lockedCampaign?.status || "missing"}' (not 'sending'). Skipping retry queue scheduling.`
+        );
+        return false;
       }
-    );
+
+      await tx
+        .update(campaigns)
+        .set({ updatedAt: new Date() })
+        .where(eq(campaigns.id, campaignId));
+
+      await enqueueJob(
+        "process_campaign",
+        { campaignId: campaign.id },
+        {
+          scheduledFor: earliestWakeup,
+          idempotencyKey: `campaign:${campaign.id}:retry:${earliestWakeup.getTime()}`,
+        },
+        tx
+      );
+
+      return true;
+    });
+
+    if (scheduled) {
+      console.log(
+        `[Worker] Campaign '${campaign.title}' still has ${remainingActive.length} active/retryable recipients. Re-scheduled queue job for ${earliestWakeup.toISOString()}.`
+      );
+    }
     return;
   }
 

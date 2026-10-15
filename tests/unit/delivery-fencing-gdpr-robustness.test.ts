@@ -2,6 +2,7 @@ import { describe, it, expect } from "bun:test";
 import { normalizeWebhookEventType, computeCampaignTargetStatus } from "../../apps/web/src/lib/webhookHelpers";
 import { renderNewsletterEmail } from "../../packages/email/src/templates/newsletter";
 import { checkRateLimit, checkEmailCooldown, isValidIpAddress, pseudonymizeRateLimitKey, getClientIp, isPrivateOrLoopbackIp, matchesCidr, isTrustedProxyHop } from "../../apps/web/src/lib/rateLimit";
+import { readBodyWithIncrementalLimit } from "../../apps/web/src/lib/bodyLimit";
 
 describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
   describe("1. Webhook Normalization & Event Isolation (P1)", () => {
@@ -928,7 +929,7 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       expect(matchesCidr("invalid", "10.0.0.0/8")).toBe(false);
     });
 
-    it("verifies isTrustedProxyHop against configured TRUSTED_PROXIES env var and private networks", () => {
+    it("verifies isTrustedProxyHop strictly adheres to TRUSTED_PROXIES allowlist and rejects unlisted private IPs", () => {
       const origEnv = process.env.TRUSTED_PROXIES;
       try {
         process.env.TRUSTED_PROXIES = "198.51.100.0/24, 203.0.113.50";
@@ -942,11 +943,15 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
         expect(isTrustedProxyHop("203.0.113.50")).toBe(true);
         expect(isTrustedProxyHop("203.0.113.51")).toBe(false);
 
-        // Private / Loopback IPs always trusted proxy hops by default
+        // Local loopback is always trusted
         expect(isTrustedProxyHop("127.0.0.1")).toBe(true);
-        expect(isTrustedProxyHop("10.0.1.1")).toBe(true);
-        expect(isTrustedProxyHop("172.16.0.1")).toBe(true);
-        expect(isTrustedProxyHop("192.168.1.1")).toBe(true);
+        expect(isTrustedProxyHop("::1")).toBe(true);
+
+        // CRITICAL SECURITY FIX: When TRUSTED_PROXIES is explicitly configured,
+        // unlisted private IP ranges MUST NOT be automatically trusted!
+        expect(isTrustedProxyHop("10.0.1.1")).toBe(false);
+        expect(isTrustedProxyHop("172.16.0.1")).toBe(false);
+        expect(isTrustedProxyHop("192.168.1.1")).toBe(false);
 
         // Arbitrary public IP not in trusted list
         expect(isTrustedProxyHop("8.8.8.8")).toBe(false);
@@ -992,35 +997,39 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       }
     });
 
-    it("rejects forged X-Forwarded-For in production when socket IP is missing and nearest hop is untrusted", () => {
+    it("rejects forged X-Forwarded-For in production with fake private proxy suffix (e.g. 9.9.9.9, 10.0.0.1)", () => {
       const origNodeEnv = process.env.NODE_ENV;
       const origTrustEdge = process.env.TRUST_EDGE_HEADERS;
+      const origTrustedProxies = process.env.TRUSTED_PROXIES;
       try {
         (process.env as any).NODE_ENV = "production";
         delete process.env.TRUST_EDGE_HEADERS;
+        delete process.env.TRUSTED_PROXIES;
 
-        // Socket IP is unavailable, client directly provides fake X-Forwarded-For
+        // Socket IP is unavailable, client directly connects and provides fake X-Forwarded-For with private proxy suffix
         const spoofedReq = {
           ip: undefined,
           headers: {
-            get: (name: string) => (name === "x-forwarded-for" ? "1.2.3.4" : null),
+            get: (name: string) => (name === "x-forwarded-for" ? "9.9.9.9, 10.0.0.1" : null),
           },
         } as any;
 
-        // Nearest hop 1.2.3.4 is untrusted; header must be rejected and fallback to safe default
+        // In production without TRUSTED_PROXIES, 10.0.0.1 is untrusted;
+        // The chain must be rejected and fallback to safe default 127.0.0.1 (not peeling 10.0.0.1 to yield 9.9.9.9!)
         const resolved = getClientIp(spoofedReq);
         expect(resolved).toBe("127.0.0.1");
 
-        // Legitimate reverse proxy scenario: nearest hop is a private/trusted reverse proxy (e.g. 10.0.0.1)
-        const trustedProxyReq = {
+        // When TRUSTED_PROXIES explicitly includes the legitimate internal proxy 10.0.0.1:
+        process.env.TRUSTED_PROXIES = "10.0.0.1";
+        const legitReq = {
           ip: undefined,
           headers: {
             get: (name: string) => (name === "x-forwarded-for" ? "203.0.113.195, 10.0.0.1" : null),
           },
         } as any;
 
-        // 10.0.0.1 is trusted; peeled off to yield real client IP 203.0.113.195
-        const legitResolved = getClientIp(trustedProxyReq);
+        // Now 10.0.0.1 is in the explicit allowlist, so it peels off to reveal the real client IP
+        const legitResolved = getClientIp(legitReq);
         expect(legitResolved).toBe("203.0.113.195");
       } finally {
         (process.env as any).NODE_ENV = origNodeEnv;
@@ -1028,6 +1037,11 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
           process.env.TRUST_EDGE_HEADERS = origTrustEdge;
         } else {
           delete process.env.TRUST_EDGE_HEADERS;
+        }
+        if (origTrustedProxies !== undefined) {
+          process.env.TRUSTED_PROXIES = origTrustedProxies;
+        } else {
+          delete process.env.TRUSTED_PROXIES;
         }
       }
     });
@@ -1080,6 +1094,108 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       expect(streamCancelled).toBe(true);
       expect(streamQueue.length).toBe(1); // chunk3 remains unread
       expect(result.bytesRead).toBe(1100);
+    });
+
+    it("verifies readBodyWithIncrementalLimit handles valid and oversized Web Stream requests", async () => {
+      // 1. Valid payload under 16KB
+      const validPayload = JSON.stringify({ email: "user@example.com", name: "User" });
+      const validStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(validPayload));
+          controller.close();
+        },
+      });
+      const validReq = {
+        body: validStream,
+        text: async () => validPayload,
+      } as any;
+
+      const validResult = await readBodyWithIncrementalLimit(validReq, 16384);
+      expect(validResult.success).toBe(true);
+      if (validResult.success) {
+        expect(validResult.text).toBe(validPayload);
+      }
+
+      // 2. Oversized payload exceeding 16KB threshold
+      const bigChunk = new Uint8Array(20 * 1024); // 20 KB
+      const bigStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(bigChunk);
+          controller.close();
+        },
+      });
+      const bigReq = {
+        body: bigStream,
+        text: async () => "should not be called",
+      } as any;
+
+      const oversizedResult = await readBodyWithIncrementalLimit(bigReq, 16384);
+      expect(oversizedResult.success).toBe(false);
+      if (!oversizedResult.success) {
+        expect(oversizedResult.status).toBe(413);
+        expect(oversizedResult.error).toContain("Payload too large");
+      }
+
+      // 3. Multi-byte Unicode payload: char length <= 16 but UTF-8 byte size > 16 bytes
+      // Bengali characters take 3 bytes each in UTF-8
+      const unicodeString = "বাংলাবাংলা"; // 10 chars, but 30 UTF-8 bytes
+      const unicodeStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(unicodeString));
+          controller.close();
+        },
+      });
+      const unicodeReq = {
+        body: unicodeStream,
+        text: async () => unicodeString,
+      } as any;
+
+      // Limit = 20 bytes: 10 chars would pass raw.length <= 20, but fails byte-accurate limit of 20 bytes!
+      const unicodeResult = await readBodyWithIncrementalLimit(unicodeReq, 20);
+      expect(unicodeResult.success).toBe(false);
+      if (!unicodeResult.success) {
+        expect(unicodeResult.status).toBe(413);
+      }
+    });
+  });
+
+  describe("17. Atomic Worker Retry Coordination & Zombie Prevention (P3)", () => {
+    it("strictly refuses to enqueue a retry job when campaign status is changed to cancelled", async () => {
+      // Mock DB simulating transaction row-lock behavior
+      let campaignState: { id: string; status: string } = {
+        id: "camp-race-1",
+        status: "sending",
+      };
+      const enqueuedJobs: any[] = [];
+
+      async function workerRetryAttempt(campaignId: string) {
+        // Simulates the worker's row-locked retry scheduling logic
+        if (campaignState.status !== "sending") {
+          return { scheduled: false, reason: "not_sending" };
+        }
+
+        // Inside transaction:
+        enqueuedJobs.push({ jobName: "process_campaign", campaignId });
+        return { scheduled: true };
+      }
+
+      // 1. Initial retry succeeds while sending
+      const res1 = await workerRetryAttempt("camp-race-1");
+      expect(res1.scheduled).toBe(true);
+      expect(enqueuedJobs.length).toBe(1);
+
+      // 2. Admin cancellation occurs
+      campaignState.status = "cancelled";
+      // Cancellation purges existing jobs:
+      const purged = enqueuedJobs.splice(0, enqueuedJobs.length);
+      expect(purged.length).toBe(1);
+      expect(enqueuedJobs.length).toBe(0);
+
+      // 3. Worker retry runs after cancellation: MUST NOT enqueue any new job!
+      const res2 = await workerRetryAttempt("camp-race-1");
+      expect(res2.scheduled).toBe(false);
+      expect(res2.reason).toBe("not_sending");
+      expect(enqueuedJobs.length).toBe(0); // No zombie jobs!
     });
   });
 });

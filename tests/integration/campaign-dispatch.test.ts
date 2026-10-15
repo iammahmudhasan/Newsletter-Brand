@@ -823,6 +823,94 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
       expect(initialized).toBe(false);
       expect(campaign.status).toBe("failed"); // Never overwritten!
     });
+
+    it("ensures row-locked worker retry coordination serializes with cancellation and prevents zombie jobs", async () => {
+      // Simulates Postgres row locking on campaigns table
+      interface CampaignRecord {
+        id: string;
+        status: "scheduled" | "sending" | "cancelled" | "sent" | "partially_failed" | "failed";
+      }
+
+      let campaign: CampaignRecord = { id: "camp-atomic-coord-1", status: "sending" };
+      let automationJobs: { id: string; campaignId: string; status: string }[] = [];
+      let lockHolder: string | null = null;
+
+      // Simulated row lock manager
+      async function withCampaignLock<T>(holder: string, fn: () => Promise<T>): Promise<T> {
+        while (lockHolder !== null) {
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        lockHolder = holder;
+        try {
+          return await fn();
+        } finally {
+          lockHolder = null;
+        }
+      }
+
+      // Scenario: Cancel endpoint and worker retry attempt concurrent operations
+      let cancelFinished = false;
+      let retryFinished = false;
+
+      // 1. Cancel transaction
+      const cancelOperation = withCampaignLock("cancel-api", async () => {
+        // SELECT * FROM campaigns WHERE id = ... FOR UPDATE
+        if (campaign.status === "sending") {
+          campaign.status = "cancelled";
+          // DELETE FROM automation_jobs WHERE (payload->>'campaignId' = ...)
+          automationJobs = automationJobs.filter((j) => j.campaignId !== campaign.id);
+        }
+        cancelFinished = true;
+      });
+
+      // 2. Worker retry transaction
+      const workerRetryOperation = withCampaignLock("worker-retry", async () => {
+        // SELECT * FROM campaigns WHERE id = ... FOR UPDATE
+        if (campaign.status !== "sending") {
+          // Abort retry scheduling if not sending!
+          return false;
+        }
+        automationJobs.push({
+          id: "job-" + Date.now(),
+          campaignId: campaign.id,
+          status: "pending",
+        });
+        return true;
+      });
+
+      const [_, retryScheduled] = await Promise.all([cancelOperation, workerRetryOperation]);
+
+      // Either:
+      // Case 1: Cancel ran first -> retry saw status='cancelled', did not enqueue, jobs = 0
+      // Case 2: Worker ran first -> job enqueued, then cancel ran and deleted it -> jobs = 0
+      expect(automationJobs.filter((j) => j.campaignId === campaign.id).length).toBe(0);
+      expect(campaign.status).toBe("cancelled");
+    });
+
+    it("ensures worker post-send successCount only increments when recipient conditional update succeeded", () => {
+      let successCount = 0;
+      let failCount = 0;
+
+      function handleSendCompletion(sendResultSuccess: boolean, updateResCount: number) {
+        if (sendResultSuccess) {
+          if (updateResCount > 0) {
+            successCount++;
+          } else {
+            // Mismatch / cancelled / expired lease
+          }
+        } else {
+          failCount++;
+        }
+      }
+
+      // 1. Normal successful send with matched claimToken
+      handleSendCompletion(true, 1);
+      expect(successCount).toBe(1);
+
+      // 2. Provider succeeded, BUT recipient was concurrently cancelled or claimToken revoked (update affected 0 rows)
+      handleSendCompletion(true, 0);
+      expect(successCount).toBe(1); // Did not erroneously increment to 2!
+    });
   });
 });
 

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db, subscribers, consentEvents, suppressions, emailEvents, automationJobs, campaignRecipients, eq, and, sql } from "@ai-signal/db";
 import { verifySignedToken, normalizeEmail } from "@ai-signal/config";
 import { pseudonymizeRateLimitKey } from "@/lib/rateLimit";
+import { readBodyWithIncrementalLimit } from "@/lib/bodyLimit";
 
 // GDPR Data Export (Right of Access) - strictly requires 'data_export' purpose token
 export async function GET(req: NextRequest) {
@@ -64,7 +65,19 @@ export async function GET(req: NextRequest) {
 // GDPR Right to be Forgotten (Permanent Deletion) - strictly requires 'data_delete' purpose token
 export async function POST(req: NextRequest) {
   try {
-    const { token } = await req.json();
+    const streamResult = await readBodyWithIncrementalLimit(req, 16384);
+    if ("error" in streamResult) {
+      return NextResponse.json({ error: streamResult.error }, { status: streamResult.status });
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(streamResult.text);
+    } catch {
+      return NextResponse.json({ error: "Malformed JSON payload" }, { status: 400 });
+    }
+
+    const token = parsed?.token;
     if (!token) {
       return NextResponse.json({ error: "Missing authorization token" }, { status: 400 });
     }

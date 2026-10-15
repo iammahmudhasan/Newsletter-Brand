@@ -206,11 +206,24 @@ export function matchesCidr(ip: string, cidr: string): boolean {
 /**
  * Checks whether an IP matches any configured trusted proxy IP or CIDR block.
  * Reads TRUSTED_PROXIES env var (comma-separated list of IPs or CIDR blocks).
- * By default, private networks and loopback interfaces are treated as trusted proxy hops.
+ *
+ * SECURITY RULES:
+ * 1. Loopback addresses (127.0.0.1, ::1) are always trusted local hops.
+ * 2. When TRUSTED_PROXIES is configured, ONLY explicitly matched IPs/subnets are trusted.
+ *    Arbitrary unlisted private network IPs are NOT trusted.
+ * 3. In production, if TRUSTED_PROXIES is not configured, arbitrary private IPs in request
+ *    headers are NOT trusted by default to prevent spoofed 'X-Forwarded-For: attacker, 10.0.0.1' bypasses.
+ * 4. In development and test environments, private networks are allowed for local reverse proxy testing.
  */
 export function isTrustedProxyHop(ip: string): boolean {
   if (!ip || !isValidIpAddress(ip)) return false;
   const trimmed = ip.trim().toLowerCase();
+  const isProd = process.env.NODE_ENV === "production";
+
+  // Loopback interfaces (127.0.0.1, ::1) are always valid local hops
+  if (trimmed === "127.0.0.1" || trimmed === "::1") {
+    return true;
+  }
 
   const configured = process.env.TRUSTED_PROXIES;
   if (configured) {
@@ -222,9 +235,19 @@ export function isTrustedProxyHop(ip: string): boolean {
         return true;
       }
     }
+    // When TRUSTED_PROXIES is explicitly configured, ONLY listed IPs/subnets are trusted
+    return false;
   }
 
-  // Default to private/loopback/link-local networks as trusted reverse proxy infrastructure
+  // In production, when TRUSTED_PROXIES is NOT configured:
+  // Do NOT blindly trust arbitrary private IP addresses in request headers,
+  // as an attacker directly reaching origin can forge "X-Forwarded-For: 9.9.9.9, 10.0.0.1"
+  // to change their rate-limit identity.
+  if (isProd) {
+    return false;
+  }
+
+  // In development and test environments, allow private networks for convenience
   return isPrivateOrLoopbackIp(trimmed);
 }
 
