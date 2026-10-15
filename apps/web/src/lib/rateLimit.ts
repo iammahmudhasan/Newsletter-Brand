@@ -183,14 +183,72 @@ export function isPrivateOrLoopbackIp(ip: string): boolean {
 }
 
 /**
- * Evaluates whether an IPv4 address falls within a CIDR subnet block (e.g. 10.0.0.0/8).
+ * Normalizes and converts an IPv6 string into a 128-bit BigInt.
+ * Supports standard notation, compressed '::' notation, and IPv4-mapped IPv6.
+ */
+export function parseIpv6(ip: string): bigint | null {
+  if (!ip || typeof ip !== "string") return null;
+  let normalized = ip.trim().toLowerCase();
+
+  // Handle IPv4-mapped IPv6 (e.g. ::ffff:192.0.2.1)
+  if (normalized.includes(".")) {
+    const lastColon = normalized.lastIndexOf(":");
+    if (lastColon === -1) return null;
+    const ipv4Part = normalized.slice(lastColon + 1);
+    const ipv4Parts = ipv4Part.split(".").map(Number);
+    if (ipv4Parts.length !== 4 || ipv4Parts.some((p) => isNaN(p) || p < 0 || p > 255)) return null;
+    const hex1 = ((ipv4Parts[0] << 8) | ipv4Parts[1]).toString(16);
+    const hex2 = ((ipv4Parts[2] << 8) | ipv4Parts[3]).toString(16);
+    normalized = normalized.slice(0, lastColon + 1) + hex1 + ":" + hex2;
+  }
+
+  const parts = normalized.split("::");
+  if (parts.length > 2) return null;
+
+  let words: number[] = [];
+  if (parts.length === 2) {
+    const left = parts[0] ? parts[0].split(":").map((w) => parseInt(w, 16)) : [];
+    const right = parts[1] ? parts[1].split(":").map((w) => parseInt(w, 16)) : [];
+    if (left.some(isNaN) || right.some(isNaN)) return null;
+    const missing = 8 - (left.length + right.length);
+    if (missing < 0) return null;
+    words = [...left, ...new Array(missing).fill(0), ...right];
+  } else {
+    words = parts[0].split(":").map((w) => parseInt(w, 16));
+    if (words.length !== 8 || words.some(isNaN)) return null;
+  }
+
+  let result = 0n;
+  for (const word of words) {
+    if (word < 0 || word > 0xffff) return null;
+    result = (result << 16n) | BigInt(word);
+  }
+  return result;
+}
+
+/**
+ * Evaluates whether an IPv4 or IPv6 address falls within a CIDR subnet block
+ * (e.g. 10.0.0.0/8, 192.168.1.0/24, 2001:db8::/32, fc00::/7, fe80::/10).
  */
 export function matchesCidr(ip: string, cidr: string): boolean {
   if (!ip || !cidr) return false;
   const [range, bitsStr] = cidr.split("/");
+  if (!range || !bitsStr) return false;
   const bits = parseInt(bitsStr, 10);
-  if (isNaN(bits) || bits < 0 || bits > 32) return false;
+  if (isNaN(bits) || bits < 0) return false;
 
+  const isIpV6 = ip.includes(":") || range.includes(":");
+  if (isIpV6) {
+    if (bits > 128) return false;
+    const ipBig = parseIpv6(ip);
+    const rangeBig = parseIpv6(range);
+    if (ipBig === null || rangeBig === null) return false;
+    if (bits === 0) return true;
+    const shift = BigInt(128 - bits);
+    return (ipBig >> shift) === (rangeBig >> shift);
+  }
+
+  if (bits > 32) return false;
   const ipParts = ip.split(".").map(Number);
   const rangeParts = range.split(".").map(Number);
   if (ipParts.length !== 4 || rangeParts.length !== 4) return false;
@@ -273,8 +331,18 @@ export function getClientIp(req: NextRequest): string {
   }
 
   // 2. Cloudflare Edge / CloudFront / Real-IP authoritative headers:
-  // Trusted when edge trust is forced, when in dev/test, or when connected via trusted proxy
-  const canTrustEdgeHeaders = trustEdge || !isProd || (hasValidNextIp && isTrustedProxyHop(nextIp));
+  // Trusted when edge trust is forced, in dev/test, on verified edge platforms (Vercel, Cloudflare Pages, AWS Lambda),
+  // or when the socket IP itself is a verified trusted proxy hop.
+  const isServerlessEdge =
+    process.env.VERCEL === "1" ||
+    process.env.CF_PAGES === "1" ||
+    Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+  const canTrustEdgeHeaders =
+    trustEdge ||
+    !isProd ||
+    isServerlessEdge ||
+    (hasValidNextIp && isTrustedProxyHop(nextIp));
 
   if (canTrustEdgeHeaders) {
     const cfIp = req.headers.get("cf-connecting-ip")?.trim();
@@ -310,6 +378,9 @@ export function getClientIp(req: NextRequest): string {
         if (hasValidNextIp) {
           return nextIp.trim();
         }
+        console.warn(
+          `[RateLimit Security] Untrusted proxy chain or unverified headers in production (nearest hop: '${nearestHop || "none"}'). Falling back to safe default '127.0.0.1'. Please configure TRUSTED_PROXIES or set TRUST_EDGE_HEADERS=true for your hosting environment.`
+        );
         return "127.0.0.1";
       }
     }

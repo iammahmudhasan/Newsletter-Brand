@@ -929,6 +929,45 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       expect(matchesCidr("invalid", "10.0.0.0/8")).toBe(false);
     });
 
+    it("correctly matches IPv6 addresses against IPv6 CIDR ranges", () => {
+      // /32 documentation range
+      expect(matchesCidr("2001:db8::1", "2001:db8::/32")).toBe(true);
+      expect(matchesCidr("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", "2001:db8::/32")).toBe(true);
+      expect(matchesCidr("2001:db9::1", "2001:db8::/32")).toBe(false);
+
+      // /7 Unique Local Addresses (ULA)
+      expect(matchesCidr("fc00::1", "fc00::/7")).toBe(true);
+      expect(matchesCidr("fd12:3456:789a::1", "fc00::/7")).toBe(true);
+      expect(matchesCidr("fe00::1", "fc00::/7")).toBe(false);
+
+      // /10 Link-Local
+      expect(matchesCidr("fe80::1", "fe80::/10")).toBe(true);
+      expect(matchesCidr("fe80:0:0:0:1:2:3:4", "fe80::/10")).toBe(true);
+      expect(matchesCidr("fec0::1", "fe80::/10")).toBe(false);
+
+      // /128 single host
+      expect(matchesCidr("::1", "::1/128")).toBe(true);
+      expect(matchesCidr("::2", "::1/128")).toBe(false);
+
+      // /0 entire IPv6 space
+      expect(matchesCidr("2606:4700:4700::1111", "::/0")).toBe(true);
+
+      // TRUSTED_PROXIES with IPv6 CIDRs
+      const origEnv = process.env.TRUSTED_PROXIES;
+      try {
+        process.env.TRUSTED_PROXIES = "2001:db8::/32, 2606:4700::/32";
+        expect(isTrustedProxyHop("2001:db8::42")).toBe(true);
+        expect(isTrustedProxyHop("2606:4700::55")).toBe(true);
+        expect(isTrustedProxyHop("2001:db9::1")).toBe(false);
+      } finally {
+        if (origEnv !== undefined) {
+          process.env.TRUSTED_PROXIES = origEnv;
+        } else {
+          delete process.env.TRUSTED_PROXIES;
+        }
+      }
+    });
+
     it("verifies isTrustedProxyHop strictly adheres to TRUSTED_PROXIES allowlist and rejects unlisted private IPs", () => {
       const origEnv = process.env.TRUSTED_PROXIES;
       try {

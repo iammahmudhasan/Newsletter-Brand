@@ -65,31 +65,70 @@ export async function runCampaignScheduler(): Promise<number> {
 
     // 2. Recovery: Check for any campaigns stuck in 'sending' for > 15 minutes without progress
     // AND verify that there is no active queue job currently executing this campaign with a valid lease!
-    const stuckCampaigns = await db.execute<typeof campaigns.$inferSelect>(
-      sql`
-        SELECT c.* FROM campaigns c
-        WHERE c.status = 'sending'
-          AND c.updated_at < NOW() - INTERVAL '15 minutes'
-          AND NOT EXISTS (
-            SELECT 1 FROM automation_jobs j
-            WHERE j.job_name = 'process_campaign'
-              AND (j.payload->>'campaignId' = c.id::text)
-              AND (
-                (j.status = 'processing' AND j.locked_at > NOW() - INTERVAL '10 minutes')
-                OR (j.status = 'pending')
+    // CRITICAL: We lock the candidate campaign row with FOR UPDATE SKIP LOCKED inside an atomic transaction.
+    // The status is re-verified, updated_at is touched, and the recovery job is enqueued inside the SAME transaction.
+    // This serializes with cancel/route.ts (which holds FOR UPDATE on campaigns and purges queue jobs),
+    // strictly preventing zombie recovery jobs from being inserted after a cancellation.
+    while (true) {
+      const recoveredCampaign = await db.transaction(async (tx) => {
+        const candidateRows = await tx.execute<typeof campaigns.$inferSelect>(
+          sql`
+            SELECT c.* FROM campaigns c
+            WHERE c.status = 'sending'
+              AND c.updated_at < NOW() - INTERVAL '15 minutes'
+              AND NOT EXISTS (
+                SELECT 1 FROM automation_jobs j
+                WHERE j.job_name = 'process_campaign'
+                  AND (j.payload->>'campaignId' = c.id::text)
+                  AND (
+                    (j.status = 'processing' AND j.locked_at > NOW() - INTERVAL '10 minutes')
+                    OR (j.status = 'pending')
+                  )
               )
-          )
-        LIMIT 5;
-      `
-    );
+            ORDER BY c.updated_at ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1;
+          `
+        );
 
-    const stuckList = (stuckCampaigns as any) || [];
-    for (const stuck of stuckList) {
-      console.warn(`[Scheduler Recovery] Re-enqueuing stuck campaign '${stuck.title}' (${stuck.id}) without active worker lease.`);
-      await enqueueJob(
-        "process_campaign",
-        { campaignId: stuck.id },
-        { idempotencyKey: `campaign:${stuck.id}:recovery:${Math.floor(Date.now() / (10 * 60 * 1000))}` }
+        const stuck = (candidateRows as any)?.[0];
+        if (!stuck) {
+          return null;
+        }
+
+        // Fencing check: verify campaign is STILL in 'sending' status under the row lock
+        if (stuck.status !== "sending") {
+          return null;
+        }
+
+        // Touch updated_at so this campaign is not immediately selected again
+        await tx
+          .update(campaigns)
+          .set({ updatedAt: new Date() })
+          .where(eq(campaigns.id, stuck.id));
+
+        const recoveryIdempotencyKey = `campaign:${stuck.id}:recovery:${Math.floor(Date.now() / (10 * 60 * 1000))}`;
+        await tx
+          .insert(automationJobs)
+          .values({
+            jobName: "process_campaign",
+            payload: { campaignId: stuck.id },
+            status: "pending",
+            scheduledFor: new Date(),
+            maxRetries: 3,
+            idempotencyKey: recoveryIdempotencyKey,
+          })
+          .onConflictDoNothing({ target: automationJobs.idempotencyKey });
+
+        return stuck;
+      });
+
+      if (!recoveredCampaign) {
+        break; // No more stuck campaigns to recover
+      }
+
+      console.warn(
+        `[Scheduler Recovery] Atomically re-enqueued stuck campaign '${recoveredCampaign.title}' (${recoveredCampaign.id}) without active worker lease.`
       );
     }
 

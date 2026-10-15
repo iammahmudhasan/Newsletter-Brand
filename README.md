@@ -124,7 +124,9 @@ bun run worker
 5. **Zero-Lockin Provider Abstraction**:
    Switch between `console`, `resend`, and `ses` with a single environment variable change without modifying any business logic.
 6. **Hardened Proxy Resolution & Bounded Streaming Limits**:
-   Rate-limiting defends against `X-Forwarded-For` spoofing by requiring explicit proxy allowlists (`TRUSTED_PROXIES`) and defaulting to fail-closed against unverified private IP hops in production. Public endpoints (`/api/subscribe`, `/api/subscriber/gdpr/*`) enforce true incremental byte stream limits (16 KB max) to prevent memory exhaustion.
+   Rate-limiting defends against `X-Forwarded-For` spoofing by requiring explicit proxy allowlists (`TRUSTED_PROXIES` supporting both IPv4 and IPv6 CIDRs) and defaulting to fail-closed against unverified private IP hops in production. Public endpoints (`/api/subscribe`, `/api/subscriber/gdpr/*`) enforce true incremental byte stream limits (16 KB max) to prevent memory exhaustion.
+7. **Atomic Cancellation Protocol & Strict In-Flight Fencing**:
+   When an admin cancels a campaign, the API acquires a transaction-level row lock (`FOR UPDATE`) on the campaign record, marks non-terminal recipients as `failed`, and purges all queue jobs. Both worker retry scheduling and scheduler stuck-campaign recovery execute within atomic transactions acquiring the same row lock, strictly preventing zombie queue jobs. Pre-send barriers immediately halt worker loops, and post-send conditional transitions guarantee that in-flight dispatches can never overwrite a cancelled campaign.
 
 ---
 
