@@ -68,7 +68,7 @@ describe("Production Security Baseline & Configuration Guardrails", () => {
     expect(() => validateProductionConfig(validProdEnv)).not.toThrow();
   });
 
-  it("fails closed in production if APP_URL is missing, insecure HTTP, or points to localhost", () => {
+  it("fails closed in production if APP_URL is missing, insecure HTTP, or points to private/internal hosts", () => {
     const base: NodeJS.ProcessEnv = {
       NODE_ENV: "production",
       AUTH_SECRET: "super-secure-production-secret-must-be-very-long-32-chars",
@@ -89,7 +89,32 @@ describe("Production Security Baseline & Configuration Guardrails", () => {
 
     // Localhost APP_URL
     expect(() => validateProductionConfig({ ...base, APP_URL: "https://localhost:3000" })).toThrow(
-      /APP_URL cannot point to localhost or private domains/
+      /APP_URL cannot point to localhost, private IP ranges, or internal domains/
+    );
+
+    // Private IPv4 ranges (RFC 1918 & link-local)
+    expect(() => validateProductionConfig({ ...base, APP_URL: "https://192.168.1.10" })).toThrow(
+      /APP_URL cannot point to localhost, private IP ranges, or internal domains/
+    );
+    expect(() => validateProductionConfig({ ...base, APP_URL: "https://10.0.0.5:8443" })).toThrow(
+      /APP_URL cannot point to localhost, private IP ranges, or internal domains/
+    );
+    expect(() => validateProductionConfig({ ...base, APP_URL: "https://172.20.14.2" })).toThrow(
+      /APP_URL cannot point to localhost, private IP ranges, or internal domains/
+    );
+    expect(() => validateProductionConfig({ ...base, APP_URL: "https://169.254.169.254" })).toThrow(
+      /APP_URL cannot point to localhost, private IP ranges, or internal domains/
+    );
+
+    // Internal domains and single-label hosts
+    expect(() => validateProductionConfig({ ...base, APP_URL: "https://myservice.local" })).toThrow(
+      /APP_URL cannot point to localhost, private IP ranges, or internal domains/
+    );
+    expect(() => validateProductionConfig({ ...base, APP_URL: "https://backend.internal" })).toThrow(
+      /APP_URL cannot point to localhost, private IP ranges, or internal domains/
+    );
+    expect(() => validateProductionConfig({ ...base, APP_URL: "https://newsletter-service" })).toThrow(
+      /APP_URL cannot point to localhost, private IP ranges, or internal domains/
     );
   });
 

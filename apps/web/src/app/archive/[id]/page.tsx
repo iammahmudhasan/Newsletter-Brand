@@ -5,6 +5,41 @@ import { sanitizeNewsletterHtml } from "@ai-signal/email";
 import { SignupForm } from "@/components/SignupForm";
 import { ArrowLeft, Calendar, Clock, Share2, Tag } from "lucide-react";
 
+const SAMPLE_DATA: Record<string, { title: string; date: string; issueNumber: number; content: string }> = {
+  "sample-01": {
+    title: "Frontier Reasoning, Test-Time Compute & Synthetic Data Loops",
+    date: "October 10, 2026",
+    issueNumber: 1,
+    content: `
+      <h2>Executive Summary</h2>
+      <p>Why adaptive search trajectories outperform 10x larger base models on code benchmarks, plus 1 startup signal on self-correcting agent runtimes.</p>
+      <h3>Key Frontier Developments</h3>
+      <ul>
+        <li><strong>Adaptive Verification:</strong> Models using test-time compute scaling achieve 88.4% on SWE-bench Verified.</li>
+        <li><strong>Synthetic Data Quality:</strong> Rule-based curriculum filtering eliminates hallucinations in agent training sets.</li>
+      </ul>
+    `,
+  },
+  "sample-02": {
+    title: "Autonomous Agents in Production: Beyond Simple Vector RAG",
+    date: "October 03, 2026",
+    issueNumber: 2,
+    content: `
+      <h2>Executive Summary</h2>
+      <p>Breaking down memory graphs, speculative tool execution, and latency trade-offs between dense vs sparse embedding pipelines.</p>
+    `,
+  },
+  "sample-03": {
+    title: "Open Weights vs Proprietary APIs: The True Cost-Per-Token Calculus",
+    date: "September 26, 2026",
+    issueNumber: 3,
+    content: `
+      <h2>Executive Summary</h2>
+      <p>A complete empirical breakdown of self-hosted vLLM clusters vs serverless tokens at 50M requests/month.</p>
+    `,
+  },
+};
+
 export default async function IssueDetailPage({
   params,
 }: {
@@ -12,25 +47,42 @@ export default async function IssueDetailPage({
 }) {
   const { id } = await params;
 
-  let campaign: any = null;
-  try {
-    const [found] = await db
-      .select()
-      .from(campaigns)
-      .where(eq(campaigns.id, id));
-    campaign = found;
-  } catch {
-    notFound();
-  }
+  let issueTitle = "";
+  let issueDate = "Recent";
+  let issueNumber = 1;
+  let htmlContent = "";
 
-  if (!campaign) {
-    notFound();
-  }
+  // 1. Support curated sample issues if accessed
+  if (id && SAMPLE_DATA[id]) {
+    const sample = SAMPLE_DATA[id];
+    issueTitle = sample.title;
+    issueDate = sample.date;
+    issueNumber = sample.issueNumber;
+    htmlContent = sample.content;
+  } else {
+    // 2. Fetch from database with strict published status filter
+    let campaign: any = null;
+    try {
+      const [found] = await db
+        .select()
+        .from(campaigns)
+        .where(eq(campaigns.id, id));
+      campaign = found;
+    } catch {
+      notFound();
+    }
 
-  const issueTitle = campaign.title;
-  const issueDate = campaign.sentAt ? new Date(campaign.sentAt).toLocaleDateString() : "Recent";
-  const issueNumber = campaign.issueNumber || 1;
-  const htmlContent = campaign.contentHtml;
+    // Only allow public access to published (sent / partially_failed) issues.
+    // Disallow scheduled, sending, draft, or cancelled issues.
+    if (!campaign || (campaign.status !== "sent" && campaign.status !== "partially_failed")) {
+      notFound();
+    }
+
+    issueTitle = campaign.title;
+    issueDate = campaign.sentAt ? new Date(campaign.sentAt).toLocaleDateString() : "Recent";
+    issueNumber = campaign.issueNumber || 1;
+    htmlContent = campaign.contentHtml;
+  }
 
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-6 py-14">

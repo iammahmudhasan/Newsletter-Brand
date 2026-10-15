@@ -76,7 +76,7 @@ export default async function ArchivePage() {
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
                   <div className="flex items-center gap-3">
                     <span className="font-mono text-xs font-bold text-brand bg-brand/10 border border-brand/20 px-2.5 py-0.5 rounded">
-                      Issue #{dbCampaigns.length - idx}
+                      Issue #{c.issueNumber ?? (dbCampaigns.length - idx)}
                     </span>
                     <span className="flex items-center gap-1.5 text-xs text-slate-500">
                       <Calendar className="w-3.5 h-3.5" />

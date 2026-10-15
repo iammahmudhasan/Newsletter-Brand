@@ -18,29 +18,65 @@ interface FallbackRecord {
   resetAt: number;
 }
 const fallbackRateLimits = new Map<string, FallbackRecord>();
+let dbUnavailableUntil = 0;
 
 /**
- * Atomically checks and reserves a login attempt in a single database transaction / query.
- * Eliminates race conditions where concurrent requests could bypass the lockout threshold.
+ * Checks if the IP address is currently locked out due to exceeding maximum failed login attempts.
  */
-async function reserveLoginAttempt(
+async function checkLoginLockout(
   ipHash: string
-): Promise<{ allowed: boolean; retryAfterSeconds?: number }> {
+): Promise<{ locked: boolean; retryAfterSeconds?: number }> {
   const now = Date.now();
 
-  try {
-    const result = await db.execute<typeof adminLoginAttempts.$inferSelect>(sql`
+  if (now >= dbUnavailableUntil) {
+    try {
+      const [record] = await db
+        .select({
+          attempts: adminLoginAttempts.attempts,
+          lockedUntil: adminLoginAttempts.lockedUntil,
+        })
+        .from(adminLoginAttempts)
+        .where(eq(adminLoginAttempts.ipHash, ipHash));
+
+      if (record?.lockedUntil && new Date(record.lockedUntil).getTime() > now) {
+        const retryAfter = Math.ceil((new Date(record.lockedUntil).getTime() - now) / 1000);
+        return { locked: true, retryAfterSeconds: Math.max(1, retryAfter) };
+      }
+
+      return { locked: false };
+    } catch {
+      dbUnavailableUntil = Date.now() + 10_000;
+    }
+  }
+
+  // In-memory fallback
+  const rec = fallbackRateLimits.get(ipHash);
+  if (rec && rec.attempts >= MAX_LOGIN_ATTEMPTS && rec.resetAt > now) {
+    return { locked: true, retryAfterSeconds: Math.max(1, Math.ceil((rec.resetAt - now) / 1000)) };
+  }
+  return { locked: false };
+}
+
+/**
+ * Atomically records a failed password attempt and triggers lockout only after 5 failed attempts.
+ */
+async function recordFailedLoginAttempt(
+  ipHash: string
+): Promise<{ attempts: number; locked: boolean; retryAfterSeconds?: number }> {
+  const now = Date.now();
+
+  if (now >= dbUnavailableUntil) {
+    try {
+      const result = await db.execute<typeof adminLoginAttempts.$inferSelect>(sql`
       INSERT INTO admin_login_attempts (ip_hash, attempts, locked_until, updated_at)
       VALUES (${ipHash}, 1, NULL, NOW())
       ON CONFLICT (ip_hash) DO UPDATE
       SET
         attempts = CASE
-          WHEN admin_login_attempts.locked_until > NOW() THEN admin_login_attempts.attempts
           WHEN admin_login_attempts.updated_at < NOW() - INTERVAL '15 minutes' THEN 1
           ELSE admin_login_attempts.attempts + 1
         END,
         locked_until = CASE
-          WHEN admin_login_attempts.locked_until > NOW() THEN admin_login_attempts.locked_until
           WHEN (CASE WHEN admin_login_attempts.updated_at < NOW() - INTERVAL '15 minutes' THEN 1 ELSE admin_login_attempts.attempts + 1 END) >= ${MAX_LOGIN_ATTEMPTS}
           THEN NOW() + INTERVAL '15 minutes'
           ELSE NULL
@@ -51,45 +87,46 @@ async function reserveLoginAttempt(
 
     const record = (result as any)?.[0];
     if (record) {
-      if (record.locked_until && new Date(record.locked_until).getTime() > now) {
-        const retryAfter = Math.ceil((new Date(record.locked_until).getTime() - now) / 1000);
-        return { allowed: false, retryAfterSeconds: Math.max(1, retryAfter) };
+      const isLocked = Boolean(record.locked_until && new Date(record.locked_until).getTime() > now);
+      const retryAfter = isLocked
+        ? Math.max(1, Math.ceil((new Date(record.locked_until).getTime() - now) / 1000))
+        : undefined;
+      return { attempts: Number(record.attempts), locked: isLocked, retryAfterSeconds: retryAfter };
+    }
+    } catch (err: any) {
+      dbUnavailableUntil = Date.now() + 10_000;
+      if (process.env.NODE_ENV === "production") {
+        console.warn("[RateLimit FailedAttempt DB Notice]:", err.message);
       }
-      if (record.attempts > MAX_LOGIN_ATTEMPTS) {
-        return { allowed: false, retryAfterSeconds: 900 };
-      }
     }
-
-    return { allowed: true };
-  } catch (err: any) {
-    if (process.env.NODE_ENV === "production") {
-      console.error("[RateLimit Production Fail-Closed]: Database error checking rate limits:", err.message);
-      return { allowed: false, retryAfterSeconds: 60 };
-    }
-
-    console.warn("[RateLimit DB Error] Falling back to memory limiter in non-production:", err.message);
-    const rec = fallbackRateLimits.get(ipHash);
-    if (!rec || now > rec.resetAt) {
-      fallbackRateLimits.set(ipHash, { attempts: 1, resetAt: now + LOCKOUT_WINDOW_MS });
-      return { allowed: true };
-    }
-
-    rec.attempts += 1;
-    if (rec.attempts > MAX_LOGIN_ATTEMPTS) {
-      return { allowed: false, retryAfterSeconds: Math.ceil((rec.resetAt - now) / 1000) };
-    }
-    return { allowed: true };
   }
+
+  // Fallback: In-memory store
+  const rec = fallbackRateLimits.get(ipHash);
+  if (!rec || now > rec.resetAt) {
+    fallbackRateLimits.set(ipHash, { attempts: 1, resetAt: now + LOCKOUT_WINDOW_MS });
+    return { attempts: 1, locked: false };
+  }
+
+  rec.attempts += 1;
+  const isLocked = rec.attempts >= MAX_LOGIN_ATTEMPTS;
+  return {
+    attempts: rec.attempts,
+    locked: isLocked,
+    retryAfterSeconds: isLocked ? Math.max(1, Math.ceil((rec.resetAt - now) / 1000)) : undefined,
+  };
 }
 
 /**
- * Clears rate limit state upon successful authentication
+ * Clears failed attempt rate limit state upon successful authentication
  */
 async function resetRateLimit(ipHash: string): Promise<void> {
-  try {
-    await db.delete(adminLoginAttempts).where(eq(adminLoginAttempts.ipHash, ipHash));
-  } catch {
-    // In-memory fallback cleanup
+  if (Date.now() >= dbUnavailableUntil) {
+    try {
+      await db.delete(adminLoginAttempts).where(eq(adminLoginAttempts.ipHash, ipHash));
+    } catch {
+      dbUnavailableUntil = Date.now() + 10_000;
+    }
   }
   fallbackRateLimits.delete(ipHash);
 }
@@ -126,17 +163,17 @@ export async function POST(req: NextRequest) {
     const rawIp = getClientIp(req);
     const ipHash = hashIp(rawIp);
 
-    // 4. Atomic check & reservation of login attempt
-    const rateLimit = await reserveLoginAttempt(ipHash);
-    if (!rateLimit.allowed) {
+    // 4. Lockout check: Is this IP currently locked out from previous failed attempts?
+    const lockout = await checkLoginLockout(ipHash);
+    if (lockout.locked) {
       return NextResponse.json(
         {
-          error: `Too many failed login attempts. Please try again in ${rateLimit.retryAfterSeconds} seconds.`,
+          error: `Too many failed login attempts. Please try again in ${lockout.retryAfterSeconds} seconds.`,
         },
         {
           status: 429,
           headers: {
-            "Retry-After": String(rateLimit.retryAfterSeconds || 60),
+            "Retry-After": String(lockout.retryAfterSeconds || 60),
           },
         }
       );
@@ -146,6 +183,21 @@ export async function POST(req: NextRequest) {
     const { password } = body;
 
     if (!password || typeof password !== "string" || !verifyAdminPassword(password)) {
+      // Atomically record failed password attempt
+      const failed = await recordFailedLoginAttempt(ipHash);
+      if (failed.locked) {
+        return NextResponse.json(
+          {
+            error: `Too many failed login attempts. Please try again in ${failed.retryAfterSeconds} seconds.`,
+          },
+          {
+            status: 429,
+            headers: {
+              "Retry-After": String(failed.retryAfterSeconds || 60),
+            },
+          }
+        );
+      }
       return NextResponse.json({ error: "Invalid admin credentials" }, { status: 401 });
     }
 

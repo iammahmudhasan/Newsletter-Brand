@@ -103,7 +103,7 @@ describe("Webhook Security, Signature Verification & Bounce Classification", () 
 
       // Terminal failures
       { raw: "email.failed", expected: "failed" },
-      { raw: "email.suppressed", expected: "failed" },
+      { raw: "email.suppressed", expected: "suppressed" },
       { raw: "Reject", expected: "failed" },
       { raw: "Rendering Failure", expected: "failed" },
       { raw: "RenderingFailure", expected: "failed" },

@@ -71,7 +71,12 @@ function verifyResendSvixSignature(
       }
     }
 
-    // Fallback: standard hex HMAC comparison
+    // In production, strictly reject non-standard raw-body hex HMAC fallback
+    if (process.env.NODE_ENV === "production") {
+      return false;
+    }
+
+    // Fallback: standard hex HMAC comparison (non-production legacy test support only)
     const computedHex = crypto
       .createHmac("sha256", secret)
       .update(rawBody)
@@ -413,8 +418,8 @@ export async function POST(req: NextRequest) {
               await reconcileCampaignMetrics(tx, targetCampaignId);
             }
           }
-        } else if (standardizedType === "failed") {
-          // Terminal provider failure (e.g. Reject, Rendering Failure, email.failed, email.suppressed)
+        } else if (standardizedType === "failed" || standardizedType === "suppressed") {
+          // Terminal provider failure or suppression (e.g. Reject, Rendering Failure, email.failed, email.suppressed)
           const updatedRows = await tx
             .update(campaignRecipients)
             .set({
@@ -507,6 +512,24 @@ export async function POST(req: NextRequest) {
             email,
             reason: "complaint",
             details: "Spam complaint received from ISP / mailbox provider",
+          })
+          .onConflictDoNothing();
+      }
+
+      // Step E: Process Provider Suppression (email.suppressed)
+      if (standardizedType === "suppressed") {
+        console.warn(`[Webhook] Provider suppression recorded for ${email}. Suppressing recipient.`);
+        await tx
+          .update(subscribers)
+          .set({ status: "bounced" })
+          .where(eq(subscribers.email, email));
+
+        await tx
+          .insert(suppressions)
+          .values({
+            email,
+            reason: "admin_block",
+            details: "Address suppressed by email provider delivery infrastructure",
           })
           .onConflictDoNothing();
       }

@@ -65,7 +65,7 @@ describe("Webhook Atomic Transaction & Delivery State Machine", () => {
       "complaint",
       "complaint",
       "failed",
-      "failed",
+      "suppressed",
       "failed",
       "failed",
       "failed",

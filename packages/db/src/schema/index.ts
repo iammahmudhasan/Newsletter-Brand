@@ -90,6 +90,7 @@ export const campaigns = pgTable(
   },
   (table) => [
     uniqueIndex("campaigns_idempotency_key_idx").on(table.idempotencyKey),
+    uniqueIndex("campaigns_issue_number_unique_idx").on(table.issueNumber),
     index("campaigns_status_idx").on(table.status),
     index("campaigns_scheduled_idx").on(table.scheduledAt),
   ]
@@ -144,7 +145,7 @@ export const emailEvents = pgTable(
     recipientId: uuid("recipient_id").references(() => campaignRecipients.id, { onDelete: "set null" }),
     recipientEmail: text("recipient_email").notNull(),
     eventType: text("event_type", {
-      enum: ["delivered", "delivery_delayed", "bounce", "complaint", "failed", "click", "open", "unknown"],
+      enum: ["delivered", "delivery_delayed", "bounce", "complaint", "failed", "suppressed", "click", "open", "unknown"],
     }).notNull(),
     payload: jsonb("payload").$type<Record<string, any>>(),
     createdAt: timestamp("created_at").notNull().defaultNow(),
@@ -241,6 +242,19 @@ export const adminLoginAttempts = pgTable(
   (table) => [
     uniqueIndex("admin_login_ip_hash_idx").on(table.ipHash),
   ]
+);
+
+// ----------------------------------------------------
+// 10. Distributed Rate Limits (Shared across all worker and web instances)
+// ----------------------------------------------------
+export const rateLimits = pgTable(
+  "rate_limits",
+  {
+    key: text("key").primaryKey(),
+    count: integer("count").notNull().default(1),
+    resetAt: timestamp("reset_at", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  }
 );
 
 // ----------------------------------------------------

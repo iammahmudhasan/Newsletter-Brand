@@ -1,3 +1,5 @@
+import { sanitizeNewsletterHtml } from "../sanitizer";
+
 export interface NewsletterIssueProps {
   issueNumber: number;
   issueDate: string;
@@ -36,6 +38,16 @@ function htmlToPlainText(html: string): string {
     .replace(/&#39;/g, "'")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function escapeHtml(str: string): string {
+  if (!str) return "";
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
 export function renderNewsletterEmail(props: NewsletterIssueProps): {
@@ -92,18 +104,27 @@ ${webUrl}
 AI Signal Media · Strict Permission Distribution
   `.trim();
 
+  // Escape all plain-text inputs to prevent HTML injection into title, preview, and layout
+  const safeTitle = escapeHtml(title);
+  const safePreviewText = escapeHtml(previewText);
+  const safeIssueDate = escapeHtml(issueDate);
+  const safeRecipientEmail = escapeHtml(recipientEmail);
+  const safeArchiveUrl = escapeHtml(archiveUrl);
+  const safeWebUrl = escapeHtml(webUrl);
+  const sanitizedContent = sanitizeNewsletterHtml(htmlContent);
+
   const html = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title} | AI Signal #${issueNumber}</title>
+  <title>${safeTitle} | AI Signal #${issueNumber}</title>
 </head>
 <body style="margin: 0; padding: 0; background-color: #08090d; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #e2e8f0;">
   <!-- Hidden Preheader -->
   <div style="display: none; max-height: 0px; overflow: hidden;">
-    ${previewText} &#847; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp;
+    ${safePreviewText} &#847; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp;
   </div>
 
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #08090d; padding: 32px 16px;">

@@ -57,6 +57,13 @@
       "when": 1791950000000,
       "tag": "0007_sturdy_delivery_and_fencing",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1791955000000,
+      "tag": "0008_distributed_rate_limits_and_issue_unique",
+      "breakpoints": true
     }
   ]
 }

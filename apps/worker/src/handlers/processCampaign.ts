@@ -251,7 +251,7 @@ export async function handleProcessCampaignBatch(
             .where(
               and(
                 eq(emailEvents.recipientId, item.recipientId),
-                sql`${emailEvents.eventType} IN ('delivered', 'bounce', 'complaint', 'open', 'click')`
+                sql`${emailEvents.eventType} IN ('delivered', 'bounce', 'complaint', 'failed', 'suppressed', 'open', 'click')`
               )
             )
             .orderBy(desc(emailEvents.createdAt))
@@ -263,9 +263,17 @@ export async function handleProcessCampaignBatch(
             );
 
             let newStatus: "delivered" | "bounced" | "failed" = "delivered";
-            if (reconciledEvent.eventType === "bounce") newStatus = "bounced";
-            else if (reconciledEvent.eventType === "complaint") newStatus = "failed";
-            else newStatus = "delivered";
+            if (reconciledEvent.eventType === "bounce") {
+              newStatus = "bounced";
+            } else if (
+              reconciledEvent.eventType === "complaint" ||
+              reconciledEvent.eventType === "failed" ||
+              reconciledEvent.eventType === "suppressed"
+            ) {
+              newStatus = "failed";
+            } else {
+              newStatus = "delivered";
+            }
 
             await db
               .update(campaignRecipients)
@@ -383,6 +391,39 @@ export async function handleProcessCampaignBatch(
 
           // Use recipient-specific idempotency key for provider-level duplicate dispatch protection
           const idempotencyKey = `campaign:${campaign.id}:recipient:${item.recipientId}`;
+
+          // Ultra-tight pre-send fencing & GDPR shield: ensure recipient wasn't concurrently cancelled, deleted, or suppressed
+          const [stillClaimed] = await db
+            .select({ id: campaignRecipients.id })
+            .from(campaignRecipients)
+            .where(
+              and(
+                eq(campaignRecipients.id, item.recipientId),
+                eq(campaignRecipients.status, "processing"),
+                eq(campaignRecipients.claimToken, claimToken)
+              )
+            );
+
+          if (!stillClaimed) {
+            console.warn(
+              `[Fencing/GDPR Pre-Send Shield] Recipient ${item.recipientId} claim was cancelled, deleted, or modified concurrently. Aborting dispatch.`
+            );
+            failCount++;
+            continue;
+          }
+
+          const [preSendSuppressed] = await db
+            .select({ id: suppressions.id })
+            .from(suppressions)
+            .where(eq(suppressions.email, normalizedEmail));
+
+          if (preSendSuppressed) {
+            console.warn(
+              `[GDPR Pre-Send Shield] Recipient ${item.recipientId} (${normalizedEmail}) was added to suppressions concurrently. Aborting dispatch.`
+            );
+            failCount++;
+            continue;
+          }
 
           const sendResult = await provider.sendEmail({
             to: freshSub.email,

@@ -198,6 +198,12 @@ export async function verifyAwsSnsSignature(
 
   // 6. Cryptographic signature check
   try {
+    if (SignatureVersion !== "1" && SignatureVersion !== "2") {
+      return {
+        valid: false,
+        error: `Unsupported or unknown SNS SignatureVersion: '${SignatureVersion}'. Only versions 1 and 2 are permitted.`,
+      };
+    }
     const algorithm = SignatureVersion === "2" ? "RSA-SHA256" : "RSA-SHA1";
     const verifier = crypto.createVerify(algorithm);
     verifier.update(canonicalString, "utf8");

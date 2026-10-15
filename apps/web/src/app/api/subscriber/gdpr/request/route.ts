@@ -42,7 +42,7 @@ export async function POST(req: NextRequest) {
     const normalized = normalizeEmail(email);
 
     // 1. Rate limiting by IP (max 5 privacy requests per 15 minutes per IP)
-    const ipRateLimit = checkRateLimit(`gdpr:ip:${clientIp}`, 5, 900);
+    const ipRateLimit = await checkRateLimit(`gdpr:ip:${clientIp}`, 5, 900);
     if (!ipRateLimit.allowed) {
       return NextResponse.json(
         { error: "Too many privacy requests. Please wait a few minutes before trying again." },
@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 2. Cooldown per email address (max 1 request per 10 minutes per email to avoid email bombing)
-    const emailCooldown = checkEmailCooldown(`gdpr:email:${normalized}`, 600);
+    const emailCooldown = await checkEmailCooldown(`gdpr:email:${normalized}`, 600);
     if (!emailCooldown.allowed) {
       // Privacy-preserving response: Do not leak whether the account exists or failed cooldown
       return NextResponse.json({

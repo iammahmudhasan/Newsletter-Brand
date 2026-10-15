@@ -101,4 +101,35 @@ describe("Admin Authentication Security, Distributed Rate Limiting & CSRF", () =
     expect(data.error).toContain("Too many failed login attempts");
     expect(blockedRes.headers.get("Retry-After")).not.toBeNull();
   });
+
+  it("allows successful authentication on the 5th attempt after 4 failed attempts without premature lockout", async () => {
+    const testIp = "203.0.113.100";
+
+    // 4 failed attempts
+    for (let i = 0; i < 4; i++) {
+      const failReq = {
+        headers: new Headers({
+          "x-forwarded-for": testIp,
+          "content-type": "application/json",
+        }),
+        json: async () => ({ password: `wrong-${i}` }),
+      } as any;
+      const res = await POST(failReq);
+      expect(res.status).toBe(401);
+    }
+
+    // 5th attempt with the correct password must succeed
+    const successReq = {
+      headers: new Headers({
+        "x-forwarded-for": testIp,
+        "content-type": "application/json",
+      }),
+      json: async () => ({ password: config.adminPassword }),
+    } as any;
+
+    const res = await POST(successReq);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.success).toBe(true);
+  });
 });

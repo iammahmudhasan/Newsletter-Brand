@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, subscribers, consentEvents, suppressions, emailEvents, automationJobs, eq, and, sql } from "@ai-signal/db";
+import { db, subscribers, consentEvents, suppressions, emailEvents, automationJobs, campaignRecipients, eq, and, sql } from "@ai-signal/db";
 import { verifySignedToken, normalizeEmail } from "@ai-signal/config";
 
 // GDPR Data Export (Right of Access) - strictly requires 'data_export' purpose token
@@ -115,10 +115,25 @@ export async function POST(req: NextRequest) {
           sql`payload->>'subscriberId' = ${subscriberId} OR payload->>'email' = ${normalizedEmail}`
         );
 
-      // 3. Delete subscriber record (cascades to campaign_recipients & consent_events)
+      // 3. Cancel in-flight campaign recipients immediately to abort concurrent worker dispatches
+      await tx
+        .update(campaignRecipients)
+        .set({
+          status: "failed",
+          errorMessage: "Cancelled by GDPR deletion request",
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(campaignRecipients.subscriberId, subscriberId),
+            sql`${campaignRecipients.status} IN ('queued', 'processing')`
+          )
+        );
+
+      // 4. Delete subscriber record (cascades to campaign_recipients & consent_events)
       await tx.delete(subscribers).where(eq(subscribers.id, subscriberId));
 
-      // 4. Add email to suppressions to guarantee they are never contacted again
+      // 5. Add email to suppressions to guarantee they are never contacted again
       await tx
         .insert(suppressions)
         .values({

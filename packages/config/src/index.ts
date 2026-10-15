@@ -21,6 +21,90 @@ export const ALLOWED_EMAIL_PROVIDERS = ["console", "resend", "ses"] as const;
 export type EmailProviderType = (typeof ALLOWED_EMAIL_PROVIDERS)[number];
 
 /**
+ * Checks whether a given hostname refers to a private/internal network, loopback, link-local, or internal TLD
+ */
+export function isPrivateOrInternalHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().trim();
+
+  // Strip IPv6 brackets if present e.g. [::1]
+  const cleanHost = host.startsWith("[") && host.endsWith("]")
+    ? host.slice(1, -1)
+    : host;
+
+  if (
+    cleanHost === "localhost" ||
+    cleanHost === "127.0.0.1" ||
+    cleanHost === "0.0.0.0" ||
+    cleanHost === "::1" ||
+    cleanHost === "::"
+  ) {
+    return true;
+  }
+
+  // Check internal TLDs and local domains
+  const internalSuffixes = [
+    ".local",
+    ".internal",
+    ".lan",
+    ".corp",
+    ".home",
+    ".test",
+    ".example",
+    ".invalid",
+    ".localhost",
+  ];
+  if (internalSuffixes.some((suffix) => cleanHost.endsWith(suffix))) {
+    return true;
+  }
+
+  // Single-label host without dot or colon (e.g. "intranet", "mailserver")
+  if (!cleanHost.includes(".") && !cleanHost.includes(":")) {
+    return true;
+  }
+
+  // IPv4 range checks
+  const ipv4Regex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+  const ipv4Match = cleanHost.match(ipv4Regex);
+  if (ipv4Match) {
+    const [, o1, o2, o3, o4] = ipv4Match.map(Number);
+    if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) {
+      return true; // invalid IP is rejected
+    }
+    // 127.0.0.0/8 (Loopback)
+    if (o1 === 127) return true;
+    // 10.0.0.0/8 (Private RFC 1918)
+    if (o1 === 10) return true;
+    // 172.16.0.0/12 (Private RFC 1918)
+    if (o1 === 172 && o2 >= 16 && o2 <= 31) return true;
+    // 192.168.0.0/16 (Private RFC 1918)
+    if (o1 === 192 && o2 === 168) return true;
+    // 169.254.0.0/16 (Link-local / Cloud metadata)
+    if (o1 === 169 && o2 === 254) return true;
+    // 100.64.0.0/10 (Carrier-grade NAT)
+    if (o1 === 100 && o2 >= 64 && o2 <= 127) return true;
+    // 0.0.0.0/8
+    if (o1 === 0) return true;
+  }
+
+  // IPv6 unique local (fc00::/7) or link-local (fe80::/10)
+  if (cleanHost.includes(":")) {
+    const lower = cleanHost.toLowerCase();
+    if (
+      lower.startsWith("fc") ||
+      lower.startsWith("fd") ||
+      lower.startsWith("fe8") ||
+      lower.startsWith("fe9") ||
+      lower.startsWith("fea") ||
+      lower.startsWith("feb")
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Validates configuration against fail-closed security rules in production
  */
 export function validateProductionConfig(env: NodeJS.ProcessEnv = process.env): void {
@@ -92,12 +176,8 @@ export function validateProductionConfig(env: NodeJS.ProcessEnv = process.env): 
       if (parsedUrl.protocol !== "https:") {
         errors.push("APP_URL must use https:// in production");
       }
-      if (
-        parsedUrl.hostname === "localhost" ||
-        parsedUrl.hostname === "127.0.0.1" ||
-        parsedUrl.hostname.endsWith(".local")
-      ) {
-        errors.push("APP_URL cannot point to localhost or private domains in production");
+      if (isPrivateOrInternalHost(parsedUrl.hostname)) {
+        errors.push("APP_URL cannot point to localhost, private IP ranges, or internal domains in production");
       }
     } catch {
       errors.push("APP_URL must be a valid absolute HTTPS URL");

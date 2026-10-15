@@ -6,6 +6,7 @@ export type WebhookNormalizedType =
   | "bounce"
   | "complaint"
   | "failed"
+  | "suppressed"
   | "click"
   | "open"
   | "unknown";
@@ -48,15 +49,18 @@ export function normalizeWebhookEventType(rawType: string): WebhookNormalizedTyp
     return "complaint";
   }
 
-  // 5. Terminal failures (SES: Reject, Rendering Failure; Resend: email.failed, email.suppressed)
+  // 5. Suppressed by provider infrastructure (Resend: email.suppressed)
+  if (lower === "email.suppressed" || lower === "suppressed") {
+    return "suppressed";
+  }
+
+  // 6. Terminal failures (SES: Reject, Rendering Failure; Resend: email.failed)
   if (
     lower === "reject" ||
     lower === "rendering failure" ||
     lower === "renderingfailure" ||
     lower === "email.failed" ||
-    lower === "email.suppressed" ||
-    lower === "failed" ||
-    lower === "suppressed"
+    lower === "failed"
   ) {
     return "failed";
   }
@@ -70,6 +74,35 @@ export function normalizeWebhookEventType(rawType: string): WebhookNormalizedTyp
   }
 
   return "unknown";
+}
+
+/**
+ * Determines the target campaign status from recipient states.
+ * CRITICAL: A campaign CANNOT be transitioned to a terminal status ('sent', 'partially_failed', 'failed')
+ * while any recipients are still queued or being processed by workers ('sending').
+ */
+export function computeCampaignTargetStatus(
+  allRecipients: { status: string }[]
+): "sending" | "sent" | "partially_failed" | "failed" {
+  const sent = allRecipients.filter((r: any) => r.status === "sent" || r.status === "delivered").length;
+  const failed = allRecipients.filter(
+    (r: any) => r.status === "failed" || r.status === "bounced" || r.status === "needs_review"
+  ).length;
+  const inFlightOrQueued = allRecipients.filter(
+    (r: any) => r.status === "queued" || r.status === "processing"
+  ).length;
+
+  if (inFlightOrQueued > 0) {
+    return "sending";
+  }
+
+  if (failed > 0 && sent > 0) {
+    return "partially_failed";
+  } else if (failed > 0 && sent === 0) {
+    return "failed";
+  } else {
+    return "sent";
+  }
 }
 
 /**
@@ -91,19 +124,14 @@ export async function reconcileCampaignMetrics(tx: any, campaignId: string): Pro
     (r: any) => r.status === "failed" || r.status === "bounced" || r.status === "needs_review"
   ).length;
 
-  let finalCampaignStatus: "sent" | "partially_failed" | "failed" = "sent";
-  if (failed > 0 && sent > 0) {
-    finalCampaignStatus = "partially_failed";
-  } else if (failed > 0 && sent === 0) {
-    finalCampaignStatus = "failed";
-  }
+  const targetStatus = computeCampaignTargetStatus(allRecipients);
 
   await tx
     .update(campaigns)
     .set({
       successfulSends: sent,
       failedSends: failed,
-      status: finalCampaignStatus,
+      status: targetStatus,
       updatedAt: new Date(),
     })
     .where(

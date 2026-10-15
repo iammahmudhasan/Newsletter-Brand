@@ -53,7 +53,10 @@ export async function POST(req: NextRequest) {
 
     // Transactional Outbox: Atomically persist campaign and outbox job in a single database transaction
     const { campaignId, jobId, issueNumber } = await db.transaction(async (tx) => {
-      // Dynamically sequence the issue number
+      // 1. Transactional advisory lock: Serialize issue number allocation across concurrent workers
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(424242);`);
+
+      // 2. Dynamically sequence the issue number
       const [maxIssue] = await tx
         .select({ max: sql<number>`COALESCE(MAX(${campaigns.issueNumber}), 0)` })
         .from(campaigns);
@@ -91,6 +94,7 @@ export async function POST(req: NextRequest) {
       {
         success: true,
         campaignId,
+        issueNumber,
         jobId,
         status: isImmediateSend ? "sending" : "scheduled",
         message: isImmediateSend
@@ -100,6 +104,33 @@ export async function POST(req: NextRequest) {
       { status: 201 }
     );
   } catch (err: any) {
+    // Graceful recovery for concurrent duplicate requests matching idempotencyKey
+    const clientKey = req.headers.get("idempotency-key") || null;
+    if (clientKey) {
+      try {
+        const [existing] = await db
+          .select()
+          .from(campaigns)
+          .where(eq(campaigns.idempotencyKey, clientKey));
+
+        if (existing) {
+          return NextResponse.json(
+            {
+              success: true,
+              campaignId: existing.id,
+              issueNumber: existing.issueNumber,
+              status: existing.status,
+              duplicate: true,
+              message: "Campaign already created with this idempotency key",
+            },
+            { status: 200 }
+          );
+        }
+      } catch {
+        // Fall through to generic error response
+      }
+    }
+
     console.error("[Admin Campaign Error]:", err.message);
     return NextResponse.json(
       { error: err?.message || "Failed to create campaign" },

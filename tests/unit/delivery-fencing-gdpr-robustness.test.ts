@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { normalizeWebhookEventType } from "../../apps/web/src/lib/webhookHelpers";
+import { normalizeWebhookEventType, computeCampaignTargetStatus } from "../../apps/web/src/lib/webhookHelpers";
 import { renderNewsletterEmail } from "../../packages/email/src/templates/newsletter";
 import { checkRateLimit, checkEmailCooldown } from "../../apps/web/src/lib/rateLimit";
 
@@ -14,9 +14,9 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       expect(normalizeWebhookEventType("DeliveryDelay")).not.toBe("delivered");
     });
 
-    it("correctly maps SES and Resend terminal failures", () => {
+    it("correctly maps SES and Resend terminal failures and suppression", () => {
       expect(normalizeWebhookEventType("email.failed")).toBe("failed");
-      expect(normalizeWebhookEventType("email.suppressed")).toBe("failed");
+      expect(normalizeWebhookEventType("email.suppressed")).toBe("suppressed");
       expect(normalizeWebhookEventType("Reject")).toBe("failed");
       expect(normalizeWebhookEventType("Rendering Failure")).toBe("failed");
       expect(normalizeWebhookEventType("RenderingFailure")).toBe("failed");
@@ -132,25 +132,25 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
   });
 
   describe("4. Abuse Prevention & Cooldown Logic (P2)", () => {
-    it("enforces sliding window rate limits on client requests", () => {
+    it("enforces sliding window rate limits on client requests", async () => {
       const testKey = `test:ip:limit:${Date.now()}`;
       // Max 3 requests
-      expect(checkRateLimit(testKey, 3, 60).allowed).toBe(true);
-      expect(checkRateLimit(testKey, 3, 60).allowed).toBe(true);
-      expect(checkRateLimit(testKey, 3, 60).allowed).toBe(true);
+      expect((await checkRateLimit(testKey, 3, 60)).allowed).toBe(true);
+      expect((await checkRateLimit(testKey, 3, 60)).allowed).toBe(true);
+      expect((await checkRateLimit(testKey, 3, 60)).allowed).toBe(true);
 
-      const fourth = checkRateLimit(testKey, 3, 60);
+      const fourth = await checkRateLimit(testKey, 3, 60);
       expect(fourth.allowed).toBe(false);
       expect(fourth.retryAfterSeconds).toBeGreaterThan(0);
     });
 
-    it("enforces per-email action cooldown against rapid email bombing", () => {
+    it("enforces per-email action cooldown against rapid email bombing", async () => {
       const testEmail = `bomb-target-${Date.now()}@domain.com`;
       // First attempt allowed
-      expect(checkEmailCooldown(testEmail, 10).allowed).toBe(true);
+      expect((await checkEmailCooldown(testEmail, 10)).allowed).toBe(true);
 
       // Immediate second attempt rejected by cooldown
-      const second = checkEmailCooldown(testEmail, 10);
+      const second = await checkEmailCooldown(testEmail, 10);
       expect(second.allowed).toBe(false);
       expect(second.retryAfterSeconds).toBeGreaterThan(0);
     });
@@ -176,6 +176,40 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
 
       expect(healthyBounces / totalOutcomes > BOUNCE_THRESHOLD).toBe(false);
       expect(healthyComplaints / totalOutcomes > COMPLAINT_THRESHOLD).toBe(false);
+    });
+  });
+
+  describe("6. Campaign Terminal Status Guard (P1)", () => {
+    it("never finalizes a campaign while any recipient remains queued or processing", () => {
+      // Scenario 1: 1 delivered, 99 queued (first webhook from a 100-recipient batch)
+      const earlyWebhookRecipients = [
+        { status: "delivered" },
+        ...Array.from({ length: 99 }, () => ({ status: "queued" })),
+      ];
+      expect(computeCampaignTargetStatus(earlyWebhookRecipients)).toBe("sending");
+
+      // Scenario 2: 50 delivered, 10 processing, 40 queued
+      const inFlightRecipients = [
+        ...Array.from({ length: 50 }, () => ({ status: "delivered" })),
+        ...Array.from({ length: 10 }, () => ({ status: "processing" })),
+        ...Array.from({ length: 40 }, () => ({ status: "queued" })),
+      ];
+      expect(computeCampaignTargetStatus(inFlightRecipients)).toBe("sending");
+
+      // Scenario 3: All 100 delivered (zero in-flight) -> 'sent'
+      const allDelivered = Array.from({ length: 100 }, () => ({ status: "delivered" }));
+      expect(computeCampaignTargetStatus(allDelivered)).toBe("sent");
+
+      // Scenario 4: 95 delivered, 5 bounced (zero in-flight) -> 'partially_failed'
+      const partiallyFailed = [
+        ...Array.from({ length: 95 }, () => ({ status: "delivered" })),
+        ...Array.from({ length: 5 }, () => ({ status: "bounced" })),
+      ];
+      expect(computeCampaignTargetStatus(partiallyFailed)).toBe("partially_failed");
+
+      // Scenario 5: All 10 failed (zero in-flight) -> 'failed'
+      const allFailed = Array.from({ length: 10 }, () => ({ status: "failed" }));
+      expect(computeCampaignTargetStatus(allFailed)).toBe("failed");
     });
   });
 });

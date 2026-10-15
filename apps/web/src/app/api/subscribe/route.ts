@@ -55,7 +55,7 @@ export async function POST(req: NextRequest) {
     const userAgent = req.headers.get("user-agent") || "unknown";
 
     // 2. IP Rate Limiting (max 15 signups per 10 minutes per IP)
-    const ipRateLimit = checkRateLimit(`signup:ip:${clientIp}`, 15, 600);
+    const ipRateLimit = await checkRateLimit(`signup:ip:${clientIp}`, 15, 600);
     if (!ipRateLimit.allowed) {
       return NextResponse.json(
         { error: "Too many signup requests. Please wait a few minutes before trying again." },
@@ -64,7 +64,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 3. Email Cooldown (max 1 confirmation request per 60 seconds per email)
-    const emailCooldown = checkEmailCooldown(`signup:email:${email}`, 60);
+    const emailCooldown = await checkEmailCooldown(`signup:email:${email}`, 60);
     if (!emailCooldown.allowed) {
       return NextResponse.json(
         {

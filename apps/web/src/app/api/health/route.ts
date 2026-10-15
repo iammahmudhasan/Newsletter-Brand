@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, subscribers, automationJobs, emailEvents, sql } from "@ai-signal/db";
+import { db, subscribers, automationJobs, emailEvents, campaignRecipients, sql } from "@ai-signal/db";
 import { isAuthorizedAdmin } from "@/lib/auth";
 
 export async function GET(req: NextRequest) {
@@ -45,26 +45,42 @@ export async function GET(req: NextRequest) {
       })
       .from(automationJobs);
 
-    // 4. Fetch delivery event telemetry
-    const [telemetry] = await db
+    // 4. Fetch delivery event telemetry and attempted recipient counts
+    const [recipientStats] = await db
       .select({
-        totalEvents: sql<number>`count(*)`,
-        delivered: sql<number>`count(*) filter (where event_type = 'delivered')`,
-        bounces: sql<number>`count(*) filter (where event_type = 'bounce')`,
-        complaints: sql<number>`count(*) filter (where event_type = 'complaint')`,
-        failed: sql<number>`count(*) filter (where event_type = 'failed')`,
+        totalRecipients: sql<number>`count(*)`,
+        totalAttempted: sql<number>`count(*) filter (where status in ('sent', 'delivered', 'bounced', 'failed', 'needs_review'))`,
+        delivered: sql<number>`count(*) filter (where status = 'delivered')`,
+        bounced: sql<number>`count(*) filter (where status = 'bounced')`,
+        failed: sql<number>`count(*) filter (where status = 'failed')`,
+      })
+      .from(campaignRecipients);
+
+    const [complaintTelemetry] = await db
+      .select({
+        uniqueComplaints: sql<number>`count(distinct coalesce(recipient_id::text, provider_message_id)) filter (where event_type = 'complaint')`,
       })
       .from(emailEvents);
 
-    const deliveredCount = Number(telemetry?.delivered || 0);
-    const bounceCount = Number(telemetry?.bounces || 0);
-    const complaintCount = Number(telemetry?.complaints || 0);
-    const failedCount = Number(telemetry?.failed || 0);
+    const totalAttemptedSends = Number(recipientStats?.totalAttempted || 0);
+    const deliveredCount = Number(recipientStats?.delivered || 0);
+    const bounceCount = Number(recipientStats?.bounced || 0);
+    const complaintCount = Number(complaintTelemetry?.uniqueComplaints || 0);
 
-    // Total delivery outcome events represent the denominator for rates
-    const totalOutcomes = deliveredCount + bounceCount + complaintCount + failedCount;
-    const bounceRatio = totalOutcomes > 0 ? bounceCount / totalOutcomes : 0;
-    const complaintRatio = totalOutcomes > 0 ? complaintCount / totalOutcomes : 0;
+    // Primary denominator: distinct attempted recipient sends.
+    // Fall back to distinct message identifier count in emailEvents if no campaign recipients exist yet.
+    let denominator = totalAttemptedSends;
+    if (denominator === 0) {
+      const [fallbackEvents] = await db
+        .select({
+          distinctMessages: sql<number>`count(distinct coalesce(provider_message_id, id::text))`,
+        })
+        .from(emailEvents);
+      denominator = Number(fallbackEvents?.distinctMessages || 0);
+    }
+
+    const bounceRatio = denominator > 0 ? bounceCount / denominator : 0;
+    const complaintRatio = denominator > 0 ? complaintCount / denominator : 0;
 
     // Evaluate deliverability health thresholds:
     // Industry target for bounces: < 0.2% (decimal ratio: 0.002)
@@ -95,7 +111,10 @@ export async function GET(req: NextRequest) {
         failedJobs: Number(queueStats?.failed || 0),
       },
       deliverability: {
+        attemptedSends: totalAttemptedSends,
         deliveredCount,
+        bounceCount,
+        complaintCount,
         bounceRate: `${(bounceRatio * 100).toFixed(2)}%`,
         complaintRate: `${(complaintRatio * 100).toFixed(3)}%`,
       },
