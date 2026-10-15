@@ -991,6 +991,46 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
         }
       }
     });
+
+    it("rejects forged X-Forwarded-For in production when socket IP is missing and nearest hop is untrusted", () => {
+      const origNodeEnv = process.env.NODE_ENV;
+      const origTrustEdge = process.env.TRUST_EDGE_HEADERS;
+      try {
+        (process.env as any).NODE_ENV = "production";
+        delete process.env.TRUST_EDGE_HEADERS;
+
+        // Socket IP is unavailable, client directly provides fake X-Forwarded-For
+        const spoofedReq = {
+          ip: undefined,
+          headers: {
+            get: (name: string) => (name === "x-forwarded-for" ? "1.2.3.4" : null),
+          },
+        } as any;
+
+        // Nearest hop 1.2.3.4 is untrusted; header must be rejected and fallback to safe default
+        const resolved = getClientIp(spoofedReq);
+        expect(resolved).toBe("127.0.0.1");
+
+        // Legitimate reverse proxy scenario: nearest hop is a private/trusted reverse proxy (e.g. 10.0.0.1)
+        const trustedProxyReq = {
+          ip: undefined,
+          headers: {
+            get: (name: string) => (name === "x-forwarded-for" ? "203.0.113.195, 10.0.0.1" : null),
+          },
+        } as any;
+
+        // 10.0.0.1 is trusted; peeled off to yield real client IP 203.0.113.195
+        const legitResolved = getClientIp(trustedProxyReq);
+        expect(legitResolved).toBe("203.0.113.195");
+      } finally {
+        (process.env as any).NODE_ENV = origNodeEnv;
+        if (origTrustEdge !== undefined) {
+          process.env.TRUST_EDGE_HEADERS = origTrustEdge;
+        } else {
+          delete process.env.TRUST_EDGE_HEADERS;
+        }
+      }
+    });
   });
 
   describe("16. Incremental Streaming Request Body Size Limit (P3)", () => {

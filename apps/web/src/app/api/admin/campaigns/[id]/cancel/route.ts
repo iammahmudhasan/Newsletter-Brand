@@ -23,15 +23,18 @@ export async function POST(
     }
 
     // Atomic Cancellation Coordination Protocol:
-    // 1. Transactionally lock and verify campaign status
+    // 1. Transactionally lock campaign row with FOR UPDATE to prevent concurrency races
     // 2. Transition campaign status from 'scheduled' or 'sending' to 'cancelled'
-    // 3. Immediately abort all in-flight, queued, and unknown_outcome recipients (claimToken: null, status: failed)
-    // 4. Purge/delete queued process_campaign automation jobs from the queue table
+    // 3. Verify cancelledCampaign row was returned before touching recipients or queue jobs
+    // 4. Immediately abort all in-flight, queued, and unknown_outcome recipients (claimToken: null, status: failed)
+    // 5. Purge/delete queued process_campaign automation jobs from the queue table
     const result = await db.transaction(async (tx) => {
-      const [existing] = await tx
-        .select()
-        .from(campaigns)
-        .where(eq(campaigns.id, campaignId));
+      // 1. Transaction-level row lock
+      const [existing] = await tx.execute<typeof campaigns.$inferSelect>(sql`
+        SELECT * FROM campaigns
+        WHERE id = ${campaignId}
+        FOR UPDATE;
+      `);
 
       if (!existing) {
         return { notFound: true };
@@ -49,7 +52,7 @@ export async function POST(
         };
       }
 
-      // 1. Atomically update campaign status to 'cancelled'
+      // 2. Atomically update campaign status to 'cancelled' with strict conditional check
       const [cancelledCampaign] = await tx
         .update(campaigns)
         .set({
@@ -64,7 +67,29 @@ export async function POST(
         )
         .returning();
 
-      // 2. Abort all remaining recipients in non-terminal states
+      // CRITICAL RACE GUARD: If the conditional update affected 0 rows, a concurrent process
+      // (worker finalization, webhook, or admin) altered the campaign status.
+      // We MUST abort immediately WITHOUT modifying recipients or purging queue jobs!
+      if (!cancelledCampaign) {
+        const [fresh] = await tx
+          .select()
+          .from(campaigns)
+          .where(eq(campaigns.id, campaignId));
+
+        if (!fresh) {
+          return { notFound: true };
+        }
+        if (fresh.status === "cancelled") {
+          return { alreadyCancelled: true, campaign: fresh };
+        }
+        return {
+          concurrentConflict: true,
+          status: fresh.status,
+          message: `Campaign was concurrently transitioned to '${fresh.status}' and could not be cancelled.`,
+        };
+      }
+
+      // 3. ONLY after successful campaign transition to 'cancelled', abort remaining non-terminal recipients
       const recipientAbortResult = await tx
         .update(campaignRecipients)
         .set({
@@ -80,7 +105,7 @@ export async function POST(
           )
         );
 
-      // 3. Purge/cancel any queued process_campaign jobs in the queue
+      // 4. Purge/cancel any queued process_campaign jobs in the queue
       await tx.execute(sql`
         DELETE FROM automation_jobs
         WHERE job_name = 'process_campaign'
@@ -101,6 +126,12 @@ export async function POST(
       return NextResponse.json(
         { error: result.message, status: result.status },
         { status: 400 }
+      );
+    }
+    if (result.concurrentConflict) {
+      return NextResponse.json(
+        { error: result.message, status: result.status },
+        { status: 409 }
       );
     }
     if (result.alreadyCancelled) {

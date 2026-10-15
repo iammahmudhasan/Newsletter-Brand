@@ -55,8 +55,9 @@ export async function handleProcessCampaignBatch(
     return;
   }
 
-  // Safety check for sent campaigns: ensure no active, queued, or retryable unknown_outcome recipients remain
-  if (campaign.status === "sent") {
+  // Safety check for terminal campaigns (sent, partially_failed, failed):
+  // Ensure no active, queued, or retryable unknown_outcome recipients remain before skipping
+  if (["sent", "partially_failed", "failed"].includes(campaign.status)) {
     const [hasActive] = await db
       .select({ count: sql<number>`count(*)` })
       .from(campaignRecipients)
@@ -68,18 +69,20 @@ export async function handleProcessCampaignBatch(
       );
 
     if (Number(hasActive?.count || 0) === 0) {
-      console.log(`[Worker] Campaign ${campaignId} is sent with 0 pending recipients, skipping duplicate dispatch.`);
+      console.log(
+        `[Worker] Campaign ${campaignId} has already reached terminal status '${campaign.status}' with 0 pending recipients, skipping duplicate dispatch.`
+      );
       return;
     }
 
     console.warn(
-      `[Worker Safety Recovery] Campaign ${campaignId} was marked 'sent' but still has ${hasActive?.count} pending/unknown_outcome recipients. Resuming dispatch.`
+      `[Worker Safety Recovery] Campaign ${campaignId} was marked '${campaign.status}' but still has ${hasActive?.count} pending/unknown_outcome recipients. Resuming dispatch.`
     );
   }
 
   // 1. Atomically ensure campaign status is 'sending' and persistent firstDispatchAt is established.
-  // CRITICAL: We enforce sql`${campaigns.status} <> 'cancelled'` so an admin's concurrent cancellation
-  // is NEVER overwritten back to 'sending'!
+  // CRITICAL: We enforce sql`${campaigns.status} IN ('scheduled', 'sending')` so an admin's cancellation
+  // or a webhook's terminal transition (sent/partially_failed/failed) is NEVER overwritten back to 'sending'!
   const [initializedCampaign] = await db
     .update(campaigns)
     .set({
@@ -90,7 +93,7 @@ export async function handleProcessCampaignBatch(
     .where(
       and(
         eq(campaigns.id, campaignId),
-        sql`${campaigns.status} <> 'cancelled'`
+        sql`${campaigns.status} IN ('scheduled', 'sending')`
       )
     )
     .returning({
@@ -100,22 +103,33 @@ export async function handleProcessCampaignBatch(
     });
 
   if (!initializedCampaign) {
-    console.log(`[Worker] Campaign ${campaignId} initialization aborted: campaign was cancelled or removed concurrently.`);
-    // Cancel any remaining in-flight, queued, or unknown_outcome recipients
-    await db
-      .update(campaignRecipients)
-      .set({
-        status: "failed",
-        errorMessage: "Cancelled by campaign cancellation",
-        claimToken: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(campaignRecipients.campaignId, campaignId),
-          sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
-        )
+    const [fresh] = await db
+      .select({ status: campaigns.status })
+      .from(campaigns)
+      .where(eq(campaigns.id, campaignId));
+
+    if (fresh?.status === "cancelled") {
+      console.log(`[Worker] Campaign ${campaignId} initialization aborted: campaign was cancelled.`);
+      // Cancel any remaining in-flight, queued, or unknown_outcome recipients
+      await db
+        .update(campaignRecipients)
+        .set({
+          status: "failed",
+          errorMessage: "Cancelled by campaign cancellation",
+          claimToken: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(campaignRecipients.campaignId, campaignId),
+            sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
+          )
+        );
+    } else {
+      console.log(
+        `[Worker] Campaign ${campaignId} initialization bypassed: campaign is already in terminal state '${fresh?.status || "unknown"}'.`
       );
+    }
     return;
   }
 
@@ -218,7 +232,7 @@ export async function handleProcessCampaignBatch(
             .where(
               and(
                 eq(campaigns.id, campaignId),
-                sql`${campaigns.status} <> 'cancelled'`
+                eq(campaigns.status, "sending")
               )
             );
         }
@@ -247,14 +261,16 @@ export async function handleProcessCampaignBatch(
         }
       }
 
-      // Check if campaign was cancelled concurrently by admin
+      // Check if campaign was cancelled or reached terminal status concurrently
       const [currentCampaign] = await db
         .select({ status: campaigns.status })
         .from(campaigns)
         .where(eq(campaigns.id, campaignId));
 
-      if (currentCampaign?.status === "cancelled") {
-        console.warn(`[Worker Cancellation Notice] Campaign ${campaignId} was marked 'cancelled' concurrently. Halting batch loop.`);
+      if (currentCampaign?.status !== "sending") {
+        console.warn(
+          `[Worker Concurrency Notice] Campaign ${campaignId} is no longer in 'sending' status (currently '${currentCampaign?.status || "unknown"}'). Halting batch loop.`
+        );
         break;
       }
 
@@ -265,7 +281,7 @@ export async function handleProcessCampaignBatch(
         .where(
           and(
             eq(campaigns.id, campaignId),
-            sql`${campaigns.status} <> 'cancelled'`
+            eq(campaigns.status, "sending")
           )
         );
 
@@ -815,6 +831,30 @@ export async function handleProcessCampaignBatch(
     );
 
   if (remainingActive.length > 0) {
+    // Fencing guard: verify campaign is STILL in 'sending' state before rescheduling.
+    // If an admin cancelled it or a webhook/worker transitioned it to terminal ('sent', 'partially_failed', 'failed'),
+    // we MUST NOT overwrite status and MUST NOT enqueue a retry job.
+    const [stillSending] = await db
+      .update(campaigns)
+      .set({
+        status: "sending",
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(campaigns.id, campaignId),
+          eq(campaigns.status, "sending")
+        )
+      )
+      .returning({ id: campaigns.id });
+
+    if (!stillSending) {
+      console.warn(
+        `[Worker Retry Guard] Campaign ${campaignId} is no longer in 'sending' status (cancelled or reached terminal status). Skipping retry queue scheduling.`
+      );
+      return;
+    }
+
     const nextAttempts = remainingActive
       .map((r) => r.nextAttemptAt?.getTime())
       .filter((t): t is number => typeof t === "number" && t > Date.now());
@@ -834,19 +874,6 @@ export async function handleProcessCampaignBatch(
         idempotencyKey: `campaign:${campaign.id}:retry:${earliestWakeup.getTime()}`,
       }
     );
-
-    await db
-      .update(campaigns)
-      .set({
-        status: "sending",
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(campaigns.id, campaignId),
-          sql`${campaigns.status} <> 'cancelled'`
-        )
-      );
     return;
   }
 

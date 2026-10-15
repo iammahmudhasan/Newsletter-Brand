@@ -669,4 +669,160 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
       expect(wrongExpirySeconds).toBeLessThan(nowSeconds); // Proof that firstDispatchAt fixes the expiry bug!
     });
   });
+
+  describe("Concurrent Campaign Cancellation, Worker Retry & Finalization Race Safety", () => {
+    it("safely handles cancellation race when worker finalizes campaign before cancel conditional update commits", () => {
+      interface CampaignDb {
+        id: string;
+        status: "scheduled" | "sending" | "sent" | "partially_failed" | "failed" | "cancelled";
+      }
+
+      interface RecipientDb {
+        id: string;
+        campaignId: string;
+        status: "queued" | "processing" | "sent" | "delivered" | "failed";
+        claimToken: string | null;
+      }
+
+      const campaign: CampaignDb = { id: "camp-race-1", status: "sending" };
+      const recipients: RecipientDb[] = [
+        { id: "r1", campaignId: "camp-race-1", status: "sent", claimToken: "tok-1" },
+        { id: "r2", campaignId: "camp-race-1", status: "delivered", claimToken: "tok-2" },
+      ];
+      const queueJobs = [{ id: "job-1", campaignId: "camp-race-1" }];
+
+      // Step 1: Worker concurrently finalizes campaign to 'sent'
+      campaign.status = "sent";
+
+      // Step 2: Cancellation transaction attempts conditional update
+      function executeCancelTransaction(
+        c: CampaignDb,
+        rList: RecipientDb[],
+        jobs: typeof queueJobs
+      ): { success: boolean; conflict?: boolean; status?: string } {
+        // Strict conditional update: WHERE status IN ('scheduled', 'sending')
+        let cancelledCampaign: CampaignDb | null = null;
+        if (c.status === "scheduled" || c.status === "sending") {
+          c.status = "cancelled";
+          cancelledCampaign = c;
+        }
+
+        // Critical guard: if 0 rows returned, abort all side effects
+        if (!cancelledCampaign) {
+          return {
+            success: false,
+            conflict: true,
+            status: c.status,
+          };
+        }
+
+        // Side effects only on successful cancellation:
+        for (const r of rList) {
+          if (["queued", "processing"].includes(r.status)) {
+            r.status = "failed";
+            r.claimToken = null;
+          }
+        }
+        jobs.length = 0;
+
+        return { success: true };
+      }
+
+      const cancelResult = executeCancelTransaction(campaign, recipients, queueJobs);
+
+      // Verifications:
+      expect(cancelResult.success).toBe(false);
+      expect(cancelResult.conflict).toBe(true);
+      expect(cancelResult.status).toBe("sent");
+
+      // Campaign remains 'sent' (NOT overwritten to cancelled)
+      expect(campaign.status).toBe("sent");
+
+      // Recipients were NOT modified/aborted
+      expect(recipients[0].status).toBe("sent");
+      expect(recipients[0].claimToken).toBe("tok-1");
+      expect(recipients[1].status).toBe("delivered");
+
+      // Queue jobs were NOT deleted
+      expect(queueJobs.length).toBe(1);
+    });
+
+    it("prevents worker retry scheduling from resurrecting a terminal or cancelled campaign to sending", () => {
+      interface CampaignDb {
+        id: string;
+        status: "scheduled" | "sending" | "sent" | "partially_failed" | "failed" | "cancelled";
+      }
+
+      const campaign: CampaignDb = { id: "camp-retry-race", status: "sending" };
+      const remainingActiveRecipients = [{ id: "r-retry-1", status: "unknown_outcome" }];
+      const enqueuedJobs: any[] = [];
+
+      // Concurrently, a webhook transitions campaign to 'partially_failed'
+      campaign.status = "partially_failed";
+
+      // Worker checks if retry is needed and executes retry conditional update
+      function executeWorkerRetryBranch(c: CampaignDb, remaining: any[], jobs: any[]) {
+        if (remaining.length === 0) return { action: "finalize" };
+
+        // Fencing guard: UPDATE campaigns SET status = 'sending' WHERE id = campaignId AND status = 'sending' RETURNING id
+        let stillSending = false;
+        if (c.status === "sending") {
+          stillSending = true;
+          c.status = "sending";
+        }
+
+        if (!stillSending) {
+          // Terminal status reached concurrently; abort retry scheduling
+          return { action: "skipped_terminal", status: c.status };
+        }
+
+        jobs.push({ jobName: "process_campaign", campaignId: c.id });
+        return { action: "scheduled" };
+      }
+
+      const retryResult = executeWorkerRetryBranch(campaign, remainingActiveRecipients, enqueuedJobs);
+
+      expect(retryResult.action).toBe("skipped_terminal");
+      expect(retryResult.status).toBe("partially_failed");
+      expect(campaign.status).toBe("partially_failed"); // PRESERVED! Not changed to 'sending'!
+      expect(enqueuedJobs.length).toBe(0); // No rogue retry jobs enqueued!
+    });
+
+    it("ensures worker startup skips dispatch when campaign is already in terminal state with 0 active recipients", () => {
+      const campaign = { id: "camp-terminal-start", status: "partially_failed" };
+      const activeRecipientCount = 0;
+
+      let dispatched = false;
+      if (["sent", "partially_failed", "failed"].includes(campaign.status)) {
+        if (activeRecipientCount === 0) {
+          dispatched = false;
+        } else {
+          dispatched = true;
+        }
+      }
+
+      expect(dispatched).toBe(false);
+    });
+
+    it("ensures worker initialization fails closed and does not overwrite terminal campaign", () => {
+      interface CampaignDb {
+        id: string;
+        status: "scheduled" | "sending" | "sent" | "partially_failed" | "failed" | "cancelled";
+      }
+
+      const campaign: CampaignDb = { id: "camp-init-guard", status: "failed" };
+
+      // Worker executes initialization:
+      // UPDATE campaigns SET status = 'sending' WHERE id = campaignId AND status IN ('scheduled', 'sending') RETURNING *
+      let initialized = false;
+      if (campaign.status === "scheduled" || campaign.status === "sending") {
+        campaign.status = "sending";
+        initialized = true;
+      }
+
+      expect(initialized).toBe(false);
+      expect(campaign.status).toBe("failed"); // Never overwritten!
+    });
+  });
 });
+

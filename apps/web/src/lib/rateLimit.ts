@@ -276,6 +276,21 @@ export function getClientIp(req: NextRequest): string {
   const forwarded = req.headers.get("x-forwarded-for");
   if (forwarded) {
     const parts = forwarded.split(",").map((s) => s.trim()).filter(Boolean);
+
+    // In production without explicit edge trust or verified trusted socket proxy:
+    // If the immediate rightmost proxy hop is untrusted, an external client could be directly connecting
+    // to the origin and forging arbitrary X-Forwarded-For headers to bypass rate limits.
+    // Reject untrusted proxy chains to prevent header spoofing.
+    if (isProd && !canTrustEdgeHeaders) {
+      const nearestHop = parts[parts.length - 1];
+      if (!nearestHop || !isValidIpAddress(nearestHop) || !isTrustedProxyHop(nearestHop)) {
+        if (hasValidNextIp) {
+          return nextIp.trim();
+        }
+        return "127.0.0.1";
+      }
+    }
+
     // Walk from right to left, peeling off trusted proxies
     for (let i = parts.length - 1; i >= 0; i--) {
       const candidate = parts[i];
