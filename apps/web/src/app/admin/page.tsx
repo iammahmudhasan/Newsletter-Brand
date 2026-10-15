@@ -19,6 +19,7 @@ import {
   Mail,
   Calendar,
 } from "lucide-react";
+import { createAdminCampaign } from "@/lib/api";
 
 export default function AdminPage() {
   const router = useRouter();
@@ -140,34 +141,24 @@ export default function AdminPage() {
     setStatusType("");
 
     try {
-      const res = await fetch("/api/admin/campaigns", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title,
-          subject,
-          previewText,
-          contentHtml,
-        }),
+      const data = await createAdminCampaign({
+        title,
+        subject,
+        previewText,
+        contentHtml,
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        if (res.status === 401) {
-          router.push("/admin/login");
-          return;
-        }
-        setStatusType("error");
-        setStatusMessage(data.error || "Failed to schedule campaign.");
-      } else {
-        setStatusType("success");
-        setStatusMessage(
-          `Campaign created successfully! Enqueued as Job ID: ${data.jobId}. Background worker will dispatch it in batches.`
-        );
+      setStatusType("success");
+      setStatusMessage(
+        `Campaign created successfully! Enqueued as Job ID: ${data.jobId}. Background worker will dispatch it in batches.`
+      );
+    } catch (err: any) {
+      if (err.status === 401) {
+        router.push("/admin/login");
+        return;
       }
-    } catch {
       setStatusType("error");
-      setStatusMessage("Failed to reach server API.");
+      setStatusMessage(err.message || "Failed to schedule campaign.");
     } finally {
       setIsSubmitting(false);
     }

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db, campaigns, eq, sql } from "@ai-signal/db";
 import { enqueueJob } from "@ai-signal/queue";
 import { sanitizeNewsletterHtml } from "@ai-signal/email";
+import { campaignCreateSchema } from "@ai-signal/validation";
 import { isAuthorizedAdmin } from "@/lib/auth";
 import { readBodyWithIncrementalLimit } from "@/lib/bodyLimit";
 
@@ -65,7 +66,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const { title, subject, previewText, contentHtml, contentPlain, scheduledAt, sendNow } = body || {};
+    const { scheduledAt, sendNow } = body || {};
 
     // 2. Request-level idempotency protection: Return existing campaign if key matches
     // Properly fall back to body idempotencyKey if header is empty or whitespace-only
@@ -101,66 +102,16 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 3. Strict input type, presence, and size validation
-    if (typeof title !== "string" || !title.trim()) {
+    // 3. Strict schema validation
+    const validation = campaignCreateSchema.safeParse(body);
+    if (!validation.success) {
       return NextResponse.json(
-        { error: "Campaign title is required and must be text" },
-        { status: 400 }
-      );
-    }
-    if (title.trim().length > 255) {
-      return NextResponse.json(
-        { error: "Campaign title cannot exceed 255 characters" },
+        { error: validation.error.issues[0]?.message || "Invalid campaign input" },
         { status: 400 }
       );
     }
 
-    if (typeof subject !== "string" || !subject.trim()) {
-      return NextResponse.json(
-        { error: "Email subject is required and must be text" },
-        { status: 400 }
-      );
-    }
-    if (subject.trim().length > 255) {
-      return NextResponse.json(
-        { error: "Email subject cannot exceed 255 characters" },
-        { status: 400 }
-      );
-    }
-
-    if (typeof contentHtml !== "string" || !contentHtml.trim()) {
-      return NextResponse.json(
-        { error: "Content HTML is required and must be text" },
-        { status: 400 }
-      );
-    }
-    if (contentHtml.length > 500_000) {
-      return NextResponse.json(
-        { error: "Content HTML exceeds maximum size limit (500KB)" },
-        { status: 400 }
-      );
-    }
-
-    if (previewText !== undefined && previewText !== null) {
-      if (typeof previewText !== "string") {
-        return NextResponse.json({ error: "Preview text must be a string" }, { status: 400 });
-      }
-      if (previewText.length > 255) {
-        return NextResponse.json({ error: "Preview text cannot exceed 255 characters" }, { status: 400 });
-      }
-    }
-
-    if (contentPlain !== undefined && contentPlain !== null) {
-      if (typeof contentPlain !== "string") {
-        return NextResponse.json({ error: "Content plain must be a string" }, { status: 400 });
-      }
-      if (contentPlain.length > 500_000) {
-        return NextResponse.json(
-          { error: "Content plain exceeds maximum size limit (500KB)" },
-          { status: 400 }
-        );
-      }
-    }
+    const { title, subject, previewText, contentHtml, contentPlain } = validation.data;
 
     let scheduleDate = new Date();
     if (scheduledAt !== undefined && scheduledAt !== null) {

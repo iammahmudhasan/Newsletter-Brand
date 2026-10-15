@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { db, campaigns, desc, sql } from "@ai-signal/db";
 import { ArrowRight, Calendar, Clock, BookOpen } from "lucide-react";
+import { formatDate } from "@/lib/utils";
 
 // Fallback sample issues for the archive if no DB issues have been created yet
 const SAMPLE_ISSUES = [
@@ -80,7 +81,7 @@ export default async function ArchivePage() {
                     </span>
                     <span className="flex items-center gap-1.5 text-xs text-slate-500">
                       <Calendar className="w-3.5 h-3.5" />
-                      {c.sentAt ? new Date(c.sentAt).toLocaleDateString() : "Recent"}
+                      {formatDate(c.sentAt)}
                     </span>
                   </div>
                   <span className="flex items-center gap-1 text-xs text-slate-500">

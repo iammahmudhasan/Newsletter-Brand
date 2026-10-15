@@ -13,6 +13,7 @@
     "@ai-signal/db": "*",
     "@ai-signal/email": "*",
     "@ai-signal/queue": "*",
+    "@ai-signal/validation": "*",
     "@aws-sdk/client-sns": "^3.1151.0",
     "clsx": "^2.1.1",
     "lucide-react": "^1.16.0",

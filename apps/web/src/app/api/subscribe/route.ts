@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db, subscribers, consentEvents, suppressions, eq } from "@ai-signal/db";
 import { enqueueJob } from "@ai-signal/queue";
-import { normalizeEmail, hashIp } from "@ai-signal/config";
+import { hashIp } from "@ai-signal/config";
+import { subscribeRequestSchema } from "@ai-signal/validation";
 import { checkRateLimit, checkEmailCooldown, getClientIp, pseudonymizeRateLimitKey } from "@/lib/rateLimit";
 import { readBodyWithIncrementalLimit } from "@/lib/bodyLimit";
 
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_BODY_BYTES = 16384; // 16KB max payload
 
 export async function POST(req: NextRequest) {
@@ -26,26 +26,16 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Malformed JSON payload" }, { status: 400 });
     }
 
-    const rawEmail = body.email;
-    if (!rawEmail || typeof rawEmail !== "string") {
+    const validation = subscribeRequestSchema.safeParse(body);
+    if (!validation.success) {
       return NextResponse.json(
-        { error: "Email is required" },
+        { error: validation.error.issues[0]?.message || "Please provide a valid email address" },
         { status: 400 }
       );
     }
 
-    const email = normalizeEmail(rawEmail);
-
-    if (!EMAIL_REGEX.test(email) || email.length > 254) {
-      return NextResponse.json(
-        { error: "Please provide a valid email address" },
-        { status: 400 }
-      );
-    }
-
-    // Sanitize source (max 50 chars, alphanumeric, hyphens, and underscores)
-    const rawSource = typeof body.source === "string" ? body.source : "web_form";
-    const signupSource = rawSource.slice(0, 50).replace(/[^a-zA-Z0-9_-]/g, "") || "web_form";
+    const email = validation.data.email;
+    const signupSource = validation.data.source.slice(0, 50).replace(/[^a-zA-Z0-9_-]/g, "") || "web_form";
 
     const clientIp = getClientIp(req);
     const userAgent = req.headers.get("user-agent") || "unknown";

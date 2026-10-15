@@ -30,7 +30,9 @@ export async function createAdminCampaign(payload: {
 
   const data = await response.json();
   if (!response.ok) {
-    throw new Error(data.error || "Failed to create campaign");
+    const error: any = new Error(data.error || "Failed to create campaign");
+    error.status = response.status;
+    throw error;
   }
   return data;
 }

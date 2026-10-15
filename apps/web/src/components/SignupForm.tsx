@@ -2,6 +2,7 @@
 
 import React, { useState } from "react";
 import { CheckCircle2, ArrowRight, Loader2, AlertCircle, ShieldCheck } from "lucide-react";
+import { subscribeToNewsletter } from "@/lib/api";
 
 export function SignupForm({ source = "landing_hero" }: { source?: string }) {
   const [email, setEmail] = useState("");
@@ -20,27 +21,15 @@ export function SignupForm({ source = "landing_hero" }: { source?: string }) {
     setMessage("");
 
     try {
-      const res = await fetch("/api/subscribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, source }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        setStatus("error");
-        setMessage(data.error || "Failed to subscribe. Please try again.");
-      } else {
-        setStatus("success");
-        setMessage(
-          data.message ||
-            "Verification email dispatched! Please click the confirmation link in your inbox to complete activation."
-        );
-      }
+      const data = await subscribeToNewsletter(email, source);
+      setStatus("success");
+      setMessage(
+        data.message ||
+          "Verification email dispatched! Please click the confirmation link in your inbox to complete activation."
+      );
     } catch (err: any) {
       setStatus("error");
-      setMessage("Network error occurred. Please check your connection and try again.");
+      setMessage(err.message || "Failed to subscribe. Please try again.");
     }
   }
 

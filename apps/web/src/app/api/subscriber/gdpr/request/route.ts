@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db, subscribers, eq } from "@ai-signal/db";
 import { normalizeEmail, generateSignedToken, config, TokenPurpose } from "@ai-signal/config";
 import { getEmailProvider } from "@ai-signal/email";
+import { gdprRequestSchema } from "@ai-signal/validation";
 import { checkRateLimit, checkEmailCooldown, getClientIp, pseudonymizeRateLimitKey } from "@/lib/rateLimit";
 import { readBodyWithIncrementalLimit } from "@/lib/bodyLimit";
 
@@ -21,18 +22,15 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Malformed JSON payload" }, { status: 400 });
     }
 
-    const { email, purpose } = body;
-
-    if (!email || typeof email !== "string") {
-      return NextResponse.json({ error: "A valid email address is required" }, { status: 400 });
-    }
-
-    if (purpose !== "data_export" && purpose !== "data_delete") {
+    const validation = gdprRequestSchema.safeParse(body);
+    if (!validation.success) {
       return NextResponse.json(
-        { error: "Invalid purpose. Must be 'data_export' or 'data_delete'" },
+        { error: validation.error.issues[0]?.message || "A valid email address is required" },
         { status: 400 }
       );
     }
+
+    const { email, purpose } = validation.data;
 
     const clientIp = getClientIp(req);
     const normalized = normalizeEmail(email);
