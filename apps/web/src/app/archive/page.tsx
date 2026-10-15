@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { db, campaigns, eq, desc } from "@ai-signal/db";
+import { db, campaigns, desc, sql } from "@ai-signal/db";
 import { ArrowRight, Calendar, Clock, BookOpen } from "lucide-react";
 
 // Fallback sample issues for the archive if no DB issues have been created yet
@@ -42,7 +42,7 @@ export default async function ArchivePage() {
     dbCampaigns = await db
       .select()
       .from(campaigns)
-      .where(eq(campaigns.status, "sent"))
+      .where(sql`${campaigns.status} IN ('sent', 'partially_failed')`)
       .orderBy(desc(campaigns.sentAt));
   } catch (err: any) {
     // If DB is offline in dev mode, fallback to sample issues

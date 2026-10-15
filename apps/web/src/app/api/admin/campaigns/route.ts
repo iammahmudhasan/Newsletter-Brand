@@ -5,6 +5,8 @@ import { sanitizeNewsletterHtml } from "@ai-signal/email";
 import { isAuthorizedAdmin } from "@/lib/auth";
 
 export async function POST(req: NextRequest) {
+  let resolvedIdempotencyKey: string | null = null;
+
   try {
     if (!isAuthorizedAdmin(req)) {
       return NextResponse.json(
@@ -16,26 +18,20 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const { title, subject, previewText, contentHtml, contentPlain, scheduledAt, sendNow } = body;
 
-    if (!title || !subject || !contentHtml) {
-      return NextResponse.json(
-        { error: "Title, Subject, and Content HTML are required" },
-        { status: 400 }
-      );
-    }
-
     // 1. Request-level idempotency protection: Return existing campaign if key matches
-    const clientKey = req.headers.get("idempotency-key") || body.idempotencyKey || null;
-    if (clientKey) {
+    resolvedIdempotencyKey = (req.headers.get("idempotency-key") || body?.idempotencyKey || null)?.trim() || null;
+    if (resolvedIdempotencyKey) {
       const [existing] = await db
         .select()
         .from(campaigns)
-        .where(eq(campaigns.idempotencyKey, clientKey));
+        .where(eq(campaigns.idempotencyKey, resolvedIdempotencyKey));
 
       if (existing) {
         return NextResponse.json(
           {
             success: true,
             campaignId: existing.id,
+            issueNumber: existing.issueNumber,
             status: existing.status,
             duplicate: true,
             message: "Campaign already created with this idempotency key",
@@ -43,6 +39,13 @@ export async function POST(req: NextRequest) {
           { status: 200 }
         );
       }
+    }
+
+    if (!title || !subject || !contentHtml) {
+      return NextResponse.json(
+        { error: "Title, Subject, and Content HTML are required" },
+        { status: 400 }
+      );
     }
 
     // Server-side allowlist HTML sanitization to prevent persistent stored XSS
@@ -73,7 +76,7 @@ export async function POST(req: NextRequest) {
           status: isImmediateSend ? "sending" : "scheduled",
           scheduledAt: scheduleDate,
           issueNumber: nextIssueNumber,
-          idempotencyKey: clientKey || undefined,
+          idempotencyKey: resolvedIdempotencyKey || undefined,
         })
         .returning({ id: campaigns.id });
 
@@ -104,14 +107,13 @@ export async function POST(req: NextRequest) {
       { status: 201 }
     );
   } catch (err: any) {
-    // Graceful recovery for concurrent duplicate requests matching idempotencyKey
-    const clientKey = req.headers.get("idempotency-key") || null;
-    if (clientKey) {
+    // Graceful recovery for concurrent duplicate requests matching idempotencyKey from headers or JSON body
+    if (resolvedIdempotencyKey) {
       try {
         const [existing] = await db
           .select()
           .from(campaigns)
-          .where(eq(campaigns.idempotencyKey, clientKey));
+          .where(eq(campaigns.idempotencyKey, resolvedIdempotencyKey));
 
         if (existing) {
           return NextResponse.json(

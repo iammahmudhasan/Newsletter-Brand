@@ -49,10 +49,12 @@ export async function GET(req: NextRequest) {
     const [recipientStats] = await db
       .select({
         totalRecipients: sql<number>`count(*)`,
-        totalAttempted: sql<number>`count(*) filter (where status in ('sent', 'delivered', 'bounced', 'failed', 'needs_review'))`,
+        totalAttempted: sql<number>`count(*) filter (where status in ('sent', 'delivered', 'bounced', 'failed', 'needs_review', 'unknown_outcome'))`,
         delivered: sql<number>`count(*) filter (where status = 'delivered')`,
+        sent: sql<number>`count(*) filter (where status = 'sent')`,
         bounced: sql<number>`count(*) filter (where status = 'bounced')`,
         failed: sql<number>`count(*) filter (where status = 'failed')`,
+        unknownOutcome: sql<number>`count(*) filter (where status = 'unknown_outcome')`,
       })
       .from(campaignRecipients);
 
@@ -64,23 +66,30 @@ export async function GET(req: NextRequest) {
 
     const totalAttemptedSends = Number(recipientStats?.totalAttempted || 0);
     const deliveredCount = Number(recipientStats?.delivered || 0);
+    const sentCount = Number(recipientStats?.sent || 0);
     const bounceCount = Number(recipientStats?.bounced || 0);
     const complaintCount = Number(complaintTelemetry?.uniqueComplaints || 0);
 
-    // Primary denominator: distinct attempted recipient sends.
-    // Fall back to distinct message identifier count in emailEvents if no campaign recipients exist yet.
-    let denominator = totalAttemptedSends;
-    if (denominator === 0) {
+    // Primary denominator for bounce rate: total attempted recipient dispatches (including unknown_outcome).
+    let bounceDenominator = totalAttemptedSends;
+    if (bounceDenominator === 0) {
       const [fallbackEvents] = await db
         .select({
           distinctMessages: sql<number>`count(distinct coalesce(provider_message_id, id::text))`,
         })
         .from(emailEvents);
-      denominator = Number(fallbackEvents?.distinctMessages || 0);
+      bounceDenominator = Number(fallbackEvents?.distinctMessages || 0);
     }
 
-    const bounceRatio = denominator > 0 ? bounceCount / denominator : 0;
-    const complaintRatio = denominator > 0 ? complaintCount / denominator : 0;
+    // Primary denominator for spam complaints: mailbox providers (Google/Yahoo) compute complaint rate
+    // strictly against successfully delivered messages. If delivered telemetry is pending, fall back to sent/attempted.
+    let complaintDenominator = deliveredCount > 0 ? deliveredCount : sentCount + deliveredCount;
+    if (complaintDenominator === 0) {
+      complaintDenominator = bounceDenominator;
+    }
+
+    const bounceRatio = bounceDenominator > 0 ? bounceCount / bounceDenominator : 0;
+    const complaintRatio = complaintDenominator > 0 ? complaintCount / complaintDenominator : 0;
 
     // Evaluate deliverability health thresholds:
     // Industry target for bounces: < 0.2% (decimal ratio: 0.002)

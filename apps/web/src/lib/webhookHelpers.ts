@@ -79,7 +79,7 @@ export function normalizeWebhookEventType(rawType: string): WebhookNormalizedTyp
 /**
  * Determines the target campaign status from recipient states.
  * CRITICAL: A campaign CANNOT be transitioned to a terminal status ('sent', 'partially_failed', 'failed')
- * while any recipients are still queued or being processed by workers ('sending').
+ * while any recipients are queued, being processed, or in 'unknown_outcome' awaiting reconciliation/retry.
  */
 export function computeCampaignTargetStatus(
   allRecipients: { status: string }[]
@@ -88,11 +88,11 @@ export function computeCampaignTargetStatus(
   const failed = allRecipients.filter(
     (r: any) => r.status === "failed" || r.status === "bounced" || r.status === "needs_review"
   ).length;
-  const inFlightOrQueued = allRecipients.filter(
-    (r: any) => r.status === "queued" || r.status === "processing"
+  const inFlightOrPending = allRecipients.filter(
+    (r: any) => r.status === "queued" || r.status === "processing" || r.status === "unknown_outcome"
   ).length;
 
-  if (inFlightOrQueued > 0) {
+  if (inFlightOrPending > 0) {
     return "sending";
   }
 

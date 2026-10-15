@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db, subscribers, consentEvents, suppressions, emailEvents, automationJobs, campaignRecipients, eq, and, sql } from "@ai-signal/db";
 import { verifySignedToken, normalizeEmail } from "@ai-signal/config";
+import { pseudonymizeRateLimitKey } from "@/lib/rateLimit";
 
 // GDPR Data Export (Right of Access) - strictly requires 'data_export' purpose token
 export async function GET(req: NextRequest) {
@@ -115,7 +116,7 @@ export async function POST(req: NextRequest) {
           sql`payload->>'subscriberId' = ${subscriberId} OR payload->>'email' = ${normalizedEmail}`
         );
 
-      // 3. Cancel in-flight campaign recipients immediately to abort concurrent worker dispatches
+      // 3. Cancel in-flight and pending retry/reconciliation campaign recipients immediately to abort concurrent worker dispatches
       await tx
         .update(campaignRecipients)
         .set({
@@ -126,7 +127,7 @@ export async function POST(req: NextRequest) {
         .where(
           and(
             eq(campaignRecipients.subscriberId, subscriberId),
-            sql`${campaignRecipients.status} IN ('queued', 'processing')`
+            sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
           )
         );
 
@@ -142,6 +143,15 @@ export async function POST(req: NextRequest) {
           details: "GDPR Right to Be Forgotten validated deletion request",
         })
         .onConflictDoNothing();
+
+      // 6. Delete any rate limit or action cooldown entries associated with this email
+      const cooldownKey = pseudonymizeRateLimitKey("email_cooldown", normalizedEmail);
+      const signupEmailKey = pseudonymizeRateLimitKey("signup:email", normalizedEmail);
+      const gdprEmailKey = pseudonymizeRateLimitKey("gdpr:email", normalizedEmail);
+      await tx.execute(sql`
+        DELETE FROM rate_limits
+        WHERE key IN (${cooldownKey}, ${signupEmailKey}, ${gdprEmailKey});
+      `);
     });
 
     return NextResponse.json({

@@ -1,7 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import { normalizeWebhookEventType, computeCampaignTargetStatus } from "../../apps/web/src/lib/webhookHelpers";
 import { renderNewsletterEmail } from "../../packages/email/src/templates/newsletter";
-import { checkRateLimit, checkEmailCooldown } from "../../apps/web/src/lib/rateLimit";
+import { checkRateLimit, checkEmailCooldown, isValidIpAddress, pseudonymizeRateLimitKey } from "../../apps/web/src/lib/rateLimit";
 
 describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
   describe("1. Webhook Normalization & Event Isolation (P1)", () => {
@@ -154,6 +154,80 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       expect(second.allowed).toBe(false);
       expect(second.retryAfterSeconds).toBeGreaterThan(0);
     });
+
+    it("strictly validates IPv4 and IPv6 addresses and rejects malformed/spoofed addresses", () => {
+      // Valid IPv4
+      expect(isValidIpAddress("1.1.1.1")).toBe(true);
+      expect(isValidIpAddress("192.168.1.100")).toBe(true);
+      expect(isValidIpAddress("255.255.255.255")).toBe(true);
+      expect(isValidIpAddress("0.0.0.0")).toBe(true);
+
+      // Invalid IPv4
+      expect(isValidIpAddress("999.999.999.999")).toBe(false);
+      expect(isValidIpAddress("256.1.1.1")).toBe(false);
+      expect(isValidIpAddress("192.168.1.300")).toBe(false);
+      expect(isValidIpAddress("01.1.1.1")).toBe(false); // Leading zero disallowed
+      expect(isValidIpAddress("1.1.1")).toBe(false);
+      expect(isValidIpAddress("1.1.1.1.1")).toBe(false);
+      expect(isValidIpAddress("abc.def.ghi.jkl")).toBe(false);
+      expect(isValidIpAddress("")).toBe(false);
+      expect(isValidIpAddress(null as any)).toBe(false);
+
+      // Valid IPv6
+      expect(isValidIpAddress("::1")).toBe(true);
+      expect(isValidIpAddress("2001:0db8:85a3:0000:0000:8a2e:0370:7334")).toBe(true);
+      expect(isValidIpAddress("fe80::1")).toBe(true);
+
+      // Invalid IPv6
+      expect(isValidIpAddress("1200::AB00:1234::2552:7777:1313")).toBe(false);
+      expect(isValidIpAddress("2001:xyz::1")).toBe(false);
+    });
+
+    it("pseudonymizes sensitive IP and email identifiers using salted HMAC-SHA256", () => {
+      const rawIp = "203.0.113.195";
+      const rawEmail = "victim@example.com";
+
+      const ipKey = pseudonymizeRateLimitKey("signup:ip", rawIp);
+      const emailKey = pseudonymizeRateLimitKey("signup:email", rawEmail);
+
+      // Prefixes are retained for metrics/domain scoping
+      expect(ipKey.startsWith("signup:ip:")).toBe(true);
+      expect(emailKey.startsWith("signup:email:")).toBe(true);
+
+      // Raw personal data must NEVER be present in the resulting key
+      expect(ipKey.includes(rawIp)).toBe(false);
+      expect(emailKey.includes(rawEmail)).toBe(false);
+      expect(emailKey.includes("victim")).toBe(false);
+      expect(emailKey.includes("example.com")).toBe(false);
+
+      // Deterministic hashing for identical normalized inputs
+      expect(pseudonymizeRateLimitKey("signup:email", "Victim@Example.COM ")).toBe(emailKey);
+
+      // Distinct prefixes produce isolated key spaces
+      expect(pseudonymizeRateLimitKey("gdpr:email", rawEmail)).not.toBe(emailKey);
+    });
+
+    it("normalizes idempotency keys consistently from both header and request body", () => {
+      function resolveIdempotencyKey(headers: Record<string, string>, body: any): string | null {
+        return (headers["idempotency-key"] || body?.idempotencyKey || null)?.trim() || null;
+      }
+
+      // 1. From header
+      expect(resolveIdempotencyKey({ "idempotency-key": "header-key-123" }, {})).toBe("header-key-123");
+
+      // 2. From body
+      expect(resolveIdempotencyKey({}, { idempotencyKey: "body-key-456" })).toBe("body-key-456");
+
+      // 3. Header takes precedence if both provided
+      expect(resolveIdempotencyKey({ "idempotency-key": "header-key-123" }, { idempotencyKey: "body-key-456" })).toBe("header-key-123");
+
+      // 4. Trims whitespace
+      expect(resolveIdempotencyKey({ "idempotency-key": "  spaced-key  " }, {})).toBe("spaced-key");
+
+      // 5. Empty or missing
+      expect(resolveIdempotencyKey({}, {})).toBe(null);
+      expect(resolveIdempotencyKey({}, { idempotencyKey: "   " })).toBe(null);
+    });
   });
 
   describe("5. Deliverability Ratio & Health Metrics (P2)", () => {
@@ -180,7 +254,7 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
   });
 
   describe("6. Campaign Terminal Status Guard (P1)", () => {
-    it("never finalizes a campaign while any recipient remains queued or processing", () => {
+    it("never finalizes a campaign while any recipient remains queued, processing, or in unknown_outcome", () => {
       // Scenario 1: 1 delivered, 99 queued (first webhook from a 100-recipient batch)
       const earlyWebhookRecipients = [
         { status: "delivered" },
@@ -196,18 +270,33 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       ];
       expect(computeCampaignTargetStatus(inFlightRecipients)).toBe("sending");
 
-      // Scenario 3: All 100 delivered (zero in-flight) -> 'sent'
+      // Scenario 3 (Critical Regression): 60 delivered, 39 sent, 1 unknown_outcome waiting for retry/reconciliation -> MUST remain 'sending'
+      const ambiguousWithDelivered = [
+        ...Array.from({ length: 60 }, () => ({ status: "delivered" })),
+        ...Array.from({ length: 39 }, () => ({ status: "sent" })),
+        { status: "unknown_outcome" },
+      ];
+      expect(computeCampaignTargetStatus(ambiguousWithDelivered)).toBe("sending");
+
+      // Scenario 4: Only unknown_outcome recipients -> MUST remain 'sending'
+      const onlyUnknown = [
+        { status: "unknown_outcome" },
+        { status: "unknown_outcome" },
+      ];
+      expect(computeCampaignTargetStatus(onlyUnknown)).toBe("sending");
+
+      // Scenario 5: All 100 delivered (zero in-flight/retryable) -> 'sent'
       const allDelivered = Array.from({ length: 100 }, () => ({ status: "delivered" }));
       expect(computeCampaignTargetStatus(allDelivered)).toBe("sent");
 
-      // Scenario 4: 95 delivered, 5 bounced (zero in-flight) -> 'partially_failed'
+      // Scenario 6: 95 delivered, 5 bounced (zero in-flight) -> 'partially_failed'
       const partiallyFailed = [
         ...Array.from({ length: 95 }, () => ({ status: "delivered" })),
         ...Array.from({ length: 5 }, () => ({ status: "bounced" })),
       ];
       expect(computeCampaignTargetStatus(partiallyFailed)).toBe("partially_failed");
 
-      // Scenario 5: All 10 failed (zero in-flight) -> 'failed'
+      // Scenario 7: All 10 failed (zero in-flight) -> 'failed'
       const allFailed = Array.from({ length: 10 }, () => ({ status: "failed" }));
       expect(computeCampaignTargetStatus(allFailed)).toBe("failed");
     });

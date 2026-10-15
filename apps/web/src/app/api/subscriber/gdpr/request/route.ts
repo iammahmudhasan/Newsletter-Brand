@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db, subscribers, eq } from "@ai-signal/db";
 import { normalizeEmail, generateSignedToken, config, TokenPurpose } from "@ai-signal/config";
 import { getEmailProvider } from "@ai-signal/email";
-import { checkRateLimit, checkEmailCooldown, getClientIp } from "@/lib/rateLimit";
+import { checkRateLimit, checkEmailCooldown, getClientIp, pseudonymizeRateLimitKey } from "@/lib/rateLimit";
 
 const MAX_BODY_BYTES = 16384; // 16KB
 
@@ -41,8 +41,13 @@ export async function POST(req: NextRequest) {
     const clientIp = getClientIp(req);
     const normalized = normalizeEmail(email);
 
-    // 1. Rate limiting by IP (max 5 privacy requests per 15 minutes per IP)
-    const ipRateLimit = await checkRateLimit(`gdpr:ip:${clientIp}`, 5, 900);
+    // 1. Rate limiting by IP (max 5 privacy requests per 15 minutes per IP) with failClosed policy
+    const ipRateLimit = await checkRateLimit(
+      pseudonymizeRateLimitKey("gdpr:ip", clientIp),
+      5,
+      900,
+      { failClosed: true }
+    );
     if (!ipRateLimit.allowed) {
       return NextResponse.json(
         { error: "Too many privacy requests. Please wait a few minutes before trying again." },
@@ -50,8 +55,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 2. Cooldown per email address (max 1 request per 10 minutes per email to avoid email bombing)
-    const emailCooldown = await checkEmailCooldown(`gdpr:email:${normalized}`, 600);
+    // 2. Cooldown per email address (max 1 request per 10 minutes per email to avoid email bombing) with failClosed policy
+    const emailCooldown = await checkEmailCooldown(normalized, 600, { failClosed: true });
     if (!emailCooldown.allowed) {
       // Privacy-preserving response: Do not leak whether the account exists or failed cooldown
       return NextResponse.json({

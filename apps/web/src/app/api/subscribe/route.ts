@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db, subscribers, consentEvents, suppressions, eq } from "@ai-signal/db";
 import { enqueueJob } from "@ai-signal/queue";
 import { normalizeEmail, hashIp } from "@ai-signal/config";
-import { checkRateLimit, checkEmailCooldown, getClientIp } from "@/lib/rateLimit";
+import { checkRateLimit, checkEmailCooldown, getClientIp, pseudonymizeRateLimitKey } from "@/lib/rateLimit";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_BODY_BYTES = 16384; // 16KB max payload
@@ -54,8 +54,13 @@ export async function POST(req: NextRequest) {
     const clientIp = getClientIp(req);
     const userAgent = req.headers.get("user-agent") || "unknown";
 
-    // 2. IP Rate Limiting (max 15 signups per 10 minutes per IP)
-    const ipRateLimit = await checkRateLimit(`signup:ip:${clientIp}`, 15, 600);
+    // 2. IP Rate Limiting (max 15 signups per 10 minutes per IP) with failClosed policy on abuse endpoints
+    const ipRateLimit = await checkRateLimit(
+      pseudonymizeRateLimitKey("signup:ip", clientIp),
+      15,
+      600,
+      { failClosed: true }
+    );
     if (!ipRateLimit.allowed) {
       return NextResponse.json(
         { error: "Too many signup requests. Please wait a few minutes before trying again." },
@@ -63,8 +68,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3. Email Cooldown (max 1 confirmation request per 60 seconds per email)
-    const emailCooldown = await checkEmailCooldown(`signup:email:${email}`, 60);
+    // 3. Email Cooldown (max 1 confirmation request per 60 seconds per email) with failClosed policy
+    const emailCooldown = await checkEmailCooldown(email, 60, { failClosed: true });
     if (!emailCooldown.allowed) {
       return NextResponse.json(
         {

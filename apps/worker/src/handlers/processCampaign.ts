@@ -34,8 +34,25 @@ export async function handleProcessCampaignBatch(
   }
 
   if (campaign.status === "sent" || campaign.status === "cancelled") {
-    console.log(`[Worker] Campaign ${campaignId} is ${campaign.status}, skipping duplicate dispatch.`);
-    return;
+    // Safety check: ensure no active, queued, or retryable unknown_outcome recipients remain
+    const [hasActive] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(campaignRecipients)
+      .where(
+        and(
+          eq(campaignRecipients.campaignId, campaignId),
+          sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
+        )
+      );
+
+    if (Number(hasActive?.count || 0) === 0) {
+      console.log(`[Worker] Campaign ${campaignId} is ${campaign.status} with 0 pending recipients, skipping duplicate dispatch.`);
+      return;
+    }
+
+    console.warn(
+      `[Worker Safety Recovery] Campaign ${campaignId} was marked '${campaign.status}' but still has ${hasActive?.count} pending/unknown_outcome recipients. Resuming dispatch.`
+    );
   }
 
   // 1. Atomically ensure campaign status is 'sending' and persistent firstDispatchAt is established

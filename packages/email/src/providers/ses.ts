@@ -95,7 +95,10 @@ export class SesEmailProvider implements EmailProvider {
         },
       });
 
-      const response = await client.send(command);
+      // Bounded request timeout (15s) to guarantee external call finishes well before recipient lease (300s)
+      const response = await client.send(command, {
+        abortSignal: AbortSignal.timeout(15000),
+      });
 
       if (!response.MessageId) {
         return {
