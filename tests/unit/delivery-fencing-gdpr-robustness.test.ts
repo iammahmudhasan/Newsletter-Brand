@@ -1377,5 +1377,120 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       expect(campaign.status).toBe("sent");
     });
   });
+
+  describe("20. Provider-Specific Proxy Trust Hardening (P2)", () => {
+    it("on Vercel deployment, prioritizes x-vercel-forwarded-for and rejects untrusted cf-connecting-ip", () => {
+      const origVercel = process.env.VERCEL;
+      const origNodeEnv = process.env.NODE_ENV;
+      const origTrustEdge = process.env.TRUST_EDGE_HEADERS;
+      const origTrustCf = process.env.TRUST_CLOUDFLARE;
+
+      try {
+        process.env.VERCEL = "1";
+        (process.env as any).NODE_ENV = "production";
+        delete process.env.TRUST_EDGE_HEADERS;
+        delete process.env.TRUST_CLOUDFLARE;
+
+        // Attacker attempts to forge rate-limit identity on Vercel by sending custom cf-connecting-ip
+        const req = {
+          ip: undefined,
+          headers: {
+            get: (name: string) => {
+              if (name === "cf-connecting-ip") return "1.1.1.1";
+              if (name === "x-vercel-forwarded-for") return "203.0.113.77";
+              return null;
+            },
+          },
+        } as any;
+
+        const resolved = getClientIp(req);
+        // Must resolve to Vercel's authentic edge header, ignoring attacker's cf-connecting-ip
+        expect(resolved).toBe("203.0.113.77");
+      } finally {
+        if (origVercel !== undefined) process.env.VERCEL = origVercel;
+        else delete process.env.VERCEL;
+        (process.env as any).NODE_ENV = origNodeEnv;
+        if (origTrustEdge !== undefined) process.env.TRUST_EDGE_HEADERS = origTrustEdge;
+        else delete process.env.TRUST_EDGE_HEADERS;
+        if (origTrustCf !== undefined) process.env.TRUST_CLOUDFLARE = origTrustCf;
+        else delete process.env.TRUST_CLOUDFLARE;
+      }
+    });
+
+    it("on Cloudflare Pages deployment, accepts cf-connecting-ip as authoritative", () => {
+      const origPages = process.env.CF_PAGES;
+      const origVercel = process.env.VERCEL;
+      const origNodeEnv = process.env.NODE_ENV;
+
+      try {
+        process.env.CF_PAGES = "1";
+        delete process.env.VERCEL;
+        (process.env as any).NODE_ENV = "production";
+
+        const req = {
+          ip: undefined,
+          headers: {
+            get: (name: string) => (name === "cf-connecting-ip" ? "198.51.100.99" : null),
+          },
+        } as any;
+
+        expect(getClientIp(req)).toBe("198.51.100.99");
+      } finally {
+        if (origPages !== undefined) process.env.CF_PAGES = origPages;
+        else delete process.env.CF_PAGES;
+        if (origVercel !== undefined) process.env.VERCEL = origVercel;
+        else delete process.env.VERCEL;
+        (process.env as any).NODE_ENV = origNodeEnv;
+      }
+    });
+
+    it("on AWS Lambda without TRUST_CLOUDFRONT in production, refuses unverified cloudfront headers", () => {
+      const origLambda = process.env.AWS_LAMBDA_FUNCTION_NAME;
+      const origTrustCf = process.env.TRUST_CLOUDFRONT;
+      const origTrustEdge = process.env.TRUST_EDGE_HEADERS;
+      const origNodeEnv = process.env.NODE_ENV;
+
+      try {
+        process.env.AWS_LAMBDA_FUNCTION_NAME = "ai-signal-subscriber-fn";
+        delete process.env.TRUST_CLOUDFRONT;
+        delete process.env.TRUST_EDGE_HEADERS;
+        (process.env as any).NODE_ENV = "production";
+
+        const spoofedReq = {
+          ip: undefined,
+          headers: {
+            get: (name: string) => {
+              if (name === "cloudfront-viewer-address") return "1.2.3.4:4321";
+              if (name === "x-forwarded-for") return "9.9.9.9, 10.0.0.1";
+              return null;
+            },
+          },
+        } as any;
+
+        // Unverified Lambda without CloudFront trust must NOT trust cloudfront-viewer-address
+        // Untrusted proxy chain falls back to safe 127.0.0.1
+        const resolved = getClientIp(spoofedReq);
+        expect(resolved).toBe("127.0.0.1");
+
+        // When TRUST_CLOUDFRONT=true is configured:
+        process.env.TRUST_CLOUDFRONT = "true";
+        const legitReq = {
+          ip: undefined,
+          headers: {
+            get: (name: string) => (name === "cloudfront-viewer-address" ? "203.0.113.88:1234" : null),
+          },
+        } as any;
+        expect(getClientIp(legitReq)).toBe("203.0.113.88");
+      } finally {
+        if (origLambda !== undefined) process.env.AWS_LAMBDA_FUNCTION_NAME = origLambda;
+        else delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+        if (origTrustCf !== undefined) process.env.TRUST_CLOUDFRONT = origTrustCf;
+        else delete process.env.TRUST_CLOUDFRONT;
+        if (origTrustEdge !== undefined) process.env.TRUST_EDGE_HEADERS = origTrustEdge;
+        else delete process.env.TRUST_EDGE_HEADERS;
+        (process.env as any).NODE_ENV = origNodeEnv;
+      }
+    });
+  });
 });
 

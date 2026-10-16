@@ -102,6 +102,27 @@ export async function handleProcessCampaignBatch(
             sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
           )
         );
+
+      // Re-synchronize parent campaign summary counters to match actual recipient distribution
+      // while keeping campaign's terminal status immutable
+      const [counts] = await tx
+        .select({
+          total: sql<number>`count(*)::int`,
+          sent: sql<number>`count(*) filter (where ${campaignRecipients.status} in ('sent', 'delivered'))::int`,
+          failed: sql<number>`count(*) filter (where ${campaignRecipients.status} in ('failed', 'bounced'))::int`,
+        })
+        .from(campaignRecipients)
+        .where(eq(campaignRecipients.campaignId, campaignId));
+
+      await tx
+        .update(campaigns)
+        .set({
+          totalRecipients: counts?.total ?? campaign.totalRecipients,
+          successfulSends: counts?.sent ?? campaign.successfulSends,
+          failedSends: counts?.failed ?? campaign.failedSends,
+          updatedAt: new Date(),
+        })
+        .where(eq(campaigns.id, campaignId));
     });
 
     return;
@@ -525,71 +546,82 @@ export async function handleProcessCampaignBatch(
           // Use recipient-specific idempotency key for provider-level duplicate dispatch protection
           const idempotencyKey = `campaign:${campaign.id}:recipient:${item.recipientId}`;
 
-          // Ultra-tight pre-send fencing, cancellation barrier & GDPR shield:
-          // 1. Recipient claimToken verification: ensure claim wasn't revoked or reclaimed
-          const [stillClaimed] = await db
-            .select({ id: campaignRecipients.id, claimToken: campaignRecipients.claimToken })
-            .from(campaignRecipients)
-            .where(
-              and(
-                eq(campaignRecipients.id, item.recipientId),
-                eq(campaignRecipients.status, "processing"),
-                eq(campaignRecipients.claimToken, claimToken)
-              )
-            );
+          // Ultra-tight pre-send fencing, atomic cancellation coordination & GDPR shield:
+          // Atomically acquire dispatch permit under a FOR SHARE row lock on the campaign.
+          // This serializes directly with cancellation transactions (which hold FOR UPDATE),
+          // guaranteeing that if cancellation is in progress, dispatch halts BEFORE contacting the provider!
+          const permit = await db.transaction(async (tx) => {
+            const [campaignLock] = await tx.execute<typeof campaigns.$inferSelect>(sql`
+              SELECT status FROM campaigns WHERE id = ${campaign.id} FOR SHARE;
+            `);
 
-          if (!stillClaimed || stillClaimed.claimToken !== claimToken) {
-            console.warn(
-              `[Fencing/GDPR Pre-Send Shield] Recipient ${item.recipientId} claim was cancelled, deleted, or revoked concurrently. Aborting dispatch.`
-            );
+            if (campaignLock?.status !== "sending") {
+              return {
+                granted: false,
+                reason: `Campaign status changed to '${campaignLock?.status || "missing"}' (not 'sending')`,
+                stopLoop: true,
+              };
+            }
+
+            const [stillClaimed] = await tx
+              .select({ id: campaignRecipients.id, claimToken: campaignRecipients.claimToken })
+              .from(campaignRecipients)
+              .where(
+                and(
+                  eq(campaignRecipients.id, item.recipientId),
+                  eq(campaignRecipients.status, "processing"),
+                  eq(campaignRecipients.claimToken, claimToken)
+                )
+              );
+
+            if (!stillClaimed || stillClaimed.claimToken !== claimToken) {
+              return {
+                granted: false,
+                reason: "Recipient claim was cancelled, aborted, or revoked concurrently",
+                stopLoop: false,
+              };
+            }
+
+            const [stillActiveSub] = await tx
+              .select({ id: subscribers.id })
+              .from(subscribers)
+              .where(
+                and(
+                  eq(subscribers.id, freshSub.id),
+                  eq(subscribers.status, "active")
+                )
+              );
+
+            if (!stillActiveSub) {
+              return {
+                granted: false,
+                reason: `Subscriber ${freshSub.id} was deleted or deactivated concurrently`,
+                stopLoop: false,
+              };
+            }
+
+            const [preSendSuppressed] = await tx
+              .select({ id: suppressions.id })
+              .from(suppressions)
+              .where(eq(suppressions.email, normalizedEmail));
+
+            if (preSendSuppressed) {
+              return {
+                granted: false,
+                reason: `Recipient ${item.recipientId} (${normalizedEmail}) was added to suppressions concurrently`,
+                stopLoop: false,
+              };
+            }
+
+            return { granted: true, reason: null, stopLoop: false };
+          });
+
+          if (!permit.granted) {
+            console.warn(`[Dispatch Permit Refused] ${permit.reason}. Aborting external dispatch.`);
             failCount++;
-            continue;
-          }
-
-          // 2. Campaign cancellation and status barrier: ensure campaign is still in 'sending' status
-          const [campaignState] = await db
-            .select({ status: campaigns.status })
-            .from(campaigns)
-            .where(eq(campaigns.id, campaign.id));
-
-          if (campaignState?.status !== "sending") {
-            console.warn(
-              `[Campaign Status Barrier] Campaign ${campaign.id} is in status '${campaignState?.status || "missing"}' (not 'sending'). Halting dispatch immediately.`
-            );
-            failCount++;
-            break;
-          }
-
-          // 3. GDPR active subscriber barrier: ensure subscriber was not deleted or deactivated concurrently
-          const [stillActiveSub] = await db
-            .select({ id: subscribers.id })
-            .from(subscribers)
-            .where(
-              and(
-                eq(subscribers.id, freshSub.id),
-                eq(subscribers.status, "active")
-              )
-            );
-
-          if (!stillActiveSub) {
-            console.warn(
-              `[GDPR Pre-Send Barrier] Subscriber ${freshSub.id} was deleted or deactivated concurrently. Aborting dispatch.`
-            );
-            failCount++;
-            continue;
-          }
-
-          // 4. Suppression barrier: ensure email wasn't suppressed concurrently
-          const [preSendSuppressed] = await db
-            .select({ id: suppressions.id })
-            .from(suppressions)
-            .where(eq(suppressions.email, normalizedEmail));
-
-          if (preSendSuppressed) {
-            console.warn(
-              `[GDPR Pre-Send Shield] Recipient ${item.recipientId} (${normalizedEmail}) was added to suppressions concurrently. Aborting dispatch.`
-            );
-            failCount++;
+            if (permit.stopLoop) {
+              break;
+            }
             continue;
           }
 
@@ -631,8 +663,24 @@ export async function handleProcessCampaignBatch(
               successCount++;
             } else {
               console.warn(
-                `[Worker Fencing] Recipient ${item.recipientId} claim token mismatch, cancelled, or lease expired. Discarding update.`
+                `[Worker Fencing] Recipient ${item.recipientId} claim token mismatch, cancelled, or lease expired. Discarding normal update.`
               );
+              // In-flight cancellation reconciliation: If provider accepted the email while cancellation
+              // was committing, record providerMessageId so external delivery proof is preserved for webhook reconciliation
+              await db
+                .update(campaignRecipients)
+                .set({
+                  providerMessageId: sendResult.messageId,
+                  sentAt: new Date(),
+                  errorMessage: "Dispatched to provider prior to cancellation confirmation",
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(campaignRecipients.id, item.recipientId),
+                    eq(campaignRecipients.status, "failed")
+                  )
+                );
             }
           } else {
             const currentAttempts = (claimed.attempt_count ?? item.attemptCount ?? 0) + 1;

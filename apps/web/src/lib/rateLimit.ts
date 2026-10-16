@@ -343,31 +343,56 @@ export function getClientIp(req: NextRequest): string {
     return nextIp.trim();
   }
 
-  // 2. Cloudflare Edge / CloudFront / Real-IP authoritative headers:
-  // Trusted when edge trust is forced, in dev/test, on verified edge platforms (Vercel, Cloudflare Pages, AWS Lambda),
-  // or when the socket IP itself is a verified trusted proxy hop.
-  const isServerlessEdge =
-    process.env.VERCEL === "1" ||
+  // 2. Provider-Specific Authoritative Edge Headers:
+  // Each hosting platform defines which header is guaranteed by its infrastructure:
+  // - Vercel: Vercel edge guarantees `x-vercel-forwarded-for` and prepends the client IP to `x-forwarded-for`.
+  //   Client-supplied `cf-connecting-ip` or `cloudfront-viewer-address` are NOT authoritative on Vercel unless
+  //   explicitly configured via TRUST_CLOUDFLARE=true or TRUST_EDGE_HEADERS=true.
+  // - Cloudflare Pages / Workers: Cloudflare edge guarantees `cf-connecting-ip`.
+  // - AWS Lambda: `cloudfront-viewer-address` is only authoritative if TRUST_CLOUDFRONT=true or TRUST_EDGE_HEADERS=true.
+  // - In development and test (!isProd) or when TRUST_EDGE_HEADERS=true, standard edge headers are supported.
+  const isVercel = process.env.VERCEL === "1" || process.env.VERCEL === "true";
+  const isCloudflare =
     process.env.CF_PAGES === "1" ||
-    Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+    process.env.TRUST_CLOUDFLARE === "true" ||
+    process.env.TRUST_CLOUDFLARE === "1";
+  const isCloudFront =
+    Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME) &&
+    (process.env.TRUST_CLOUDFRONT === "true" || process.env.TRUST_CLOUDFRONT === "1");
 
-  const canTrustEdgeHeaders =
-    trustEdge ||
-    !isProd ||
-    isServerlessEdge ||
-    (hasValidNextIp && isTrustedProxyHop(nextIp, { isHeaderHop: false }));
+  // On Vercel: check Vercel's authoritative header first
+  if (isVercel) {
+    const vercelIp = req.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim();
+    if (vercelIp && isValidIpAddress(vercelIp)) {
+      return vercelIp;
+    }
+  }
 
-  if (canTrustEdgeHeaders) {
+  // Cloudflare authoritative header:
+  if (isCloudflare || trustEdge || (!isProd && !isVercel)) {
     const cfIp = req.headers.get("cf-connecting-ip")?.trim();
     if (cfIp && isValidIpAddress(cfIp)) {
       return cfIp;
     }
+  }
 
+  // CloudFront authoritative header:
+  if (isCloudFront || trustEdge || (!isProd && !isVercel)) {
     const cloudFrontIp = req.headers.get("cloudfront-viewer-address")?.split(":")[0]?.trim();
     if (cloudFrontIp && isValidIpAddress(cloudFrontIp)) {
       return cloudFrontIp;
     }
+  }
 
+  const canTrustEdgeHeaders =
+    trustEdge ||
+    !isProd ||
+    isVercel ||
+    isCloudflare ||
+    isCloudFront ||
+    (hasValidNextIp && isTrustedProxyHop(nextIp, { isHeaderHop: false }));
+
+  if (canTrustEdgeHeaders) {
     const realIp = req.headers.get("x-real-ip")?.trim();
     if (realIp && isValidIpAddress(realIp)) {
       return realIp;

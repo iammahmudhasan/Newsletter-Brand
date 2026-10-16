@@ -1,5 +1,9 @@
 import { describe, it, expect } from "bun:test";
-import { db, campaigns, automationJobs, sql, eq } from "@ai-signal/db";
+import { db, campaigns, automationJobs, campaignRecipients, subscribers, sql, eq } from "@ai-signal/db";
+import { runCampaignScheduler } from "../../apps/worker/src/scheduler/campaignScheduler";
+import { POST as cancelCampaignRoute } from "../../apps/web/src/app/api/admin/campaigns/[id]/cancel/route";
+import { createAdminSessionToken } from "../../apps/web/src/lib/auth";
+import { handleProcessCampaignBatch } from "../../apps/worker/src/handlers/processCampaign";
 
 describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculations", () => {
   it("accurately calculates partial failure when some recipient deliveries fail", () => {
@@ -994,17 +998,18 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
       expect(campaign.status as string).toBe("cancelled");
     });
 
-    it("verifies PostgreSQL transaction row-lock isolation and cancellation coordination when database is available", async () => {
-      let isPgAvailable = false;
+    async function isPostgresRunning(): Promise<boolean> {
       try {
         const ping = await db.execute(sql`SELECT 1 as alive;`);
-        isPgAvailable = Array.isArray(ping) && ping.length > 0;
+        return Array.isArray(ping) && ping.length > 0;
       } catch {
-        isPgAvailable = false;
+        return false;
       }
+    }
 
-      if (!isPgAvailable) {
-        // Safe graceful fallback for local machines without a PostgreSQL daemon
+    it("verifies PostgreSQL transaction row-lock isolation and cancellation coordination when database is available", async () => {
+      if (!(await isPostgresRunning())) {
+        // Safe graceful fallback for local environments without a running PostgreSQL daemon
         expect(true).toBe(true);
         return;
       }
@@ -1129,6 +1134,170 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
         try {
           await db.execute(sql`DELETE FROM automation_jobs WHERE (payload->>'campaignId' = ${testCampId});`);
           await db.execute(sql`DELETE FROM campaigns WHERE id = ${testCampId};`);
+        } catch {}
+      }
+    });
+
+    it("executes production runCampaignScheduler and admin cancellation route handler end-to-end against real PostgreSQL", async () => {
+      if (!(await isPostgresRunning())) {
+        expect(true).toBe(true);
+        return;
+      }
+
+      // 1. Create a due scheduled campaign in PostgreSQL
+      const [scheduledCamp] = await db
+        .insert(campaigns)
+        .values({
+          title: "Production Scheduler & Cancel E2E Test Campaign",
+          subject: "E2E Subject",
+          contentPlain: "E2E Content",
+          contentHtml: "<p>E2E Content</p>",
+          status: "scheduled",
+          scheduledAt: new Date(Date.now() - 5000), // Due 5 seconds ago
+        })
+        .returning({ id: campaigns.id });
+
+      const e2eCampId = scheduledCamp.id;
+
+      try {
+        // 2. Execute production runCampaignScheduler() to claim and enqueue the campaign
+        const claimedCount = await runCampaignScheduler();
+        expect(claimedCount).toBeGreaterThanOrEqual(1);
+
+        // Verify status transitioned to 'sending' in PostgreSQL
+        const [sendingCamp] = await db
+          .select({ status: campaigns.status })
+          .from(campaigns)
+          .where(eq(campaigns.id, e2eCampId));
+        expect(sendingCamp?.status).toBe("sending");
+
+        // Verify automation job was enqueued
+        const enqueuedJobs = await db.execute(sql`
+          SELECT * FROM automation_jobs
+          WHERE job_name = 'process_campaign'
+            AND (payload->>'campaignId' = ${e2eCampId});
+        `);
+        expect((enqueuedJobs as any)?.length).toBe(1);
+
+        // 3. Execute production admin cancellation route handler
+        const sessionToken = createAdminSessionToken();
+        const cancelReq = {
+          headers: {
+            get: (name: string) => {
+              if (name === "authorization") return `Bearer ${sessionToken}`;
+              return null;
+            },
+          },
+          cookies: { get: () => null },
+        } as any;
+
+        const cancelResponse = await cancelCampaignRoute(cancelReq, {
+          params: Promise.resolve({ id: e2eCampId }),
+        });
+        expect(cancelResponse.status).toBe(200);
+        const cancelData = await cancelResponse.json();
+        expect(cancelData.message).toContain("Campaign cancelled successfully");
+
+        // Verify campaign is cancelled in PostgreSQL
+        const [cancelledCamp] = await db
+          .select({ status: campaigns.status })
+          .from(campaigns)
+          .where(eq(campaigns.id, e2eCampId));
+        expect(cancelledCamp?.status).toBe("cancelled");
+
+        // Verify enqueued job was atomically purged
+        const remainingJobs = await db.execute(sql`
+          SELECT count(*)::int as count FROM automation_jobs
+          WHERE (payload->>'campaignId' = ${e2eCampId});
+        `);
+        expect((remainingJobs as any)[0]?.count).toBe(0);
+
+        // 4. Execute scheduler again: cancelled campaign must NOT be claimed or recovered
+        await runCampaignScheduler();
+        const [stillCancelled] = await db
+          .select({ status: campaigns.status })
+          .from(campaigns)
+          .where(eq(campaigns.id, e2eCampId));
+        expect(stillCancelled?.status).toBe("cancelled");
+      } finally {
+        try {
+          await db.execute(sql`DELETE FROM automation_jobs WHERE (payload->>'campaignId' = ${e2eCampId});`);
+          await db.execute(sql`DELETE FROM campaigns WHERE id = ${e2eCampId};`);
+        } catch {}
+      }
+    });
+
+    it("re-synchronizes parent campaign summary counters upon terminal recipient needs_review reconciliation", async () => {
+      if (!(await isPostgresRunning())) {
+        expect(true).toBe(true);
+        return;
+      }
+
+      // 1. Create a subscriber
+      const [sub] = await db
+        .insert(subscribers)
+        .values({
+          email: `e2e-reconcile-${Date.now()}@example.com`,
+          status: "active",
+        })
+        .returning({ id: subscribers.id });
+
+      // 2. Create a terminal campaign ('sent') with stale counters
+      const [termCamp] = await db
+        .insert(campaigns)
+        .values({
+          title: "Terminal Campaign Reconciliation Test",
+          subject: "Subject",
+          contentPlain: "Plain",
+          contentHtml: "<p>Html</p>",
+          status: "sent",
+          totalRecipients: 10,
+          successfulSends: 0,
+          failedSends: 0,
+        })
+        .returning({ id: campaigns.id });
+
+      const termCampId = termCamp.id;
+
+      try {
+        // 3. Create a recipient stranded in 'processing' status
+        const [strandedRecip] = await db
+          .insert(campaignRecipients)
+          .values({
+            campaignId: termCampId,
+            subscriberId: sub.id,
+            status: "processing",
+            claimToken: "stale-claim-token",
+          })
+          .returning({ id: campaignRecipients.id });
+
+        // 4. Run worker handler against the terminal campaign
+        await handleProcessCampaignBatch({ campaignId: termCampId });
+
+        // 5. Verify recipient transitioned to 'needs_review' with clear errorMessage and cleared claimToken
+        const [reconciledRecip] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, strandedRecip.id));
+        expect(reconciledRecip.status).toBe("needs_review");
+        expect(reconciledRecip.claimToken).toBeNull();
+        expect(reconciledRecip.errorMessage).toContain("Reconciled: campaign already reached terminal status 'sent'");
+
+        // 6. Verify parent campaign counters were re-synchronized in PostgreSQL:
+        // status remains 'sent', totalRecipients = 1, successfulSends = 0, failedSends = 0
+        const [reconciledCamp] = await db
+          .select()
+          .from(campaigns)
+          .where(eq(campaigns.id, termCampId));
+        expect(reconciledCamp.status).toBe("sent");
+        expect(reconciledCamp.totalRecipients).toBe(1);
+        expect(reconciledCamp.successfulSends).toBe(0);
+        expect(reconciledCamp.failedSends).toBe(0);
+      } finally {
+        try {
+          await db.execute(sql`DELETE FROM campaign_recipients WHERE campaign_id = ${termCampId};`);
+          await db.execute(sql`DELETE FROM campaigns WHERE id = ${termCampId};`);
+          await db.execute(sql`DELETE FROM subscribers WHERE id = ${sub.id};`);
         } catch {}
       }
     });
