@@ -106,7 +106,7 @@ export async function POST(
       const inFlightCount = inFlightRecipients.length;
 
       // Abort only the truly pending recipients:
-      const recipientAbortResult = await tx
+      const abortedRecipients = await tx
         .update(campaignRecipients)
         .set({
           status: "failed",
@@ -119,9 +119,10 @@ export async function POST(
             eq(campaignRecipients.campaignId, campaignId),
             sql`(${campaignRecipients.status} IN ('queued', 'unknown_outcome') OR (${campaignRecipients.status} = 'processing' AND (${campaignRecipients.claimToken} IS NULL OR ${campaignRecipients.claimToken} NOT LIKE 'permit:%')))`
           )
-        );
+        )
+        .returning({ id: campaignRecipients.id });
 
-      const abortedCount = (recipientAbortResult as any)?.rowCount || 0;
+      const abortedCount = abortedRecipients.length;
 
       // For in-flight permitted recipients, mark an audit note indicating permit was granted prior to cancellation,
       // but PRESERVE their status ('processing') and permit claimToken so the worker can complete delivery reporting.

@@ -100,7 +100,7 @@ export async function cleanupExpiredRateLimits(): Promise<number> {
       DELETE FROM rate_limits
       WHERE reset_at < NOW() - INTERVAL '10 minutes';
     `);
-    return (result as any)?.rowCount || 0;
+    return (result as any)?.rowCount ?? (result as any)?.count ?? 0;
   } catch {
     return 0;
   }
