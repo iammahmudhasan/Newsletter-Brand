@@ -1504,11 +1504,22 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
       // Standard AWS CloudFront IPv6 format: <full-8-hextet-ipv6>:<port>
       const rawCloudFrontIpv6 = "2001:db8:85a3:8d3:1319:8a2e:370:7348:46532";
       expect(parseCloudFrontViewerAddress(rawCloudFrontIpv6)).toBe("2001:db8:85a3:8d3:1319:8a2e:370:7348");
+
+      // Compressed IPv6 format with port:
+      expect(parseCloudFrontViewerAddress("2001:db8::1:46532")).toBe("2001:db8::1");
+      // Ambiguous port disambiguation (e.g. 8080 is an ephemeral port, not an 8th hextet):
+      expect(parseCloudFrontViewerAddress("2001:db8::1:8080")).toBe("2001:db8::1");
+      expect(parseCloudFrontViewerAddress("  2001:db8::1:443  ")).toBe("2001:db8::1");
     });
 
     it("safely extracts bracketed IPv6 addresses with port", () => {
       const bracketed = "[2001:db8:85a3:8d3:1319:8a2e:370:7348]:46532";
       expect(parseCloudFrontViewerAddress(bracketed)).toBe("2001:db8:85a3:8d3:1319:8a2e:370:7348");
+
+      // Bracketed compressed IPv6 format with port:
+      expect(parseCloudFrontViewerAddress("[2001:db8::1]:46532")).toBe("2001:db8::1");
+      expect(parseCloudFrontViewerAddress("[2001:db8::1]:80")).toBe("2001:db8::1");
+      expect(parseCloudFrontViewerAddress("  [2001:db8::1]:443  ")).toBe("2001:db8::1");
     });
 
     it("accepts direct valid IP without port and returns null on malformed inputs", () => {

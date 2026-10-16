@@ -346,14 +346,11 @@ export function parseCloudFrontViewerAddress(raw: string | null | undefined): st
     return null;
   }
 
-  // 2. Direct valid IP (if port was already stripped or omitted)
-  if (isValidIpAddress(trimmed)) {
-    return trimmed;
-  }
-
-  // 3. Address with trailing port:
-  // Since IPv6 addresses contain multiple colons and IPv4 contains none,
-  // the port delimiter is strictly the LAST colon in the string.
+  // 2. Address with trailing port:
+  // Since CloudFront-Viewer-Address is specified by AWS to include "<ip>:<port>",
+  // we first check for a valid trailing port (1 - 65535) delimited by the LAST colon.
+  // This correctly disambiguates compressed IPv6 addresses (e.g. "2001:db8::1:8080" where
+  // 8080 is an ephemeral port, not an 8th hextet).
   const lastColon = trimmed.lastIndexOf(":");
   if (lastColon > 0) {
     const candidateIp = trimmed.substring(0, lastColon).trim();
@@ -366,6 +363,11 @@ export function parseCloudFrontViewerAddress(raw: string | null | undefined): st
         return candidateIp;
       }
     }
+  }
+
+  // 3. Direct valid IP (if port was already stripped or omitted)
+  if (isValidIpAddress(trimmed)) {
+    return trimmed;
   }
 
   return null;

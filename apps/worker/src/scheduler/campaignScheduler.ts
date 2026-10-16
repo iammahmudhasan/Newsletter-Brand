@@ -1,4 +1,14 @@
-import { db, campaigns, automationJobs, sql, eq } from "@ai-signal/db";
+import {
+  db,
+  campaigns,
+  automationJobs,
+  campaignRecipients,
+  emailEvents,
+  sql,
+  eq,
+  and,
+  desc,
+} from "@ai-signal/db";
 import { enqueueJob } from "@ai-signal/queue";
 
 /**
@@ -132,9 +142,188 @@ export async function runCampaignScheduler(): Promise<number> {
       );
     }
 
+    // 3. Stale In-Flight Permit Reconciliation for Cancelled Campaigns:
+    // Periodically reconciles recipients of cancelled campaigns that were granted a permit
+    // but became stranded due to a worker crash or unconfirmed dispatch.
+    await reconcileCancelledCampaignInFlightPermits(5);
+
     return claimedCount;
   } catch (err: any) {
     console.error("[Scheduler Error]:", err.message);
     return claimedCount;
+  }
+}
+
+/**
+ * Reconciles stranded in-flight permits on cancelled campaigns.
+ *
+ * SCENARIO (Worker crash during permit-to-send):
+ * When an admin cancels a campaign, active recipients granted a durable permit ('permit:%')
+ * are preserved in 'processing' so an in-flight worker can record sent status.
+ * However, if the worker crashes before completing sendEmail() or writing providerMessageId,
+ * the campaign is already cancelled and queue jobs are deleted.
+ *
+ * This reconciler:
+ * 1. Finds recipients of 'cancelled' campaigns that have been stuck in 'processing'
+ *    with a 'permit:%' claimToken for > staleThresholdMinutes (default: 5 minutes).
+ * 2. Checks whether a providerMessageId exists or an email_events webhook record arrived:
+ *    - If providerMessageId exists: marks 'sent' with audit note.
+ *    - If a matching delivery/bounce webhook event arrived: updates to the webhook outcome.
+ *    - If completely unresolved (no messageId and no webhook): transitions status to 'needs_review'
+ *      with errorMessage 'Reconciled: in-flight permit timed out after campaign cancellation with unconfirmed dispatch outcome (possible worker crash)'.
+ *      Releases claimToken to null.
+ * 3. Re-synchronizes the parent cancelled campaign's summary counters (totalRecipients, successfulSends, failedSends).
+ * 4. Logs a structured alert for operator awareness.
+ */
+export async function reconcileCancelledCampaignInFlightPermits(
+  staleThresholdMinutes: number = 5
+): Promise<number> {
+  let reconciledCount = 0;
+  const affectedCampaignIds = new Set<string>();
+
+  try {
+    const staleRecipients = await db
+      .select({
+        id: campaignRecipients.id,
+        campaignId: campaignRecipients.campaignId,
+        claimToken: campaignRecipients.claimToken,
+        providerMessageId: campaignRecipients.providerMessageId,
+      })
+      .from(campaignRecipients)
+      .innerJoin(campaigns, eq(campaignRecipients.campaignId, campaigns.id))
+      .where(
+        and(
+          eq(campaigns.status, "cancelled"),
+          eq(campaignRecipients.status, "processing"),
+          sql`${campaignRecipients.claimToken} LIKE 'permit:%'`,
+          sql`${campaignRecipients.updatedAt} < NOW() - (${staleThresholdMinutes} || ' minutes')::interval`
+        )
+      )
+      .limit(100);
+
+    for (const item of staleRecipients) {
+      await db.transaction(async (tx) => {
+        const [currentRecip] = await tx
+          .select({
+            id: campaignRecipients.id,
+            campaignId: campaignRecipients.campaignId,
+            status: campaignRecipients.status,
+            providerMessageId: campaignRecipients.providerMessageId,
+          })
+          .from(campaignRecipients)
+          .where(
+            and(
+              eq(campaignRecipients.id, item.id),
+              eq(campaignRecipients.status, "processing")
+            )
+          )
+          .for("update", { skipLocked: true });
+
+        if (!currentRecip) return;
+
+        // Check if providerMessageId was already recorded on recipient row
+        if (currentRecip.providerMessageId) {
+          await tx
+            .update(campaignRecipients)
+            .set({
+              status: "sent",
+              errorMessage: `Reconciled after worker crash: email was dispatched under permit with providerMessageId ${currentRecip.providerMessageId}`,
+              claimToken: null,
+              updatedAt: new Date(),
+            })
+            .where(eq(campaignRecipients.id, item.id));
+
+          reconciledCount++;
+          affectedCampaignIds.add(currentRecip.campaignId);
+          return;
+        }
+
+        // Check if any webhook event arrived for this recipient
+        const [webhookEvent] = await tx
+          .select({
+            providerMessageId: emailEvents.providerMessageId,
+            eventType: emailEvents.eventType,
+          })
+          .from(emailEvents)
+          .where(
+            and(
+              eq(emailEvents.recipientId, item.id),
+              sql`${emailEvents.eventType} IN ('delivered', 'bounce', 'complaint', 'failed', 'suppressed', 'open', 'click')`
+            )
+          )
+          .orderBy(desc(emailEvents.createdAt))
+          .limit(1);
+
+        if (webhookEvent) {
+          let resolvedStatus: "delivered" | "bounced" | "failed" = "delivered";
+          if (webhookEvent.eventType === "bounce") resolvedStatus = "bounced";
+          else if (["complaint", "failed", "suppressed"].includes(webhookEvent.eventType)) resolvedStatus = "failed";
+
+          await tx
+            .update(campaignRecipients)
+            .set({
+              status: resolvedStatus,
+              providerMessageId: webhookEvent.providerMessageId || undefined,
+              errorMessage: `Reconciled after worker crash: matched delivery event '${webhookEvent.eventType}'`,
+              claimToken: null,
+              updatedAt: new Date(),
+            })
+            .where(eq(campaignRecipients.id, item.id));
+
+          reconciledCount++;
+          affectedCampaignIds.add(currentRecip.campaignId);
+          return;
+        }
+
+        // Truly unresolved: dispatch outcome cannot be confirmed
+        // Do NOT mark as failed (email might have been sent to provider before crash);
+        // transition to 'needs_review' with explicit audit message
+        await tx
+          .update(campaignRecipients)
+          .set({
+            status: "needs_review",
+            errorMessage: "Reconciled: in-flight permit timed out after campaign cancellation with unconfirmed dispatch outcome (possible worker crash)",
+            claimToken: null,
+            updatedAt: new Date(),
+          })
+          .where(eq(campaignRecipients.id, item.id));
+
+        reconciledCount++;
+        affectedCampaignIds.add(currentRecip.campaignId);
+      });
+    }
+
+    // Re-synchronize parent cancelled campaigns' summary counters
+    for (const campId of affectedCampaignIds) {
+      const [counts] = await db
+        .select({
+          total: sql<number>`count(*)::int`,
+          sent: sql<number>`count(*) filter (where ${campaignRecipients.status} in ('sent', 'delivered'))::int`,
+          failed: sql<number>`count(*) filter (where ${campaignRecipients.status} in ('failed', 'bounced'))::int`,
+        })
+        .from(campaignRecipients)
+        .where(eq(campaignRecipients.campaignId, campId));
+
+      await db
+        .update(campaigns)
+        .set({
+          totalRecipients: counts?.total ?? 0,
+          successfulSends: counts?.sent ?? 0,
+          failedSends: counts?.failed ?? 0,
+          updatedAt: new Date(),
+        })
+        .where(eq(campaigns.id, campId));
+    }
+
+    if (reconciledCount > 0) {
+      console.warn(
+        `[Reconciler Alert - Cancelled Campaign Permit Recovery] Reconciled ${reconciledCount} stranded in-flight permit(s) across ${affectedCampaignIds.size} cancelled campaign(s).`
+      );
+    }
+
+    return reconciledCount;
+  } catch (err: any) {
+    console.error("[Cancelled Campaign Permit Reconciler Error]:", err.message);
+    return reconciledCount;
   }
 }

@@ -37,7 +37,7 @@ export async function handleProcessCampaignBatch(
   // A cancelled campaign must NEVER be resumed, rescheduled, or have emails dispatched.
   if (campaign.status === "cancelled") {
     console.log(`[Worker] Campaign ${campaignId} is cancelled; aborting dispatch.`);
-    // Cancel any remaining in-flight, queued, or unknown_outcome recipients for this cancelled campaign
+    // Cancel truly pending recipients (queued, unknown_outcome, or processing without active permit)
     await db
       .update(campaignRecipients)
       .set({
@@ -49,7 +49,7 @@ export async function handleProcessCampaignBatch(
       .where(
         and(
           eq(campaignRecipients.campaignId, campaignId),
-          sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
+          sql`(${campaignRecipients.status} IN ('queued', 'unknown_outcome') OR (${campaignRecipients.status} = 'processing' AND (${campaignRecipients.claimToken} IS NULL OR ${campaignRecipients.claimToken} NOT LIKE 'permit:%')))`
         )
       );
     return;

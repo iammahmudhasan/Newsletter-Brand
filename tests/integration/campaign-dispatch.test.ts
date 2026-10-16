@@ -1,6 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { db, campaigns, automationJobs, campaignRecipients, subscribers, sql, eq, and } from "@ai-signal/db";
-import { runCampaignScheduler } from "../../apps/worker/src/scheduler/campaignScheduler";
+import { runCampaignScheduler, reconcileCancelledCampaignInFlightPermits } from "../../apps/worker/src/scheduler/campaignScheduler";
 import { POST as cancelCampaignRoute } from "../../apps/web/src/app/api/admin/campaigns/[id]/cancel/route";
 import { createAdminSessionToken } from "../../apps/web/src/lib/auth";
 import { handleProcessCampaignBatch } from "../../apps/worker/src/handlers/processCampaign";
@@ -1425,6 +1425,124 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
         expect(finalRecip1.status).toBe("sent");
         expect(finalRecip1.providerMessageId).toBe("provider-msg-permit-test-1");
         expect(finalRecip1.errorMessage).toBe("Dispatched under permit prior to cancellation confirmation");
+      } finally {
+        try {
+          await db.execute(sql`DELETE FROM campaign_recipients WHERE campaign_id = ${campId};`);
+          await db.execute(sql`DELETE FROM campaigns WHERE id = ${campId};`);
+          await db.execute(sql`DELETE FROM subscribers WHERE id IN (${sub1.id}, ${sub2.id});`);
+        } catch {}
+      }
+    });
+
+    it("reconciles stranded in-flight permits on cancelled campaigns after worker crash timeout into needs_review", async () => {
+      if (!(await isPostgresRunning())) {
+        expect(true).toBe(true);
+        return;
+      }
+
+      const sub1Email = `permit-crash-unconfirmed-${Date.now()}@aisignal.dev`;
+      const sub2Email = `permit-crash-confirmed-${Date.now()}@aisignal.dev`;
+
+      const [sub1] = await db
+        .insert(subscribers)
+        .values({ email: sub1Email, status: "active" })
+        .returning({ id: subscribers.id });
+
+      const [sub2] = await db
+        .insert(subscribers)
+        .values({ email: sub2Email, status: "active" })
+        .returning({ id: subscribers.id });
+
+      // Create a campaign in 'cancelled' status (simulating admin cancellation)
+      const [camp] = await db
+        .insert(campaigns)
+        .values({
+          title: "Cancelled Permit Crash Recovery Test Campaign",
+          subject: "Crash Recovery Subject",
+          contentPlain: "Plain",
+          contentHtml: "<p>Html</p>",
+          status: "cancelled",
+          totalRecipients: 2,
+        })
+        .returning({ id: campaigns.id });
+
+      const campId = camp.id;
+      const permitToken1 = `permit:crash-worker-1:${Date.now()}`;
+      const permitToken2 = `permit:crash-worker-2:${Date.now()}`;
+
+      try {
+        // Recipient 1: worker acquired permit, but crashed before send (unconfirmed outcome)
+        const [recip1] = await db
+          .insert(campaignRecipients)
+          .values({
+            campaignId: campId,
+            subscriberId: sub1.id,
+            status: "processing",
+            claimToken: permitToken1,
+            errorMessage: "In-flight: dispatch was permitted prior to campaign cancellation",
+          })
+          .returning({ id: campaignRecipients.id });
+
+        // Force recipient 1's updatedAt to 10 minutes ago to simulate worker crash timeout
+        await db.execute(sql`
+          UPDATE campaign_recipients
+          SET updated_at = NOW() - INTERVAL '10 minutes'
+          WHERE id = ${recip1.id};
+        `);
+
+        // Recipient 2: worker acquired permit and provider accepted (recorded providerMessageId),
+        // but worker crashed before updating status from processing to sent
+        const [recip2] = await db
+          .insert(campaignRecipients)
+          .values({
+            campaignId: campId,
+            subscriberId: sub2.id,
+            status: "processing",
+            claimToken: permitToken2,
+            providerMessageId: "provider-crashed-accepted-msg-999",
+            errorMessage: "In-flight: dispatch was permitted prior to campaign cancellation",
+          })
+          .returning({ id: campaignRecipients.id });
+
+        await db.execute(sql`
+          UPDATE campaign_recipients
+          SET updated_at = NOW() - INTERVAL '10 minutes'
+          WHERE id = ${recip2.id};
+        `);
+
+        // Execute reconciler with a 5-minute threshold
+        const reconciledCount = await reconcileCancelledCampaignInFlightPermits(5);
+        expect(reconciledCount).toBe(2);
+
+        // Verify Recipient 1: transitioned to 'needs_review' with clear audit trail
+        const [reconciledRecip1] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, recip1.id));
+        expect(reconciledRecip1.status).toBe("needs_review");
+        expect(reconciledRecip1.claimToken).toBeNull();
+        expect(reconciledRecip1.errorMessage).toContain(
+          "Reconciled: in-flight permit timed out after campaign cancellation with unconfirmed dispatch outcome"
+        );
+
+        // Verify Recipient 2: transitioned to 'sent' because providerMessageId confirmed dispatch
+        const [reconciledRecip2] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, recip2.id));
+        expect(reconciledRecip2.status).toBe("sent");
+        expect(reconciledRecip2.claimToken).toBeNull();
+        expect(reconciledRecip2.errorMessage).toContain(
+          "Reconciled after worker crash: email was dispatched under permit with providerMessageId provider-crashed-accepted-msg-999"
+        );
+
+        // Verify campaign remains 'cancelled' and summary counts were re-synchronized
+        const [updatedCamp] = await db
+          .select()
+          .from(campaigns)
+          .where(eq(campaigns.id, campId));
+        expect(updatedCamp.status).toBe("cancelled");
+        expect(updatedCamp.successfulSends).toBe(1); // recip2 was sent
       } finally {
         try {
           await db.execute(sql`DELETE FROM campaign_recipients WHERE campaign_id = ${campId};`);
