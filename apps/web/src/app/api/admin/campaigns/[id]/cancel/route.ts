@@ -89,21 +89,57 @@ export async function POST(
         };
       }
 
-      // 3. ONLY after successful campaign transition to 'cancelled', abort remaining non-terminal recipients
+      // 3. ONLY after successful campaign transition to 'cancelled', partition non-terminal recipients into:
+      // (a) in-flight permitted: recipients that have already been granted a durable dispatch permit ('permit:%')
+      // (b) truly pending / abortable: queued, unknown_outcome, or processing without an active dispatch permit
+      const inFlightRecipients = await tx
+        .select({ id: campaignRecipients.id })
+        .from(campaignRecipients)
+        .where(
+          and(
+            eq(campaignRecipients.campaignId, campaignId),
+            eq(campaignRecipients.status, "processing"),
+            sql`${campaignRecipients.claimToken} LIKE 'permit:%'`
+          )
+        );
+
+      const inFlightCount = inFlightRecipients.length;
+
+      // Abort only the truly pending recipients:
       const recipientAbortResult = await tx
         .update(campaignRecipients)
         .set({
           status: "failed",
-          errorMessage: "Cancelled by admin request",
+          errorMessage: "Cancelled by admin request before dispatch permit",
           claimToken: null,
           updatedAt: new Date(),
         })
         .where(
           and(
             eq(campaignRecipients.campaignId, campaignId),
-            sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
+            sql`(${campaignRecipients.status} IN ('queued', 'unknown_outcome') OR (${campaignRecipients.status} = 'processing' AND (${campaignRecipients.claimToken} IS NULL OR ${campaignRecipients.claimToken} NOT LIKE 'permit:%')))`
           )
         );
+
+      const abortedCount = (recipientAbortResult as any)?.rowCount || 0;
+
+      // For in-flight permitted recipients, mark an audit note indicating permit was granted prior to cancellation,
+      // but PRESERVE their status ('processing') and permit claimToken so the worker can complete delivery reporting.
+      if (inFlightCount > 0) {
+        await tx
+          .update(campaignRecipients)
+          .set({
+            errorMessage: "In-flight: dispatch was permitted prior to campaign cancellation",
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(campaignRecipients.campaignId, campaignId),
+              eq(campaignRecipients.status, "processing"),
+              sql`${campaignRecipients.claimToken} LIKE 'permit:%'`
+            )
+          );
+      }
 
       // 4. Purge/cancel any queued process_campaign jobs in the queue
       await tx.execute(sql`
@@ -115,7 +151,8 @@ export async function POST(
       return {
         success: true,
         campaign: cancelledCampaign,
-        abortedRecipientsCount: (recipientAbortResult as any)?.rowCount || 0,
+        abortedRecipientsCount: abortedCount,
+        inFlightRecipientsCount: inFlightCount,
       };
     });
 
@@ -142,9 +179,16 @@ export async function POST(
       });
     }
 
+    const statusMessage =
+      result.inFlightRecipientsCount && result.inFlightRecipientsCount > 0
+        ? `Campaign cancelled successfully. ${result.abortedRecipientsCount} pending recipients aborted; ${result.inFlightRecipientsCount} in-flight recipients permitted prior to cancellation.`
+        : `Campaign cancelled successfully. ${result.abortedRecipientsCount} pending recipients aborted.`;
+
     return NextResponse.json({
       success: true,
-      message: "Campaign cancelled successfully. In-flight and pending recipients have been aborted.",
+      message: statusMessage,
+      abortedRecipientsCount: result.abortedRecipientsCount,
+      inFlightRecipientsCount: result.inFlightRecipientsCount,
       campaign: result.campaign,
     });
   } catch (err: any) {

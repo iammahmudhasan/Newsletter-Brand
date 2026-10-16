@@ -123,12 +123,18 @@ bun run worker
    Jobs use row-level locking (`FOR UPDATE SKIP LOCKED`) directly in PostgreSQL. If the server restarts, pending jobs are never lost.
 5. **Zero-Lockin Provider Abstraction**:
    Switch between `console`, `resend`, and `ses` with a single environment variable change without modifying any business logic.
-6. **Hardened Proxy Resolution & Bounded Streaming Limits**:
-   Rate-limiting defends against `X-Forwarded-For` spoofing by requiring explicit proxy allowlists (`TRUSTED_PROXIES` supporting both IPv4 and IPv6 CIDRs). In production, unlisted header loopback addresses (`127.0.0.1`, `::1`) and private IPs are strictly rejected as trusted hops, preventing attackers from injecting trailing fake proxies (`9.9.9.9, 127.0.0.1`). Public endpoints (`/api/subscribe`, `/api/subscriber/gdpr/*`) enforce true incremental byte stream limits (16 KB max) to prevent memory exhaustion.
-7. **Atomic Cancellation Protocol & Strict In-Flight Fencing**:
-   When an admin cancels a campaign, the API acquires a transaction-level row lock (`FOR UPDATE`) on the campaign record, marks non-terminal recipients as `failed`, and purges all queue jobs. Both worker retry scheduling and scheduler stuck-campaign recovery execute within atomic transactions acquiring the same row lock, strictly preventing zombie queue jobs. Pre-send status checks (`status === 'sending'`) immediately halt dispatch loops, and post-send conditional transitions guarantee that in-flight dispatches can never overwrite a cancelled campaign.
+6. **Provider-Specific Proxy Resolution & Bounded Streaming Limits**:
+   Rate-limiting defends against `X-Forwarded-For` spoofing by requiring explicit proxy allowlists (`TRUSTED_PROXIES` supporting both IPv4 and IPv6 CIDRs). In production, unlisted header loopback addresses (`127.0.0.1`, `::1`) and private IPs are strictly rejected as trusted hops, preventing attackers from injecting trailing fake proxies (`9.9.9.9, 127.0.0.1`).
+   Edge proxy header trust is granularly scoped per provider:
+   - **Vercel** (`VERCEL=1`): Automatically prioritizes `x-vercel-forwarded-for` and rejects client-injected `cf-connecting-ip`.
+   - **AWS CloudFront** (`TRUST_CLOUDFRONT=true`): Parses `CloudFront-Viewer-Address` safely supporting both IPv4:port and IPv6:port, and strictly refuses unverified `x-real-ip` fallbacks.
+   - **Cloudflare** (`TRUST_CLOUDFLARE=true` / `CF_PAGES=1`): Authoritatively trusts `cf-connecting-ip`.
+   - **Generic Edge Trust** (`TRUST_EDGE_HEADERS=true`): Opt-in flag for reverse proxies that authenticate edge headers.
+   Public endpoints (`/api/subscribe`, `/api/subscriber/gdpr/*`) enforce true incremental byte stream limits (16 KB max) to prevent memory exhaustion.
+7. **Durable Dispatch Permit, Atomic Cancellation & In-Flight Partitioning**:
+   Before invoking external email providers, workers atomically acquire a durable dispatch permit recorded directly on the recipient row in PostgreSQL under a `FOR SHARE` row lock on `campaigns`. When an admin cancels a campaign (`POST /api/admin/campaigns/:id/cancel`), the cancellation transaction holds `FOR UPDATE`, atomically partitions recipients between truly pending ones (aborted to `failed`) and in-flight permitted ones (preserved in-flight for worker post-send reporting), and purges queue jobs. Post-send updates accurately record `sent` with `providerMessageId` for in-flight dispatches without corrupting cancelled state, guaranteeing full observability across SES/Resend delivery webhooks.
 8. **Terminal Campaign Recipient Reconciliation & Concurrency Verification**:
-   If inconsistent active recipients (`queued`, `processing`, `unknown_outcome`) are detected within a terminal campaign (`sent`, `partially_failed`, `failed`), workers transactionally reconcile them to `needs_review` with an audit error message and emit structured operator alerts without violating terminal campaign immutability. Concurrency tests run against real PostgreSQL database transactions with concurrent row locking, waiting, and commit ordering.
+   If inconsistent active recipients (`queued`, `processing`, `unknown_outcome`) are detected within a terminal campaign (`sent`, `partially_failed`, `failed`), workers transactionally reconcile them to `needs_review` with an audit error message and re-synchronize parent campaign counters (`totalRecipients`, `successfulSends`, `failedSends`) without violating terminal campaign immutability. Concurrency tests run against real PostgreSQL database transactions with concurrent row locking, waiting, and commit ordering.
 
 ---
 

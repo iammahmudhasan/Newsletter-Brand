@@ -323,6 +323,55 @@ export function isTrustedProxyHop(ip: string, options: { isHeaderHop?: boolean }
 }
 
 /**
+ * Safely parses the client IP address from the CloudFront-Viewer-Address header.
+ * AWS CloudFront formats this header as:
+ * - IPv4: `<ip>:<port>` (e.g. `198.51.100.10:46532`)
+ * - IPv6: `<ip>:<port>` (e.g. `2001:db8:85a3:8d3:1319:8a2e:370:7348:46532` or `[2001:db8:...]:46532`)
+ * Robustly parses IPv6 addresses with multiple colons without mistaking address segments for port delimiters.
+ */
+export function parseCloudFrontViewerAddress(raw: string | null | undefined): string | null {
+  if (!raw || typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  // 1. Bracketed IPv6 format: "[2001:db8:...]:port" or "[2001:db8:...]"
+  if (trimmed.startsWith("[")) {
+    const closeBracketIdx = trimmed.indexOf("]");
+    if (closeBracketIdx > 1) {
+      const candidate = trimmed.substring(1, closeBracketIdx).trim();
+      if (isValidIpAddress(candidate)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  // 2. Direct valid IP (if port was already stripped or omitted)
+  if (isValidIpAddress(trimmed)) {
+    return trimmed;
+  }
+
+  // 3. Address with trailing port:
+  // Since IPv6 addresses contain multiple colons and IPv4 contains none,
+  // the port delimiter is strictly the LAST colon in the string.
+  const lastColon = trimmed.lastIndexOf(":");
+  if (lastColon > 0) {
+    const candidateIp = trimmed.substring(0, lastColon).trim();
+    const candidatePort = trimmed.substring(lastColon + 1).trim();
+
+    // Verify candidate port is a valid decimal port (1 - 65535)
+    if (/^\d{1,5}$/.test(candidatePort)) {
+      const portNum = Number(candidatePort);
+      if (portNum >= 1 && portNum <= 65535 && isValidIpAddress(candidateIp)) {
+        return candidateIp;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
  * Extracts and sanitizes the client IP address from request headers.
  * Uses trusted proxy chain resolution with strict IPv4/IPv6 validation.
  * Traverses X-Forwarded-For from right to left, peeling off trusted proxies
@@ -349,7 +398,7 @@ export function getClientIp(req: NextRequest): string {
   //   Client-supplied `cf-connecting-ip` or `cloudfront-viewer-address` are NOT authoritative on Vercel unless
   //   explicitly configured via TRUST_CLOUDFLARE=true or TRUST_EDGE_HEADERS=true.
   // - Cloudflare Pages / Workers: Cloudflare edge guarantees `cf-connecting-ip`.
-  // - AWS Lambda: `cloudfront-viewer-address` is only authoritative if TRUST_CLOUDFRONT=true or TRUST_EDGE_HEADERS=true.
+  // - AWS / CloudFront: `cloudfront-viewer-address` is authoritative when TRUST_CLOUDFRONT=true or TRUST_EDGE_HEADERS=true.
   // - In development and test (!isProd) or when TRUST_EDGE_HEADERS=true, standard edge headers are supported.
   const isVercel = process.env.VERCEL === "1" || process.env.VERCEL === "true";
   const isCloudflare =
@@ -357,8 +406,10 @@ export function getClientIp(req: NextRequest): string {
     process.env.TRUST_CLOUDFLARE === "true" ||
     process.env.TRUST_CLOUDFLARE === "1";
   const isCloudFront =
-    Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME) &&
-    (process.env.TRUST_CLOUDFRONT === "true" || process.env.TRUST_CLOUDFRONT === "1");
+    process.env.TRUST_CLOUDFRONT === "true" ||
+    process.env.TRUST_CLOUDFRONT === "1" ||
+    (Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME) &&
+      (process.env.TRUST_CLOUDFRONT === "true" || process.env.TRUST_CLOUDFRONT === "1"));
 
   // On Vercel: check Vercel's authoritative header first
   if (isVercel) {
@@ -376,23 +427,25 @@ export function getClientIp(req: NextRequest): string {
     }
   }
 
-  // CloudFront authoritative header:
+  // CloudFront authoritative header (handles IPv4:port, IPv6:port, and bracketed IPv6:port):
   if (isCloudFront || trustEdge || (!isProd && !isVercel)) {
-    const cloudFrontIp = req.headers.get("cloudfront-viewer-address")?.split(":")[0]?.trim();
-    if (cloudFrontIp && isValidIpAddress(cloudFrontIp)) {
+    const cloudFrontIp = parseCloudFrontViewerAddress(req.headers.get("cloudfront-viewer-address"));
+    if (cloudFrontIp) {
       return cloudFrontIp;
     }
   }
 
+  // Edge real-ip header:
+  // When running behind CloudFront, x-real-ip is NOT trusted unless trustEdge is explicitly enabled,
+  // because CloudFront does not set x-real-ip authoritatively and client-injected headers must be rejected.
   const canTrustEdgeHeaders =
     trustEdge ||
     !isProd ||
     isVercel ||
     isCloudflare ||
-    isCloudFront ||
     (hasValidNextIp && isTrustedProxyHop(nextIp, { isHeaderHop: false }));
 
-  if (canTrustEdgeHeaders) {
+  if (canTrustEdgeHeaders && !isCloudFront) {
     const realIp = req.headers.get("x-real-ip")?.trim();
     if (realIp && isValidIpAddress(realIp)) {
       return realIp;

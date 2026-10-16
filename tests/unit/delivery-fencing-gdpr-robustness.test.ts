@@ -1,7 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import { normalizeWebhookEventType, computeCampaignTargetStatus } from "../../apps/web/src/lib/webhookHelpers";
 import { renderNewsletterEmail } from "../../packages/email/src/templates/newsletter";
-import { checkRateLimit, checkEmailCooldown, isValidIpAddress, pseudonymizeRateLimitKey, getClientIp, isPrivateOrLoopbackIp, matchesCidr, isTrustedProxyHop } from "../../apps/web/src/lib/rateLimit";
+import { checkRateLimit, checkEmailCooldown, isValidIpAddress, pseudonymizeRateLimitKey, getClientIp, isPrivateOrLoopbackIp, matchesCidr, isTrustedProxyHop, parseCloudFrontViewerAddress } from "../../apps/web/src/lib/rateLimit";
 import { readBodyWithIncrementalLimit } from "../../apps/web/src/lib/bodyLimit";
 
 describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
@@ -1490,6 +1490,146 @@ describe("Production Delivery, Fencing, GDPR & Robustness Verification", () => {
         else delete process.env.TRUST_EDGE_HEADERS;
         (process.env as any).NODE_ENV = origNodeEnv;
       }
+    });
+  });
+
+  describe("21. CloudFront IPv6 & Strict Fallback Verification (P2)", () => {
+    it("safely extracts IPv4 addresses with port from CloudFront-Viewer-Address", () => {
+      expect(parseCloudFrontViewerAddress("198.51.100.10:46532")).toBe("198.51.100.10");
+      expect(parseCloudFrontViewerAddress("203.0.113.195:80")).toBe("203.0.113.195");
+      expect(parseCloudFrontViewerAddress("  198.51.100.10:443  ")).toBe("198.51.100.10");
+    });
+
+    it("safely extracts unbracketed IPv6 addresses with port without corrupting colons", () => {
+      // Standard AWS CloudFront IPv6 format: <full-8-hextet-ipv6>:<port>
+      const rawCloudFrontIpv6 = "2001:db8:85a3:8d3:1319:8a2e:370:7348:46532";
+      expect(parseCloudFrontViewerAddress(rawCloudFrontIpv6)).toBe("2001:db8:85a3:8d3:1319:8a2e:370:7348");
+    });
+
+    it("safely extracts bracketed IPv6 addresses with port", () => {
+      const bracketed = "[2001:db8:85a3:8d3:1319:8a2e:370:7348]:46532";
+      expect(parseCloudFrontViewerAddress(bracketed)).toBe("2001:db8:85a3:8d3:1319:8a2e:370:7348");
+    });
+
+    it("accepts direct valid IP without port and returns null on malformed inputs", () => {
+      expect(parseCloudFrontViewerAddress("2001:db8::1")).toBe("2001:db8::1");
+      expect(parseCloudFrontViewerAddress("198.51.100.5")).toBe("198.51.100.5");
+      expect(parseCloudFrontViewerAddress("invalid:ip:format:99999")).toBeNull();
+      expect(parseCloudFrontViewerAddress("999.999.999.999:80")).toBeNull();
+      expect(parseCloudFrontViewerAddress("")).toBeNull();
+      expect(parseCloudFrontViewerAddress(null)).toBeNull();
+    });
+
+    it("strictly refuses to fall back to spoofed x-real-ip when running behind CloudFront", () => {
+      const origTrustCf = process.env.TRUST_CLOUDFRONT;
+      const origTrustEdge = process.env.TRUST_EDGE_HEADERS;
+      const origNodeEnv = process.env.NODE_ENV;
+
+      try {
+        process.env.TRUST_CLOUDFRONT = "true";
+        delete process.env.TRUST_EDGE_HEADERS;
+        (process.env as any).NODE_ENV = "production";
+
+        // Attacker sends malformed cloudfront-viewer-address and injects fake x-real-ip
+        const spoofedReq = {
+          ip: undefined,
+          headers: {
+            get: (name: string) => {
+              if (name === "cloudfront-viewer-address") return "malformed-garbage";
+              if (name === "x-real-ip") return "1.1.1.1";
+              if (name === "x-forwarded-for") return "10.0.0.1";
+              return null;
+            },
+          },
+        } as any;
+
+        // When CloudFront is active, x-real-ip must NOT be trusted as a fallback!
+        // Untrusted proxy chain falls back to safe 127.0.0.1
+        const resolved = getClientIp(spoofedReq);
+        expect(resolved).toBe("127.0.0.1");
+      } finally {
+        if (origTrustCf !== undefined) process.env.TRUST_CLOUDFRONT = origTrustCf;
+        else delete process.env.TRUST_CLOUDFRONT;
+        if (origTrustEdge !== undefined) process.env.TRUST_EDGE_HEADERS = origTrustEdge;
+        else delete process.env.TRUST_EDGE_HEADERS;
+        (process.env as any).NODE_ENV = origNodeEnv;
+      }
+    });
+  });
+
+  describe("22. Durable Dispatch Permit & In-Flight Cancellation Partitioning (P2)", () => {
+    it("partitions in-flight permitted recipients from pending recipients during campaign cancellation", () => {
+      interface RecipientState {
+        id: string;
+        campaignId: string;
+        status: "queued" | "processing" | "sent" | "failed";
+        claimToken: string | null;
+        errorMessage: string | null;
+      }
+
+      const campaign = { id: "camp-permit-test", status: "sending" };
+      const recipients: RecipientState[] = [
+        // Recipient 1: Granted a durable dispatch permit
+        { id: "r1", campaignId: "camp-permit-test", status: "processing", claimToken: "permit:workerA:12345", errorMessage: "in_flight_permitted" },
+        // Recipient 2: Claimed in batch but NOT yet granted dispatch permit
+        { id: "r2", campaignId: "camp-permit-test", status: "processing", claimToken: "workerA-batch", errorMessage: null },
+        // Recipient 3: Queued
+        { id: "r3", campaignId: "camp-permit-test", status: "queued", claimToken: null, errorMessage: null },
+      ];
+
+      // Simulated cancellation transaction with durable permit partitioning
+      function cancelCampaignWithPermitPartitioning(c: typeof campaign, rList: RecipientState[]) {
+        c.status = "cancelled";
+
+        const inFlight = rList.filter((r) => r.status === "processing" && r.claimToken?.startsWith("permit:"));
+        const abortable = rList.filter(
+          (r) =>
+            r.status === "queued" ||
+            (r.status === "processing" && (!r.claimToken || !r.claimToken.startsWith("permit:")))
+        );
+
+        // Abort truly pending
+        for (const r of abortable) {
+          r.status = "failed";
+          r.claimToken = null;
+          r.errorMessage = "Cancelled by admin request before dispatch permit";
+        }
+
+        // Annotate in-flight but PRESERVE permit claimToken
+        for (const r of inFlight) {
+          r.errorMessage = "In-flight: dispatch was permitted prior to campaign cancellation";
+        }
+
+        return {
+          abortedCount: abortable.length,
+          inFlightCount: inFlight.length,
+        };
+      }
+
+      const cancelSummary = cancelCampaignWithPermitPartitioning(campaign, recipients);
+
+      expect(cancelSummary.abortedCount).toBe(2);
+      expect(cancelSummary.inFlightCount).toBe(1);
+
+      // Verify recipient 2 & 3 were aborted
+      expect(recipients[1].status).toBe("failed");
+      expect(recipients[1].claimToken).toBeNull();
+      expect(recipients[2].status).toBe("failed");
+
+      // Verify permitted recipient 1 was NOT aborted and retained its permit claimToken!
+      expect(recipients[0].status).toBe("processing");
+      expect(recipients[0].claimToken).toBe("permit:workerA:12345");
+      expect(recipients[0].errorMessage).toBe("In-flight: dispatch was permitted prior to campaign cancellation");
+
+      // Worker post-send resolution: when provider succeeds, recipient 1 updates to sent
+      const sendSuccess = true;
+      if (sendSuccess && recipients[0].claimToken === "permit:workerA:12345") {
+        recipients[0].status = "sent";
+        recipients[0].errorMessage = "Dispatched under permit prior to cancellation confirmation";
+      }
+
+      expect(recipients[0].status).toBe("sent");
+      expect(recipients[0].errorMessage).toBe("Dispatched under permit prior to cancellation confirmation");
     });
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { db, campaigns, automationJobs, campaignRecipients, subscribers, sql, eq } from "@ai-signal/db";
+import { db, campaigns, automationJobs, campaignRecipients, subscribers, sql, eq, and } from "@ai-signal/db";
 import { runCampaignScheduler } from "../../apps/worker/src/scheduler/campaignScheduler";
 import { POST as cancelCampaignRoute } from "../../apps/web/src/app/api/admin/campaigns/[id]/cancel/route";
 import { createAdminSessionToken } from "../../apps/web/src/lib/auth";
@@ -1298,6 +1298,138 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
           await db.execute(sql`DELETE FROM campaign_recipients WHERE campaign_id = ${termCampId};`);
           await db.execute(sql`DELETE FROM campaigns WHERE id = ${termCampId};`);
           await db.execute(sql`DELETE FROM subscribers WHERE id = ${sub.id};`);
+        } catch {}
+      }
+    });
+
+    it("coordinates durable dispatch permit with concurrent cancellation and accurately tracks in-flight recipients against real PostgreSQL", async () => {
+      if (!(await isPostgresRunning())) {
+        expect(true).toBe(true);
+        return;
+      }
+
+      // 1. Create subscribers
+      const [sub1] = await db
+        .insert(subscribers)
+        .values({ email: `permit-race-1-${Date.now()}@example.com`, status: "active" })
+        .returning({ id: subscribers.id });
+
+      const [sub2] = await db
+        .insert(subscribers)
+        .values({ email: `permit-race-2-${Date.now()}@example.com`, status: "active" })
+        .returning({ id: subscribers.id });
+
+      // 2. Create campaign in 'sending' status
+      const [camp] = await db
+        .insert(campaigns)
+        .values({
+          title: "Durable Permit Concurrency Test Campaign",
+          subject: "Permit Subject",
+          contentPlain: "Plain",
+          contentHtml: "<p>Html</p>",
+          status: "sending",
+          totalRecipients: 2,
+        })
+        .returning({ id: campaigns.id });
+
+      const campId = camp.id;
+      const workerBatchClaim = `worker-claim-${Date.now()}`;
+      const permitToken = `permit:${workerBatchClaim}:unique-123`;
+
+      try {
+        // 3. Recipient 1 has acquired a durable dispatch permit
+        const [recip1] = await db
+          .insert(campaignRecipients)
+          .values({
+            campaignId: campId,
+            subscriberId: sub1.id,
+            status: "processing",
+            claimToken: permitToken,
+            errorMessage: "in_flight_permitted",
+          })
+          .returning({ id: campaignRecipients.id });
+
+        // Recipient 2 is claimed in worker batch but has NOT yet been granted a dispatch permit
+        const [recip2] = await db
+          .insert(campaignRecipients)
+          .values({
+            campaignId: campId,
+            subscriberId: sub2.id,
+            status: "processing",
+            claimToken: workerBatchClaim,
+          })
+          .returning({ id: campaignRecipients.id });
+
+        // 4. Concurrently, admin cancellation executes
+        const sessionToken = createAdminSessionToken();
+        const cancelReq = {
+          headers: {
+            get: (name: string) => (name === "authorization" ? `Bearer ${sessionToken}` : null),
+          },
+          cookies: { get: () => null },
+        } as any;
+
+        const cancelRes = await cancelCampaignRoute(cancelReq, {
+          params: Promise.resolve({ id: campId }),
+        });
+        expect(cancelRes.status).toBe(200);
+        const cancelBody = await cancelRes.json();
+
+        // 5. Verify cancellation response accurately partitions aborted vs in-flight
+        expect(cancelBody.abortedRecipientsCount).toBe(1);
+        expect(cancelBody.inFlightRecipientsCount).toBe(1);
+        expect(cancelBody.message).toContain("1 pending recipients aborted");
+        expect(cancelBody.message).toContain("1 in-flight recipients permitted prior to cancellation");
+
+        // 6. Verify in database:
+        // Recipient 2 was aborted before permit
+        const [dbRecip2] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, recip2.id));
+        expect(dbRecip2.status).toBe("failed");
+        expect(dbRecip2.claimToken).toBeNull();
+        expect(dbRecip2.errorMessage).toContain("Cancelled by admin request before dispatch permit");
+
+        // Recipient 1 was preserved in-flight with its permit claimToken intact
+        const [dbRecip1] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, recip1.id));
+        expect(dbRecip1.status).toBe("processing");
+        expect(dbRecip1.claimToken).toBe(permitToken);
+        expect(dbRecip1.errorMessage).toContain("In-flight: dispatch was permitted prior to campaign cancellation");
+
+        // 7. Worker completes post-send update for in-flight permitted recipient:
+        await db
+          .update(campaignRecipients)
+          .set({
+            status: "sent",
+            providerMessageId: "provider-msg-permit-test-1",
+            sentAt: new Date(),
+            errorMessage: "Dispatched under permit prior to cancellation confirmation",
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(campaignRecipients.id, recip1.id),
+              eq(campaignRecipients.status, "processing"),
+              sql`${campaignRecipients.claimToken} IN (${workerBatchClaim}, ${permitToken})`
+            )
+          );
+
+        const [finalRecip1] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, recip1.id));
+        expect(finalRecip1.status).toBe("sent");
+        expect(finalRecip1.providerMessageId).toBe("provider-msg-permit-test-1");
+        expect(finalRecip1.errorMessage).toBe("Dispatched under permit prior to cancellation confirmation");
+      } finally {
+        try {
+          await db.execute(sql`DELETE FROM campaign_recipients WHERE campaign_id = ${campId};`);
+          await db.execute(sql`DELETE FROM campaigns WHERE id = ${campId};`);
+          await db.execute(sql`DELETE FROM subscribers WHERE id IN (${sub1.id}, ${sub2.id});`);
         } catch {}
       }
     });

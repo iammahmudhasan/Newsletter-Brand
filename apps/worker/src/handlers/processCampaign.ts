@@ -13,7 +13,7 @@ import {
 import { getEmailProvider, renderNewsletterEmail } from "@ai-signal/email";
 import { config, generateSignedToken, normalizeEmail } from "@ai-signal/config";
 import { enqueueJob, renewJobLease } from "@ai-signal/queue";
-import crypto from "crypto";
+import crypto, { randomUUID } from "crypto";
 
 export async function handleProcessCampaignBatch(
   payload: { campaignId: string },
@@ -455,6 +455,7 @@ export async function handleProcessCampaignBatch(
           }
         }
 
+        let permitToken: string | null = null;
         try {
           // Fresh check of subscriber status and suppression list immediately prior to dispatch
           const [freshSub] = await db
@@ -547,9 +548,11 @@ export async function handleProcessCampaignBatch(
           const idempotencyKey = `campaign:${campaign.id}:recipient:${item.recipientId}`;
 
           // Ultra-tight pre-send fencing, atomic cancellation coordination & GDPR shield:
-          // Atomically acquire dispatch permit under a FOR SHARE row lock on the campaign.
+          // Atomically acquire a durable dispatch permit under a FOR SHARE row lock on the campaign.
           // This serializes directly with cancellation transactions (which hold FOR UPDATE),
           // guaranteeing that if cancellation is in progress, dispatch halts BEFORE contacting the provider!
+          permitToken = `permit:${claimToken}:${randomUUID()}`;
+
           const permit = await db.transaction(async (tx) => {
             const [campaignLock] = await tx.execute<typeof campaigns.$inferSelect>(sql`
               SELECT status FROM campaigns WHERE id = ${campaign.id} FOR SHARE;
@@ -558,6 +561,7 @@ export async function handleProcessCampaignBatch(
             if (campaignLock?.status !== "sending") {
               return {
                 granted: false,
+                permitToken: null,
                 reason: `Campaign status changed to '${campaignLock?.status || "missing"}' (not 'sending')`,
                 stopLoop: true,
               };
@@ -577,6 +581,7 @@ export async function handleProcessCampaignBatch(
             if (!stillClaimed || stillClaimed.claimToken !== claimToken) {
               return {
                 granted: false,
+                permitToken: null,
                 reason: "Recipient claim was cancelled, aborted, or revoked concurrently",
                 stopLoop: false,
               };
@@ -595,6 +600,7 @@ export async function handleProcessCampaignBatch(
             if (!stillActiveSub) {
               return {
                 granted: false,
+                permitToken: null,
                 reason: `Subscriber ${freshSub.id} was deleted or deactivated concurrently`,
                 stopLoop: false,
               };
@@ -608,15 +614,42 @@ export async function handleProcessCampaignBatch(
             if (preSendSuppressed) {
               return {
                 granted: false,
+                permitToken: null,
                 reason: `Recipient ${item.recipientId} (${normalizedEmail}) was added to suppressions concurrently`,
                 stopLoop: false,
               };
             }
 
-            return { granted: true, reason: null, stopLoop: false };
+            // Durably record the dispatch permit on the recipient row in PostgreSQL
+            const [grantedRow] = await tx
+              .update(campaignRecipients)
+              .set({
+                claimToken: permitToken,
+                errorMessage: "in_flight_permitted",
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(campaignRecipients.id, item.recipientId),
+                  eq(campaignRecipients.status, "processing"),
+                  eq(campaignRecipients.claimToken, claimToken)
+                )
+              )
+              .returning({ id: campaignRecipients.id });
+
+            if (!grantedRow) {
+              return {
+                granted: false,
+                permitToken: null,
+                reason: "Failed to persist durable dispatch permit",
+                stopLoop: false,
+              };
+            }
+
+            return { granted: true, permitToken, reason: null, stopLoop: false };
           });
 
-          if (!permit.granted) {
+          if (!permit.granted || !permit.permitToken) {
             console.warn(`[Dispatch Permit Refused] ${permit.reason}. Aborting external dispatch.`);
             failCount++;
             if (permit.stopLoop) {
@@ -639,8 +672,15 @@ export async function handleProcessCampaignBatch(
           });
 
           if (sendResult.success) {
-            // Conditional state transition: Only set status = 'sent' if the recipient still matches this worker's claimToken!
-            // If lease expired, cancelled concurrently, or claimed by another worker, fail-closed without overwriting!
+            // Check if campaign was cancelled while email was in flight to provider
+            const [currentCampState] = await db
+              .select({ status: campaigns.status })
+              .from(campaigns)
+              .where(eq(campaigns.id, campaign.id));
+
+            const isCancelled = currentCampState?.status === "cancelled";
+
+            // Conditional state transition: set status = 'sent' matching this worker's permitToken
             const updateRes = await db
               .update(campaignRecipients)
               .set({
@@ -648,13 +688,15 @@ export async function handleProcessCampaignBatch(
                 providerMessageId: sendResult.messageId,
                 sentAt: new Date(),
                 updatedAt: new Date(),
-                errorMessage: null,
+                errorMessage: isCancelled
+                  ? "Dispatched under permit prior to cancellation confirmation"
+                  : null,
               })
               .where(
                 and(
                   eq(campaignRecipients.id, item.recipientId),
                   eq(campaignRecipients.status, "processing"),
-                  eq(campaignRecipients.claimToken, claimToken)
+                  sql`${campaignRecipients.claimToken} IN (${claimToken}, ${permit.permitToken})`
                 )
               )
               .returning({ id: campaignRecipients.id });
@@ -678,7 +720,7 @@ export async function handleProcessCampaignBatch(
                 .where(
                   and(
                     eq(campaignRecipients.id, item.recipientId),
-                    eq(campaignRecipients.status, "failed")
+                    sql`${campaignRecipients.status} IN ('processing', 'failed')`
                   )
                 );
             }
@@ -711,7 +753,7 @@ export async function handleProcessCampaignBatch(
                     and(
                       eq(campaignRecipients.id, item.recipientId),
                       eq(campaignRecipients.status, "processing"),
-                      eq(campaignRecipients.claimToken, claimToken)
+                      sql`${campaignRecipients.claimToken} IN (${claimToken}, ${permitToken})`
                     )
                   );
                 failCount++;
@@ -738,7 +780,7 @@ export async function handleProcessCampaignBatch(
                     and(
                       eq(campaignRecipients.id, item.recipientId),
                       eq(campaignRecipients.status, "processing"),
-                      eq(campaignRecipients.claimToken, claimToken)
+                      sql`${campaignRecipients.claimToken} IN (${claimToken}, ${permitToken})`
                     )
                   );
               }
@@ -764,7 +806,7 @@ export async function handleProcessCampaignBatch(
                   and(
                     eq(campaignRecipients.id, item.recipientId),
                     eq(campaignRecipients.status, "processing"),
-                    eq(campaignRecipients.claimToken, claimToken)
+                    sql`${campaignRecipients.claimToken} IN (${claimToken}, ${permitToken})`
                   )
                 );
             } else {
@@ -786,7 +828,7 @@ export async function handleProcessCampaignBatch(
                   and(
                     eq(campaignRecipients.id, item.recipientId),
                     eq(campaignRecipients.status, "processing"),
-                    eq(campaignRecipients.claimToken, claimToken)
+                    sql`${campaignRecipients.claimToken} IN (${claimToken}, ${permitToken})`
                   )
                 );
             }
@@ -813,7 +855,7 @@ export async function handleProcessCampaignBatch(
                 and(
                   eq(campaignRecipients.id, item.recipientId),
                   eq(campaignRecipients.status, "processing"),
-                  eq(campaignRecipients.claimToken, claimToken)
+                  sql`${campaignRecipients.claimToken} IN (${claimToken}, ${permitToken ?? claimToken})`
                 )
               );
             failCount++;
@@ -839,7 +881,7 @@ export async function handleProcessCampaignBatch(
                 and(
                   eq(campaignRecipients.id, item.recipientId),
                   eq(campaignRecipients.status, "processing"),
-                  eq(campaignRecipients.claimToken, claimToken)
+                  sql`${campaignRecipients.claimToken} IN (${claimToken}, ${permitToken ?? claimToken})`
                 )
               );
           }
