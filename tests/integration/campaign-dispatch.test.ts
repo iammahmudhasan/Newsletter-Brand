@@ -1442,6 +1442,7 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
 
       const sub1Email = `permit-crash-unconfirmed-${Date.now()}@aisignal.dev`;
       const sub2Email = `permit-crash-confirmed-${Date.now()}@aisignal.dev`;
+      const sub3Email = `permit-fresh-active-${Date.now()}@aisignal.dev`;
 
       const [sub1] = await db
         .insert(subscribers)
@@ -1453,6 +1454,11 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
         .values({ email: sub2Email, status: "active" })
         .returning({ id: subscribers.id });
 
+      const [sub3] = await db
+        .insert(subscribers)
+        .values({ email: sub3Email, status: "active" })
+        .returning({ id: subscribers.id });
+
       // Create a campaign in 'cancelled' status (simulating admin cancellation)
       const [camp] = await db
         .insert(campaigns)
@@ -1462,13 +1468,14 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
           contentPlain: "Plain",
           contentHtml: "<p>Html</p>",
           status: "cancelled",
-          totalRecipients: 2,
+          totalRecipients: 3,
         })
         .returning({ id: campaigns.id });
 
       const campId = camp.id;
       const permitToken1 = `permit:crash-worker-1:${Date.now()}`;
       const permitToken2 = `permit:crash-worker-2:${Date.now()}`;
+      const freshPermitToken3 = `permit:fresh-worker-3:${Date.now()}`;
 
       try {
         // Recipient 1: worker acquired permit, but crashed before send (unconfirmed outcome)
@@ -1510,6 +1517,19 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
           WHERE id = ${recip2.id};
         `);
 
+        // Recipient 3: active in-flight worker whose permit is FRESH (< 1 minute old)
+        // Must NOT be touched by the reconciler!
+        const [recip3] = await db
+          .insert(campaignRecipients)
+          .values({
+            campaignId: campId,
+            subscriberId: sub3.id,
+            status: "processing",
+            claimToken: freshPermitToken3,
+            errorMessage: "In-flight: active dispatch permit",
+          })
+          .returning({ id: campaignRecipients.id });
+
         // Execute reconciler with a 5-minute threshold
         const reconciledCount = await reconcileCancelledCampaignInFlightPermits(5);
         expect(reconciledCount).toBe(2);
@@ -1536,7 +1556,15 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
           "Reconciled after worker crash: email was dispatched under permit with providerMessageId provider-crashed-accepted-msg-999"
         );
 
-        // Verify campaign remains 'cancelled' and summary counts were re-synchronized
+        // Verify Recipient 3: STILL 'processing' with active permit intact!
+        const [untouchedRecip3] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, recip3.id));
+        expect(untouchedRecip3.status).toBe("processing");
+        expect(untouchedRecip3.claimToken).toBe(freshPermitToken3);
+
+        // Verify campaign remains 'cancelled' and summary counts were re-synchronized atomically
         const [updatedCamp] = await db
           .select()
           .from(campaigns)
@@ -1547,7 +1575,7 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
         try {
           await db.execute(sql`DELETE FROM campaign_recipients WHERE campaign_id = ${campId};`);
           await db.execute(sql`DELETE FROM campaigns WHERE id = ${campId};`);
-          await db.execute(sql`DELETE FROM subscribers WHERE id IN (${sub1.id}, ${sub2.id});`);
+          await db.execute(sql`DELETE FROM subscribers WHERE id IN (${sub1.id}, ${sub2.id}, ${sub3.id});`);
         } catch {}
       }
     });
