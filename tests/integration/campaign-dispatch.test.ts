@@ -1727,21 +1727,18 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
 
         // Now simulate delayed delivery webhook arriving from SES
         const webhookPayload = {
-          Type: "Notification",
-          Message: JSON.stringify({
-            eventType: "Delivery",
-            mail: {
-              messageId: "ses-msg-crash-recovered-456",
-              tags: {
-                campaign_id: [campId],
-                recipient_id: [recip.id],
-              },
-              destination: [subEmail],
+          eventType: "Delivery",
+          mail: {
+            messageId: "ses-msg-crash-recovered-456",
+            tags: {
+              campaign_id: [campId],
+              recipient_id: [recip.id],
             },
-            delivery: {
-              recipients: [subEmail],
-            },
-          }),
+            destination: [subEmail],
+          },
+          delivery: {
+            recipients: [subEmail],
+          },
         };
 
         const webhookReq = new Request("http://localhost:3000/api/webhooks/email", {
