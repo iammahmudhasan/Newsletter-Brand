@@ -1,7 +1,8 @@
 import { describe, it, expect } from "bun:test";
 import { db, campaigns, automationJobs, campaignRecipients, subscribers, sql, eq, and } from "@ai-signal/db";
-import { runCampaignScheduler, reconcileCancelledCampaignInFlightPermits } from "../../apps/worker/src/scheduler/campaignScheduler";
+import { runCampaignScheduler, reconcileCancelledCampaignInFlightPermits, reconcileStaleInFlightPermits } from "../../apps/worker/src/scheduler/campaignScheduler";
 import { POST as cancelCampaignRoute } from "../../apps/web/src/app/api/admin/campaigns/[id]/cancel/route";
+import { POST as webhookRoute } from "../../apps/web/src/app/api/webhooks/email/route";
 import { createAdminSessionToken } from "../../apps/web/src/lib/auth";
 import { handleProcessCampaignBatch } from "../../apps/worker/src/handlers/processCampaign";
 
@@ -1576,6 +1577,307 @@ describe("Campaign Dispatch Reliability, Queue Lease Recovery & Status Calculati
           await db.execute(sql`DELETE FROM campaign_recipients WHERE campaign_id = ${campId};`);
           await db.execute(sql`DELETE FROM campaigns WHERE id = ${campId};`);
           await db.execute(sql`DELETE FROM subscribers WHERE id IN (${sub1.id}, ${sub2.id}, ${sub3.id});`);
+        } catch {}
+      }
+    });
+
+    it("Scenario 1: preserves permit and does not falsely fail unknown_outcome recipient when campaign is cancelled", async () => {
+      if (!(await isPostgresRunning())) {
+        expect(true).toBe(true);
+        return;
+      }
+
+      const subEmail = `unknown-outcome-permit-${Date.now()}@aisignal.dev`;
+      const [sub] = await db
+        .insert(subscribers)
+        .values({ email: subEmail, status: "active" })
+        .returning({ id: subscribers.id });
+
+      const [camp] = await db
+        .insert(campaigns)
+        .values({
+          title: "Unknown Outcome Permit Cancellation Test",
+          subject: "Test Subject",
+          contentPlain: "Plain",
+          contentHtml: "<p>Html</p>",
+          status: "sending",
+          totalRecipients: 1,
+        })
+        .returning({ id: campaigns.id });
+
+      const campId = camp.id;
+      const permitToken = `permit:unknown-worker:${Date.now()}`;
+
+      try {
+        const [recip] = await db
+          .insert(campaignRecipients)
+          .values({
+            campaignId: campId,
+            subscriberId: sub.id,
+            status: "unknown_outcome",
+            claimToken: permitToken,
+            errorMessage: "Ambiguous outcome (Attempt 1/3): 504 Gateway Timeout from email provider",
+          })
+          .returning({ id: campaignRecipients.id });
+
+        // Cancel campaign via admin route
+        const sessionToken = createAdminSessionToken();
+        const cancelReq = {
+          headers: {
+            get: (name: string) => (name === "authorization" ? `Bearer ${sessionToken}` : null),
+          },
+          cookies: { get: () => null },
+        } as any;
+
+        const cancelResponse = await cancelCampaignRoute(cancelReq, {
+          params: Promise.resolve({ id: campId }),
+        });
+        expect(cancelResponse.status).toBe(200);
+        const cancelData = await cancelResponse.json();
+        expect(cancelData.inFlightRecipientsCount).toBe(1);
+        expect(cancelData.abortedRecipientsCount).toBe(0);
+
+        // Verify recipient state in PostgreSQL:
+        // 1. Status is NOT failed
+        // 2. Permit claimToken is strictly preserved!
+        const [updatedRecip] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, recip.id));
+
+        expect(updatedRecip.status).toBe("unknown_outcome");
+        expect(updatedRecip.claimToken).toBe(permitToken);
+        expect(updatedRecip.errorMessage).toContain("In-flight: dispatch was permitted prior to campaign cancellation");
+
+        // Verify campaign status is cancelled
+        const [cancelledCamp] = await db
+          .select({ status: campaigns.status })
+          .from(campaigns)
+          .where(eq(campaigns.id, campId));
+        expect(cancelledCamp?.status).toBe("cancelled");
+      } finally {
+        try {
+          await db.execute(sql`DELETE FROM campaign_recipients WHERE campaign_id = ${campId};`);
+          await db.execute(sql`DELETE FROM campaigns WHERE id = ${campId};`);
+          await db.execute(sql`DELETE FROM subscribers WHERE id = ${sub.id};`);
+        } catch {}
+      }
+    });
+
+    it("Scenario 2: safe reconciliation prevents automated duplicate email when worker crashes after SES acceptance without providerMessageId", async () => {
+      if (!(await isPostgresRunning())) {
+        expect(true).toBe(true);
+        return;
+      }
+
+      const subEmail = `ses-crash-safety-${Date.now()}@aisignal.dev`;
+      const [sub] = await db
+        .insert(subscribers)
+        .values({ email: subEmail, status: "active" })
+        .returning({ id: subscribers.id });
+
+      const [camp] = await db
+        .insert(campaigns)
+        .values({
+          title: "SES Crash Recovery Test Campaign",
+          subject: "SES Crash Recovery",
+          contentPlain: "Plain",
+          contentHtml: "<p>Html</p>",
+          status: "sending",
+          totalRecipients: 1,
+        })
+        .returning({ id: campaigns.id });
+
+      const campId = camp.id;
+      const permitToken = `permit:ses-crashed-worker:${Date.now()}`;
+
+      try {
+        // Recipient was permitted and sent to SES, but worker crashed before writing providerMessageId
+        const [recip] = await db
+          .insert(campaignRecipients)
+          .values({
+            campaignId: campId,
+            subscriberId: sub.id,
+            status: "processing",
+            claimToken: permitToken,
+            providerMessageId: null,
+            errorMessage: "in_flight_permitted",
+          })
+          .returning({ id: campaignRecipients.id });
+
+        // Simulate crash by setting updatedAt to 10 minutes ago
+        await db.execute(sql`
+          UPDATE campaign_recipients
+          SET updated_at = NOW() - INTERVAL '10 minutes'
+          WHERE id = ${recip.id};
+        `);
+
+        // Execute reconciler: without webhook confirmation, it MUST NOT re-send duplicate email
+        const reconciled = await reconcileStaleInFlightPermits(5);
+        expect(reconciled).toBeGreaterThanOrEqual(1);
+
+        // Verify recipient was moved to 'needs_review' rather than re-dispatched
+        const [heldRecip] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, recip.id));
+        expect(heldRecip.status).toBe("needs_review");
+        expect(heldRecip.claimToken).toBeNull();
+        expect(heldRecip.errorMessage).toContain("Reconciled after worker crash: in-flight permit timed out with unconfirmed dispatch outcome");
+
+        // Now simulate delayed delivery webhook arriving from SES
+        const webhookPayload = {
+          Type: "Notification",
+          Message: JSON.stringify({
+            eventType: "Delivery",
+            mail: {
+              messageId: "ses-msg-crash-recovered-456",
+              tags: {
+                campaign_id: [campId],
+                recipient_id: [recip.id],
+              },
+              destination: [subEmail],
+            },
+            delivery: {
+              recipients: [subEmail],
+            },
+          }),
+        };
+
+        const webhookReq = new Request("http://localhost:3000/api/webhooks/email", {
+          method: "POST",
+          body: JSON.stringify(webhookPayload),
+          headers: { "Content-Type": "application/json" },
+        });
+
+        const webhookRes = await webhookRoute(webhookReq as any);
+        expect(webhookRes.status).toBe(200);
+
+        // Verify that the webhook successfully reconciled the recipient from needs_review -> delivered!
+        const [deliveredRecip] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, recip.id));
+        expect(deliveredRecip.status).toBe("delivered");
+        expect(deliveredRecip.providerMessageId).toBe("ses-msg-crash-recovered-456");
+      } finally {
+        try {
+          await db.execute(sql`DELETE FROM email_events WHERE campaign_id = ${campId};`);
+          await db.execute(sql`DELETE FROM campaign_recipients WHERE campaign_id = ${campId};`);
+          await db.execute(sql`DELETE FROM campaigns WHERE id = ${campId};`);
+          await db.execute(sql`DELETE FROM subscribers WHERE id = ${sub.id};`);
+        } catch {}
+      }
+    });
+
+    it("Scenario 3: maintains cancelled status while accurately updating counters when worker or webhook confirms delivery after cancellation", async () => {
+      if (!(await isPostgresRunning())) {
+        expect(true).toBe(true);
+        return;
+      }
+
+      const sub1Email = `cancelled-counter-1-${Date.now()}@aisignal.dev`;
+      const sub2Email = `cancelled-counter-2-${Date.now()}@aisignal.dev`;
+
+      const [sub1] = await db
+        .insert(subscribers)
+        .values({ email: sub1Email, status: "active" })
+        .returning({ id: subscribers.id });
+
+      const [sub2] = await db
+        .insert(subscribers)
+        .values({ email: sub2Email, status: "active" })
+        .returning({ id: subscribers.id });
+
+      // Create a cancelled campaign with initial 0 successfulSends / 0 failedSends
+      const [camp] = await db
+        .insert(campaigns)
+        .values({
+          title: "Cancelled Campaign Dynamic Counter Test",
+          subject: "Test Subject",
+          contentPlain: "Plain",
+          contentHtml: "<p>Html</p>",
+          status: "cancelled",
+          totalRecipients: 2,
+          successfulSends: 0,
+          failedSends: 0,
+        })
+        .returning({ id: campaigns.id });
+
+      const campId = camp.id;
+      const permitToken1 = `permit:worker-inflight:${Date.now()}`;
+
+      try {
+        // Recipient 1: in-flight permitted during cancellation
+        const [recip1] = await db
+          .insert(campaignRecipients)
+          .values({
+            campaignId: campId,
+            subscriberId: sub1.id,
+            status: "processing",
+            claimToken: permitToken1,
+            errorMessage: "In-flight: dispatch was permitted prior to campaign cancellation",
+          })
+          .returning({ id: campaignRecipients.id });
+
+        // Recipient 2: aborted by cancellation
+        const [recip2] = await db
+          .insert(campaignRecipients)
+          .values({
+            campaignId: campId,
+            subscriberId: sub2.id,
+            status: "failed",
+            errorMessage: "Cancelled by admin request before dispatch permit",
+          })
+          .returning({ id: campaignRecipients.id });
+
+        // Delivery webhook arrives for in-flight Recipient 1
+        const webhookPayload = {
+          type: "email.delivered",
+          data: {
+            email: sub1Email,
+            email_id: "resend-msg-after-cancel-123",
+            tags: [
+              { name: "campaign_id", value: campId },
+              { name: "recipient_id", value: recip1.id },
+            ],
+          },
+        };
+
+        const webhookReq = new Request("http://localhost:3000/api/webhooks/email", {
+          method: "POST",
+          body: JSON.stringify(webhookPayload),
+          headers: { "Content-Type": "application/json" },
+        });
+
+        const webhookRes = await webhookRoute(webhookReq as any);
+        expect(webhookRes.status).toBe(200);
+
+        // Verify Recipient 1 transitioned to 'delivered'
+        const [updatedRecip1] = await db
+          .select()
+          .from(campaignRecipients)
+          .where(eq(campaignRecipients.id, recip1.id));
+        expect(updatedRecip1.status).toBe("delivered");
+
+        // Verify Campaign:
+        // 1. Status strictly remains 'cancelled' (NEVER overwritten to 'partially_failed' or 'sent'!)
+        // 2. Summary counters are accurately synchronized: successfulSends = 1, failedSends = 1, totalRecipients = 2!
+        const [updatedCamp] = await db
+          .select()
+          .from(campaigns)
+          .where(eq(campaigns.id, campId));
+
+        expect(updatedCamp.status).toBe("cancelled");
+        expect(updatedCamp.successfulSends).toBe(1);
+        expect(updatedCamp.failedSends).toBe(1);
+        expect(updatedCamp.totalRecipients).toBe(2);
+      } finally {
+        try {
+          await db.execute(sql`DELETE FROM email_events WHERE campaign_id = ${campId};`);
+          await db.execute(sql`DELETE FROM campaign_recipients WHERE campaign_id = ${campId};`);
+          await db.execute(sql`DELETE FROM campaigns WHERE id = ${campId};`);
+          await db.execute(sql`DELETE FROM subscribers WHERE id IN (${sub1.id}, ${sub2.id});`);
         } catch {}
       }
     });

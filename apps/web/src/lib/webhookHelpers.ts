@@ -112,6 +112,18 @@ export function computeCampaignTargetStatus(
 export async function reconcileCampaignMetrics(tx: any, campaignId: string): Promise<void> {
   if (!campaignId) return;
 
+  const [currentCamp] = await tx
+    .select({
+      id: campaigns.id,
+      status: campaigns.status,
+      sentAt: campaigns.sentAt,
+    })
+    .from(campaigns)
+    .where(eq(campaigns.id, campaignId))
+    .for("update");
+
+  if (!currentCamp) return;
+
   const allRecipients = await tx
     .select({ status: campaignRecipients.status })
     .from(campaignRecipients)
@@ -123,9 +135,28 @@ export async function reconcileCampaignMetrics(tx: any, campaignId: string): Pro
   const failed = allRecipients.filter(
     (r: any) => r.status === "failed" || r.status === "bounced" || r.status === "needs_review"
   ).length;
+  const total = allRecipients.length;
+
+  // CRITICAL: If campaign is cancelled, preserve status 'cancelled' while synchronizing counters
+  if (currentCamp.status === "cancelled") {
+    await tx
+      .update(campaigns)
+      .set({
+        totalRecipients: total,
+        successfulSends: sent,
+        failedSends: failed,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(campaigns.id, campaignId),
+          eq(campaigns.status, "cancelled")
+        )
+      );
+    return;
+  }
 
   const targetStatus = computeCampaignTargetStatus(allRecipients);
-  const total = allRecipients.length;
 
   await tx
     .update(campaigns)

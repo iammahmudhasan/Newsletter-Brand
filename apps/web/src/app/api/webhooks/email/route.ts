@@ -340,7 +340,7 @@ export async function POST(req: NextRequest) {
       if (targetCondition) {
         if (standardizedType === "delivered") {
           // Delivered transitions from queued/processing/sent/unknown_outcome/needs_review -> delivered
-          // CRITICAL: NEVER overwrite terminal bounce or failed status!
+          // CRITICAL: NEVER overwrite terminal bounce! If marked failed by a cancellation race but verified delivered by provider, reconcile to delivered.
           const updatedRows = await tx
             .update(campaignRecipients)
             .set({
@@ -352,7 +352,7 @@ export async function POST(req: NextRequest) {
             .where(
               and(
                 targetCondition,
-                sql`${campaignRecipients.status} IN ('queued', 'processing', 'sent', 'unknown_outcome', 'needs_review')`
+                sql`(${campaignRecipients.status} IN ('queued', 'processing', 'sent', 'unknown_outcome', 'needs_review') OR (${campaignRecipients.status} = 'failed' AND (${campaignRecipients.claimToken} LIKE 'permit:%' OR ${campaignRecipients.errorMessage} ILIKE '%cancel%' OR ${campaignRecipients.errorMessage} ILIKE '%permit%')))`
               )
             )
             .returning({

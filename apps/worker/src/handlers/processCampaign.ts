@@ -14,6 +14,7 @@ import { getEmailProvider, renderNewsletterEmail } from "@ai-signal/email";
 import { config, generateSignedToken, normalizeEmail } from "@ai-signal/config";
 import { enqueueJob, renewJobLease } from "@ai-signal/queue";
 import crypto, { randomUUID } from "crypto";
+import { reconcileStaleInFlightPermits } from "../scheduler/campaignScheduler";
 
 export async function handleProcessCampaignBatch(
   payload: { campaignId: string },
@@ -49,7 +50,8 @@ export async function handleProcessCampaignBatch(
       .where(
         and(
           eq(campaignRecipients.campaignId, campaignId),
-          sql`(${campaignRecipients.status} IN ('queued', 'unknown_outcome') OR (${campaignRecipients.status} = 'processing' AND (${campaignRecipients.claimToken} IS NULL OR ${campaignRecipients.claimToken} NOT LIKE 'permit:%')))`
+          sql`(${campaignRecipients.claimToken} IS NULL OR ${campaignRecipients.claimToken} NOT LIKE 'permit:%')`,
+          sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
         )
       );
     return;
@@ -158,7 +160,7 @@ export async function handleProcessCampaignBatch(
 
     if (fresh?.status === "cancelled") {
       console.log(`[Worker] Campaign ${campaignId} initialization aborted: campaign was cancelled.`);
-      // Cancel any remaining in-flight, queued, or unknown_outcome recipients
+      // Cancel any remaining queued or unpermitted processing/unknown_outcome recipients
       await db
         .update(campaignRecipients)
         .set({
@@ -170,6 +172,7 @@ export async function handleProcessCampaignBatch(
         .where(
           and(
             eq(campaignRecipients.campaignId, campaignId),
+            sql`(${campaignRecipients.claimToken} IS NULL OR ${campaignRecipients.claimToken} NOT LIKE 'permit:%')`,
             sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
           )
         );
@@ -232,7 +235,11 @@ export async function handleProcessCampaignBatch(
       .onConflictDoNothing();
   }
 
-  // 4. Fetch list of recipients to process (including retryable queued items and expired processing leases)
+  // 4. Stale in-flight permit reconciliation: resolve any stranded permits before fetching pending batch
+  // Prevents duplicate email dispatch by moving unconfirmed stranded permits to needs_review instead of re-sending
+  await reconcileStaleInFlightPermits(5);
+
+  // Fetch list of recipients to process (including retryable queued items and expired processing leases without active permits)
   const pendingRecipients = await db
     .select({
       recipientId: campaignRecipients.id,
@@ -240,6 +247,7 @@ export async function handleProcessCampaignBatch(
       status: campaignRecipients.status,
       attemptCount: campaignRecipients.attemptCount,
       providerMessageId: campaignRecipients.providerMessageId,
+      claimToken: campaignRecipients.claimToken,
     })
     .from(campaignRecipients)
     .where(
@@ -247,8 +255,8 @@ export async function handleProcessCampaignBatch(
         eq(campaignRecipients.campaignId, campaign.id),
         sql`(
           (${campaignRecipients.status} = 'queued' AND (${campaignRecipients.nextAttemptAt} IS NULL OR ${campaignRecipients.nextAttemptAt} <= NOW()))
-          OR (${campaignRecipients.status} = 'unknown_outcome' AND (${campaignRecipients.nextAttemptAt} IS NULL OR ${campaignRecipients.nextAttemptAt} <= NOW()))
-          OR (${campaignRecipients.status} = 'processing' AND ${campaignRecipients.updatedAt} < NOW() - INTERVAL '5 minutes')
+          OR (${campaignRecipients.status} = 'unknown_outcome' AND (${campaignRecipients.claimToken} IS NULL OR ${campaignRecipients.claimToken} NOT LIKE 'permit:%') AND (${campaignRecipients.nextAttemptAt} IS NULL OR ${campaignRecipients.nextAttemptAt} <= NOW()))
+          OR (${campaignRecipients.status} = 'processing' AND (${campaignRecipients.claimToken} IS NULL OR ${campaignRecipients.claimToken} NOT LIKE 'permit:%') AND ${campaignRecipients.updatedAt} < NOW() - INTERVAL '5 minutes')
         )`
       )
     );
@@ -349,6 +357,7 @@ export async function handleProcessCampaignBatch(
         }
 
         // Atomic Claim: Transition status to 'processing' with fresh lease timestamp and unique claimToken
+        // Exclude any records with active or stranded permits ('permit:%') to protect against duplicate dispatch
         const claimToken = crypto.randomUUID();
         const claimResult = await db.execute<typeof campaignRecipients.$inferSelect>(
           sql`
@@ -357,8 +366,8 @@ export async function handleProcessCampaignBatch(
             WHERE id = ${item.recipientId}
               AND (
                 (status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()))
-                OR (status = 'unknown_outcome' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()))
-                OR (status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes')
+                OR (status = 'unknown_outcome' AND (claim_token IS NULL OR claim_token NOT LIKE 'permit:%') AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()))
+                OR (status = 'processing' AND (claim_token IS NULL OR claim_token NOT LIKE 'permit:%') AND updated_at < NOW() - INTERVAL '5 minutes')
               )
             RETURNING *;
           `
@@ -681,48 +690,82 @@ export async function handleProcessCampaignBatch(
             const isCancelled = currentCampState?.status === "cancelled";
 
             // Conditional state transition: set status = 'sent' matching this worker's permitToken
-            const updateRes = await db
-              .update(campaignRecipients)
-              .set({
-                status: "sent",
-                providerMessageId: sendResult.messageId,
-                sentAt: new Date(),
-                updatedAt: new Date(),
-                errorMessage: isCancelled
-                  ? "Dispatched under permit prior to cancellation confirmation"
-                  : null,
-              })
-              .where(
-                and(
-                  eq(campaignRecipients.id, item.recipientId),
-                  eq(campaignRecipients.status, "processing"),
-                  sql`${campaignRecipients.claimToken} IN (${claimToken}, ${permit.permitToken})`
-                )
-              )
-              .returning({ id: campaignRecipients.id });
-
-            if (updateRes.length > 0) {
-              successCount++;
-            } else {
-              console.warn(
-                `[Worker Fencing] Recipient ${item.recipientId} claim token mismatch, cancelled, or lease expired. Discarding normal update.`
-              );
-              // In-flight cancellation reconciliation: If provider accepted the email while cancellation
-              // was committing, record providerMessageId so external delivery proof is preserved for webhook reconciliation
-              await db
+            // Atomically update recipient and recalculate cancelled campaign counters if cancelled
+            const updateRes = await db.transaction(async (tx) => {
+              const res = await tx
                 .update(campaignRecipients)
                 .set({
+                  status: "sent",
                   providerMessageId: sendResult.messageId,
                   sentAt: new Date(),
-                  errorMessage: "Dispatched to provider prior to cancellation confirmation",
                   updatedAt: new Date(),
+                  errorMessage: isCancelled
+                    ? "Dispatched under permit prior to cancellation confirmation"
+                    : null,
                 })
                 .where(
                   and(
                     eq(campaignRecipients.id, item.recipientId),
-                    sql`${campaignRecipients.status} IN ('processing', 'failed')`
+                    eq(campaignRecipients.status, "processing"),
+                    sql`${campaignRecipients.claimToken} IN (${claimToken}, ${permit.permitToken})`
                   )
+                )
+                .returning({ id: campaignRecipients.id });
+
+              if (res.length === 0) {
+                console.warn(
+                  `[Worker Fencing] Recipient ${item.recipientId} claim token mismatch, cancelled, or lease expired. Discarding normal update.`
                 );
+                // In-flight cancellation reconciliation: If provider accepted the email while cancellation
+                // was committing, record providerMessageId so external delivery proof is preserved for webhook reconciliation
+                await tx
+                  .update(campaignRecipients)
+                  .set({
+                    providerMessageId: sendResult.messageId,
+                    sentAt: new Date(),
+                    errorMessage: "Dispatched to provider prior to cancellation confirmation",
+                    updatedAt: new Date(),
+                  })
+                  .where(
+                    and(
+                      eq(campaignRecipients.id, item.recipientId),
+                      sql`${campaignRecipients.status} IN ('processing', 'failed')`
+                    )
+                  );
+              }
+
+              if (isCancelled) {
+                // Synchronize parent campaign counters in the same transaction
+                const [counts] = await tx
+                  .select({
+                    total: sql<number>`count(*)::int`,
+                    sent: sql<number>`count(*) filter (where ${campaignRecipients.status} in ('sent', 'delivered'))::int`,
+                    failed: sql<number>`count(*) filter (where ${campaignRecipients.status} in ('failed', 'bounced'))::int`,
+                  })
+                  .from(campaignRecipients)
+                  .where(eq(campaignRecipients.campaignId, campaign.id));
+
+                await tx
+                  .update(campaigns)
+                  .set({
+                    totalRecipients: counts?.total ?? campaign.totalRecipients,
+                    successfulSends: counts?.sent ?? campaign.successfulSends,
+                    failedSends: counts?.failed ?? campaign.failedSends,
+                    updatedAt: new Date(),
+                  })
+                  .where(
+                    and(
+                      eq(campaigns.id, campaign.id),
+                      eq(campaigns.status, "cancelled")
+                    )
+                  );
+              }
+
+              return res;
+            });
+
+            if (updateRes.length > 0) {
+              successCount++;
             }
           } else {
             const currentAttempts = (claimed.attempt_count ?? item.attemptCount ?? 0) + 1;
@@ -927,6 +970,7 @@ export async function handleProcessCampaignBatch(
       .where(
         and(
           eq(campaignRecipients.campaignId, campaignId),
+          sql`(${campaignRecipients.claimToken} IS NULL OR ${campaignRecipients.claimToken} NOT LIKE 'permit:%')`,
           sql`${campaignRecipients.status} IN ('queued', 'processing', 'unknown_outcome')`
         )
       );

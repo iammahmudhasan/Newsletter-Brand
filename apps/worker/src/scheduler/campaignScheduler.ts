@@ -142,10 +142,10 @@ export async function runCampaignScheduler(): Promise<number> {
       );
     }
 
-    // 3. Stale In-Flight Permit Reconciliation for Cancelled Campaigns:
-    // Periodically reconciles recipients of cancelled campaigns that were granted a permit
+    // 3. Stale In-Flight Permit Reconciliation for Cancelled & Sending Campaigns:
+    // Periodically reconciles recipients that were granted a permit
     // but became stranded due to a worker crash or unconfirmed dispatch.
-    await reconcileCancelledCampaignInFlightPermits(5);
+    await reconcileStaleInFlightPermits(5);
 
     return claimedCount;
   } catch (err: any) {
@@ -155,42 +155,47 @@ export async function runCampaignScheduler(): Promise<number> {
 }
 
 /**
- * Reconciles stranded in-flight permits on cancelled campaigns.
+ * Reconciles stranded in-flight permits on campaigns (both cancelled and active sending).
  *
  * SCENARIO (Worker crash during permit-to-send):
- * When an admin cancels a campaign, active recipients granted a durable permit ('permit:%')
- * are preserved in 'processing' so an in-flight worker can record sent status.
- * However, if the worker crashes before completing sendEmail() or writing providerMessageId,
- * the campaign is already cancelled and queue jobs are deleted.
+ * When a worker acquires a durable permit ('permit:%') to dispatch an email to SES/Resend,
+ * if the worker crashes before completing sendEmail() or writing providerMessageId,
+ * the recipient row remains stranded in 'processing' or 'unknown_outcome' with a permit claimToken.
  *
  * This reconciler:
- * 1. Finds recipients of 'cancelled' campaigns that have been stuck in 'processing'
+ * 1. Finds recipients that have been stuck in 'processing' or 'unknown_outcome'
  *    with a 'permit:%' claimToken for > staleThresholdMinutes (default: 5 minutes).
  * 2. Checks whether a providerMessageId exists or an email_events webhook record arrived:
  *    - If providerMessageId exists: marks 'sent' with audit note.
  *    - If a matching delivery/bounce webhook event arrived: updates to the webhook outcome.
  *    - If completely unresolved (no messageId and no webhook): transitions status to 'needs_review'
- *      with errorMessage 'Reconciled: in-flight permit timed out after campaign cancellation with unconfirmed dispatch outcome (possible worker crash)'.
+ *      with audit errorMessage (preventing duplicate email dispatch to real subscribers!).
  *      Releases claimToken to null.
- * 3. Re-synchronizes the parent cancelled campaign's summary counters (totalRecipients, successfulSends, failedSends).
+ * 3. Re-synchronizes the parent campaign's summary counters (totalRecipients, successfulSends, failedSends).
  * 4. Logs a structured alert for operator awareness.
  */
-export async function reconcileCancelledCampaignInFlightPermits(
-  staleThresholdMinutes: number = 5
+export async function reconcileStaleInFlightPermits(
+  staleThresholdMinutes: number = 5,
+  campaignStatusFilter?: "cancelled" | "all"
 ): Promise<number> {
   let reconciledCount = 0;
   let reconciledCampaignsCount = 0;
 
   try {
-    // 1. Discover candidate cancelled campaigns that contain potentially stale in-flight permits
+    const statusCondition =
+      campaignStatusFilter === "cancelled"
+        ? eq(campaigns.status, "cancelled")
+        : sql`${campaigns.status} IN ('cancelled', 'sending')`;
+
+    // 1. Discover candidate campaigns that contain potentially stale in-flight permits
     const candidateCampaigns = await db
       .selectDistinct({ id: campaigns.id })
       .from(campaigns)
       .innerJoin(campaignRecipients, eq(campaigns.id, campaignRecipients.campaignId))
       .where(
         and(
-          eq(campaigns.status, "cancelled"),
-          eq(campaignRecipients.status, "processing"),
+          statusCondition,
+          sql`${campaignRecipients.status} IN ('processing', 'unknown_outcome')`,
           sql`${campaignRecipients.claimToken} LIKE 'permit:%'`,
           sql`${campaignRecipients.updatedAt} < NOW() - (${staleThresholdMinutes} || ' minutes')::interval`
         )
@@ -199,14 +204,14 @@ export async function reconcileCancelledCampaignInFlightPermits(
 
     for (const candidate of candidateCampaigns) {
       await db.transaction(async (tx) => {
-        // 2a. Row-lock parent campaign and re-verify it is STILL cancelled
+        // 2a. Row-lock parent campaign
         const [camp] = await tx
           .select({ id: campaigns.id, status: campaigns.status })
           .from(campaigns)
           .where(
             and(
               eq(campaigns.id, candidate.id),
-              eq(campaigns.status, "cancelled")
+              statusCondition
             )
           )
           .for("update", { skipLocked: true });
@@ -218,12 +223,13 @@ export async function reconcileCancelledCampaignInFlightPermits(
 
         // 2b. Re-select and lock ALL eligible stale permitted recipients for this campaign
         // Re-verifying inside the transaction:
-        // - status === 'processing'
+        // - status IN ('processing', 'unknown_outcome')
         // - claimToken LIKE 'permit:%'
         // - updatedAt is STILL older than the threshold
         const staleForCamp = await tx
           .select({
             id: campaignRecipients.id,
+            status: campaignRecipients.status,
             claimToken: campaignRecipients.claimToken,
             providerMessageId: campaignRecipients.providerMessageId,
             updatedAt: campaignRecipients.updatedAt,
@@ -232,7 +238,7 @@ export async function reconcileCancelledCampaignInFlightPermits(
           .where(
             and(
               eq(campaignRecipients.campaignId, camp.id),
-              eq(campaignRecipients.status, "processing"),
+              sql`${campaignRecipients.status} IN ('processing', 'unknown_outcome')`,
               sql`${campaignRecipients.claimToken} LIKE 'permit:%'`,
               sql`${campaignRecipients.updatedAt} < NOW() - (${staleThresholdMinutes} || ' minutes')::interval`
             )
@@ -262,7 +268,7 @@ export async function reconcileCancelledCampaignInFlightPermits(
               .where(
                 and(
                   eq(campaignRecipients.id, recip.id),
-                  eq(campaignRecipients.status, "processing"),
+                  sql`${campaignRecipients.status} IN ('processing', 'unknown_outcome')`,
                   eq(campaignRecipients.claimToken, recip.claimToken)
                 )
               )
@@ -305,7 +311,7 @@ export async function reconcileCancelledCampaignInFlightPermits(
               .where(
                 and(
                   eq(campaignRecipients.id, recip.id),
-                  eq(campaignRecipients.status, "processing"),
+                  sql`${campaignRecipients.status} IN ('processing', 'unknown_outcome')`,
                   eq(campaignRecipients.claimToken, recip.claimToken)
                 )
               )
@@ -316,19 +322,22 @@ export async function reconcileCancelledCampaignInFlightPermits(
           }
 
           // Case 3: Truly unresolved dispatch outcome
-          // Transition to 'needs_review' with explicit audit message
+          // Transition to 'needs_review' with explicit audit message to PREVENT duplicate send!
           const updateRes = await tx
             .update(campaignRecipients)
             .set({
               status: "needs_review",
-              errorMessage: "Reconciled: in-flight permit timed out after campaign cancellation with unconfirmed dispatch outcome (possible worker crash)",
+              errorMessage:
+                camp.status === "cancelled"
+                  ? "Reconciled: in-flight permit timed out after campaign cancellation with unconfirmed dispatch outcome (possible worker crash)"
+                  : "Reconciled after worker crash: in-flight permit timed out with unconfirmed dispatch outcome. Held in needs_review to prevent duplicate dispatch.",
               claimToken: null,
               updatedAt: new Date(),
             })
             .where(
               and(
                 eq(campaignRecipients.id, recip.id),
-                eq(campaignRecipients.status, "processing"),
+                sql`${campaignRecipients.status} IN ('processing', 'unknown_outcome')`,
                 eq(campaignRecipients.claimToken, recip.claimToken)
               )
             )
@@ -364,13 +373,23 @@ export async function reconcileCancelledCampaignInFlightPermits(
 
     if (reconciledCount > 0) {
       console.warn(
-        `[Reconciler Alert - Cancelled Campaign Permit Recovery] Reconciled ${reconciledCount} stranded in-flight permit(s) across ${reconciledCampaignsCount} cancelled campaign(s).`
+        `[Reconciler Alert - In-Flight Permit Recovery] Reconciled ${reconciledCount} stranded in-flight permit(s) across ${reconciledCampaignsCount} campaign(s).`
       );
     }
 
     return reconciledCount;
   } catch (err: any) {
-    console.error("[Cancelled Campaign Permit Reconciler Error]:", err.message);
+    console.error("[In-Flight Permit Reconciler Error]:", err.message);
     return reconciledCount;
   }
+}
+
+/**
+ * Reconciles stranded in-flight permits on cancelled campaigns.
+ * Provided for backwards compatibility with existing consumers and test suites.
+ */
+export async function reconcileCancelledCampaignInFlightPermits(
+  staleThresholdMinutes: number = 5
+): Promise<number> {
+  return reconcileStaleInFlightPermits(staleThresholdMinutes, "cancelled");
 }
